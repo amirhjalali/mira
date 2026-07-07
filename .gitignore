@@ -1,0 +1,10 @@
+state/*
+logs/*
+build/
+config.sh
+*.log
+.codex-last.txt
+.DS_Store
+!state/.gitkeep
+!logs/.gitkeep
+attic/

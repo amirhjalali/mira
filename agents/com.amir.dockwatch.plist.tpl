@@ -3,9 +3,11 @@
 <plist version="1.0"><dict>
  <key>Label</key><string>com.amir.dockwatch</string>
  <key>ProgramArguments</key>
- <array><string>__HOME__/home/macrig/build/dock-watch</string></array>
+ <array><string>__MACRIG_DIR__/build/dock-watch</string></array>
+ <key>EnvironmentVariables</key>
+ <dict><key>MACRIG_DIR</key><string>__MACRIG_DIR__</string></dict>
  <key>RunAtLoad</key><true/>
  <key>KeepAlive</key><true/>
  <key>ProcessType</key><string>Background</string>
- <key>StandardErrorPath</key><string>__HOME__/home/macrig/logs/dock-watch.err</string>
+ <key>StandardErrorPath</key><string>__MACRIG_DIR__/logs/dock-watch.err</string>
 </dict></plist>

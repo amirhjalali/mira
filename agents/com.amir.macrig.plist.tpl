@@ -4,6 +4,8 @@
  <key>Label</key><string>com.amir.macrig</string>
  <key>ProgramArguments</key>
  <array><string>/Applications/MacRig.app/Contents/MacOS/MacRig</string></array>
+ <key>EnvironmentVariables</key>
+ <dict><key>MACRIG_DIR</key><string>__MACRIG_DIR__</string></dict>
  <key>RunAtLoad</key><true/>
  <key>KeepAlive</key><false/>
 </dict></plist>

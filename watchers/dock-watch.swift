@@ -13,10 +13,13 @@
 import CoreGraphics
 import Foundation
 
-let toggleScript = "\(NSHomeDirectory())/home/macrig/bin/dock-apply.sh"
-let logPath = "\(NSHomeDirectory())/home/macrig/logs/dock-watch.log"
+let root = ProcessInfo.processInfo.environment["MACRIG_DIR"] ?? "\(NSHomeDirectory())/macrig"
+let toggleScript = "\(root)/bin/dock-apply.sh"
+let logPath = "\(root)/logs/dock-watch.log"
 var lastMode = ""
 var pending: DispatchWorkItem?
+var isApplying = false
+var retryCount = 0
 
 func log(_ message: String) {
     let formatter = DateFormatter()
@@ -47,26 +50,54 @@ func currentMode() -> String {
 
 func apply() {
     let mode = currentMode()
-    if mode == lastMode { return }
-    lastMode = mode
-    log("display mode -> \(mode)")
+    if mode.isEmpty || mode == lastMode || isApplying { return }
+    isApplying = true
+    log("display mode requested -> \(mode)")
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/bash")
     p.arguments = [toggleScript, mode]
+    p.terminationHandler = { process in
+        DispatchQueue.main.async {
+            isApplying = false
+            if process.terminationStatus == 0 {
+                lastMode = mode
+                retryCount = 0
+                log("display mode applied -> \(mode)")
+            } else {
+                retryCount += 1
+                log("dock-apply failed for \(mode): exit \(process.terminationStatus), retry \(retryCount)/3")
+                if retryCount <= 3 && currentMode() == mode {
+                    schedule(after: [5.0, 15.0, 30.0][retryCount - 1], resetRetries: false)
+                }
+                return
+            }
+
+            // A second display event may have arrived while the script ran.
+            if currentMode() != lastMode {
+                schedule(after: 1.0, resetRetries: false)
+            }
+        }
+    }
     do {
-        try p.run()   // non-blocking; the script handles its own retries/logging
+        try p.run()
     } catch {
+        isApplying = false
         log("failed to start dock-apply.sh: \(error.localizedDescription)")
+        retryCount += 1
+        if retryCount <= 3 { schedule(after: 5.0, resetRetries: false) }
     }
 }
 
 // Display events arrive in bursts (a dock change fires several); debounce so we
 // act once, after things settle.
-func schedule() {
-    pending?.cancel()
-    let work = DispatchWorkItem { apply() }
-    pending = work
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+func schedule(after delay: TimeInterval = 1.5, resetRetries: Bool = true) {
+    DispatchQueue.main.async {
+        if resetRetries { retryCount = 0 }
+        pending?.cancel()
+        let work = DispatchWorkItem { apply() }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
 }
 
 let callback: CGDisplayReconfigurationCallBack = { _, _, _ in schedule() }

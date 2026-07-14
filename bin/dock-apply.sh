@@ -1,5 +1,6 @@
 #!/bin/bash
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/macrig-config.sh"
+acquire_action_lock "Apply Dock Mode" || exit $?
 
 # dock-apply.sh <ultrawide|laptop>
 # Fired by the dock-watch agent on display connect/disconnect. Does BOTH:
@@ -18,9 +19,6 @@ WIFI_DEV="$(networksetup -listallhardwareports 2>/dev/null \
 
 echo "=== $(date '+%F %T')  dock-apply $MODE  (wifi=$WIFI_DEV) ===" >>"$LOG"
 
-# 1) Remote-Mac resolution (has its own logging/retries).
-bash "$MACRIG_DIR/bin/mac-resolution-toggle.sh" "$MODE"
-
 # True if some wired (non-WiFi, non-virtual) interface is carrying an IPv4 —
 # i.e. the dock's ethernet is really up, so it's safe to drop WiFi.
 wired_up() {
@@ -34,20 +32,50 @@ wired_up() {
   return 1
 }
 
+RESULT=0
+
+# Restore WiFi before any SSH work when undocking. This keeps the local viewer
+# online even when a remote target is slow or unavailable.
+if [ "$MODE" = "laptop" ]; then
+  networksetup -setairportpower "$WIFI_DEV" on \
+    && echo "  wifi ON" >>"$LOG" \
+    || RESULT=1
+fi
+
+RESOLUTION_PID=""
+if display_control_owned; then
+  bash "$MACRIG_DIR/bin/mac-resolution-toggle.sh" "$MODE" &
+  RESOLUTION_PID=$!
+else
+  if display_sync_enabled; then
+    printf 'off\n' > "$DISPLAY_SYNC_STATE"
+    echo "  remote display lease belongs elsewhere; local control reconciled OFF" >>"$LOG"
+  else
+    echo "  remote display sync OFF on this viewer" >>"$LOG"
+  fi
+fi
+
 case "$MODE" in
   ultrawide)   # docked → drop WiFi, but only once wired ethernet has an IP
-    for i in 1 2 3 4 5 6; do
+    for _ in 1 2 3 4 5 6; do
       if wired_up; then
         networksetup -setairportpower "$WIFI_DEV" off \
-          && echo "  wifi OFF (wired ethernet up)" >>"$LOG"
-        exit 0
+          && echo "  wifi OFF (wired ethernet up)" >>"$LOG" \
+          || RESULT=1
+        break
       fi
       sleep 2
     done
-    echo "  no wired ethernet came up — leaving WiFi ON" >>"$LOG"
+    if ! wired_up; then
+      echo "  no wired ethernet came up — leaving WiFi ON" >>"$LOG"
+    fi
     ;;
-  laptop)      # undocked → make sure WiFi is back on
-    networksetup -setairportpower "$WIFI_DEV" on \
-      && echo "  wifi ON" >>"$LOG"
-    ;;
+  laptop) ;;
+  *) echo "invalid dock mode: $MODE" >>"$LOG"; RESULT=2 ;;
 esac
+
+if [ -n "$RESOLUTION_PID" ] && ! wait "$RESOLUTION_PID"; then
+  RESULT=1
+fi
+
+exit "$RESULT"

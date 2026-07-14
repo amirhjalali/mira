@@ -1,5 +1,6 @@
 #!/bin/bash
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/macrig-config.sh"
+acquire_action_lock "Open Both Macs" || exit $?
 
 # open-both-macs.sh — ONE CLICK: open BOTH Macs at once via Jump Desktop.
 #
@@ -25,7 +26,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.sh"
 
 # Connection names EXACTLY as they appear in Jump's File > Open Recent menu
 # (= the saved computer names; session windows get the same title).
-MACHINES=("$MINI_NAME" "$AIR_NAME")
+MACHINES=("${TARGET_NAMES[@]}")
 
 # 1. Make sure Jump Desktop is running (and give a fresh launch time to sign
 #    in to Jump Connect before we ask it to open sessions).
@@ -41,9 +42,10 @@ fi
 # 2. Open each machine via File > Open Recent — skipping ones that already
 #    have a session window. Retry a couple of times (fresh launches can be
 #    slow to populate the menu bar).
+OPEN_FAILED=0
 for name in "${MACHINES[@]}"; do
   ok=""
-  for attempt in 1 2 3; do
+  for _ in 1 2 3; do
     result=$(/usr/bin/osascript <<EOF 2>&1
 tell application "System Events"
   tell process "Jump Desktop"
@@ -62,6 +64,7 @@ EOF
     esac
   done
   if [ -z "$ok" ]; then
+    OPEN_FAILED=1
     echo "✗ $name — could not open via Jump's Open Recent menu." >&2
     echo "  Last error: $result" >&2
     echo "  (Did the connection get renamed? Check File > Open Recent in Jump.)" >&2
@@ -71,4 +74,7 @@ done
 
 # 3. Auto-tune quality to the network we're on (high at home, medium/low away).
 sleep 4   # let sessions finish connecting first
-"$MACRIG_DIR/bin/jump-quality.sh" auto
+QUALITY_STATUS=0
+"$MACRIG_DIR/bin/jump-quality.sh" auto || QUALITY_STATUS=$?
+[ "$OPEN_FAILED" -ne 0 ] && exit 1
+exit "$QUALITY_STATUS"

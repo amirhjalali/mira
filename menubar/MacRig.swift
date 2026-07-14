@@ -13,12 +13,19 @@ extension FileHandle {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let home = NSHomeDirectory()
-    lazy var root = URL(fileURLWithPath: home).appendingPathComponent("home/macrig", isDirectory: true)
+    lazy var root: URL = {
+        if let configured = ProcessInfo.processInfo.environment["MACRIG_DIR"], !configured.isEmpty {
+            return URL(fileURLWithPath: configured, isDirectory: true)
+        }
+        return URL(fileURLWithPath: home).appendingPathComponent("macrig", isDirectory: true)
+    }()
     lazy var bin = root.appendingPathComponent("bin", isDirectory: true)
     lazy var stateDir = root.appendingPathComponent("state", isDirectory: true)
     lazy var logsDir = root.appendingPathComponent("logs", isDirectory: true)
     lazy var profileFile = stateDir.appendingPathComponent("profile")
     lazy var modeFile = stateDir.appendingPathComponent("mode")
+    lazy var controlDir = URL(fileURLWithPath: home).appendingPathComponent("Library/Application Support/MacRig", isDirectory: true)
+    lazy var displaySyncFile = controlDir.appendingPathComponent("display-sync")
     lazy var logFile = logsDir.appendingPathComponent("macrig.log")
     lazy var configFile = root.appendingPathComponent("config.sh")
 
@@ -31,6 +38,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastPathKey = "init"
     var isRunning = false
     var lastActionFailed = false
+    var cachedSessionPresence = "Session status: checking…"
+    var sessionCheckRunning = false
+    weak var sessionStatusItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -48,12 +58,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         disabled(statusLine())
         if macrigAXIsProcessTrusted() {
-            disabled(sessionPresenceLine())
+            sessionStatusItem = add(cachedSessionPresence, nil, enabled: false)
+            refreshSessionPresence()
         } else {
             add("Grant Accessibility to MacRig…", #selector(openAccessibilitySettings))
         }
         sep()
-        add("Open Both Macs", #selector(openBothMacs), enabled: !isRunning)
+        add("Start Workspace", #selector(startWorkspace), enabled: !isRunning)
         sep()
 
         let currentMode = mode()
@@ -67,6 +78,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         sep()
+        if displaySyncEnabled() {
+            add("Release Display Control", #selector(releaseDisplayControl), enabled: !isRunning)
+        } else {
+            add("Take Display Control Here", #selector(takeDisplayControl), enabled: !isRunning)
+        }
+        sep()
+        add("Run MacRig Doctor", #selector(runDoctor), enabled: !isRunning)
         add("View Log", #selector(viewLog))
         add("Quit MacRig", #selector(quit))
     }
@@ -88,7 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func sep() { menu.addItem(.separator()) }
 
-    @objc func openBothMacs() { runScript("open-both-macs.sh", [], label: "Open Both Macs") }
+    @objc func startWorkspace() { runScript("start-workspace.sh", [], label: "Start Workspace") }
 
     @objc func chooseAuto() {
         writeMode("auto")
@@ -100,6 +118,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         writeMode("manual")
         runScript("jump-quality.sh", [selected], label: "Set \(displayName(selected)) Profile")
     }
+
+    @objc func takeDisplayControl() { runScript("claim-display-control.sh", [], label: "Take Display Control") }
+
+    @objc func releaseDisplayControl() { runScript("release-display-control.sh", [], label: "Release Display Control") }
+
+    @objc func runDoctor() { runScript("macrig-doctor.sh", [], label: "MacRig Doctor") }
 
     @objc func viewLog() { ensureLog(); NSWorkspace.shared.open(logFile) }
 
@@ -116,8 +140,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func handle(_ path: NWPath) {
-        let interfaces = path.availableInterfaces.map { $0.name }.sorted().joined(separator: ",")
-        let key = "\(path.status) [\(interfaces)]"
+        let candidates: [(NWInterface.InterfaceType, String)] = [
+            (.wiredEthernet, "ethernet"), (.wifi, "wifi"), (.cellular, "cellular"),
+            (.other, "other"), (.loopback, "loopback")
+        ]
+        let interfaces = candidates.compactMap { path.usesInterfaceType($0.0) ? $0.1 : nil }.joined(separator: ",")
+        let key = "\(path.status) [\(interfaces)] expensive=\(path.isExpensive) constrained=\(path.isConstrained)"
         guard key != lastPathKey else { return }
         lastPathKey = key
         log("path change: \(key)")
@@ -128,6 +156,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        scheduleNetworkTune(after: 12)
+    }
+
+    func scheduleNetworkTune(after delay: TimeInterval) {
+        pendingNetworkWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -140,8 +173,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         pendingNetworkWork = work
-        log("network auto tune scheduled in 12s")
-        networkQueue.asyncAfter(deadline: .now() + 12, execute: work)
+        log("network auto tune scheduled in \(Int(delay))s")
+        networkQueue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     func runScript(_ name: String, _ args: [String], label: String, watcher: Bool = false) {
@@ -151,11 +184,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         guard !isRunning else {
             log(watcher ? "network auto tune skipped: script already running" : "\(label) skipped: script already running")
+            if watcher { scheduleNetworkTune(after: 10) }
             return
         }
 
         ensureLog()
         isRunning = true
+        refreshTitle()
         menu.update()
         let script = bin.appendingPathComponent(name)
         guard let handle = FileHandle(forWritingAtPath: logFile.path) else {
@@ -178,6 +213,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isRunning = false
+                if watcher && code == 75 {
+                    self.log("network auto tune deferred: another MacRig process owns the action lock")
+                    self.scheduleNetworkTune(after: 10)
+                    self.refreshTitle()
+                    self.menu.update()
+                    return
+                }
                 self.lastActionFailed = code != 0
                 if code != 0 { self.notify("\(label) failed with exit \(code).") }
                 self.refreshTitle()
@@ -201,20 +243,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         notify("\(label) could not start.")
     }
 
-    func sessionPresenceLine() -> String {
-        guard let names = connectionNames() else { return "Config missing Jump names" }
+    func refreshSessionPresence() {
+        guard !sessionCheckRunning else { return }
+        sessionCheckRunning = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = self.computeSessionPresence()
+            DispatchQueue.main.async {
+                self.cachedSessionPresence = result
+                self.sessionCheckRunning = false
+                self.sessionStatusItem?.title = result
+            }
+        }
+    }
+
+    func computeSessionPresence() -> String {
+        let names = connectionNames()
+        guard !names.isEmpty else { return "Config missing Jump names" }
         let script = """
         on run argv
-          set miniName to item 1 of argv
-          set airName to item 2 of argv
           tell application "System Events"
             if not (exists process "Jump Desktop") then return "Jump not running"
             tell process "Jump Desktop"
-              set miniMark to "—"
-              set airMark to "—"
-              if (exists window miniName) then set miniMark to "✓"
-              if (exists window airName) then set airMark to "✓"
-              return "Mini " & miniMark & " · Air " & airMark
+              set summary to ""
+              repeat with machineName in argv
+                set mark to "—"
+                if (exists window (machineName as text)) then set mark to "✓"
+                if summary is not "" then set summary to summary & " · "
+                set summary to summary & (machineName as text) & " " & mark
+              end repeat
+              return summary
             end tell
           end tell
         end run
@@ -222,7 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script, names.0, names.1]
+        process.arguments = ["-e", script] + names
         process.standardOutput = pipe
         process.standardError = pipe
         do {
@@ -236,9 +294,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func connectionNames() -> (String, String)? {
-        guard let mini = configValue("MINI_NAME"), let air = configValue("AIR_NAME") else { return nil }
-        return (mini, air)
+    func connectionNames() -> [String] {
+        if let first = configValue("TARGET_1_NAME"), let second = configValue("TARGET_2_NAME") {
+            return [first, second]
+        }
+        if let mini = configValue("MINI_NAME"), let air = configValue("AIR_NAME") {
+            return [air, mini]
+        }
+        return []
     }
 
     func configValue(_ key: String) -> String? {
@@ -254,12 +317,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return nil
     }
 
-    func statusLine() -> String { "Profile: \(displayName(profile())) (\(mode()))" }
+    func statusLine() -> String {
+        let displays = displaySyncEnabled() ? "This Mac" : "Released"
+        return "Profile: \(displayName(profile())) (\(mode())) · Displays: \(displays)"
+    }
 
     func refreshTitle() {
         guard let button = item.button else { return }
         let state: (String, NSColor)
-        if lastActionFailed {
+        if isRunning {
+            state = ("◐", .systemBlue)
+        } else if lastActionFailed {
             state = ("●!", .systemRed)
         } else {
             switch profile() {
@@ -276,16 +344,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func profile() -> String? { read(profileFile) }
     func mode() -> String { read(modeFile) == "manual" ? "manual" : "auto" }
+    func displaySyncEnabled() -> Bool {
+        if let saved = read(displaySyncFile) { return saved != "off" }
+        return configValue("REMOTE_DISPLAY_SYNC_DEFAULT") != "off"
+    }
 
     func writeMode(_ value: String) {
+        writeState(value, to: modeFile, label: "mode state")
+        refreshTitle()
+    }
+
+    func writeState(_ value: String, to file: URL, label: String) {
         ensurePaths()
         do {
-            try "\(value)\n".write(to: modeFile, atomically: true, encoding: .utf8)
-            log("mode state -> \(value)")
+            try "\(value)\n".write(to: file, atomically: true, encoding: .utf8)
+            log("\(label) -> \(value)")
         } catch {
-            log("mode state write failed: \(error.localizedDescription)")
+            log("\(label) write failed: \(error.localizedDescription)")
         }
-        refreshTitle()
     }
 
     func displayName(_ value: String?) -> String {
@@ -305,6 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func ensurePaths() {
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: controlDir, withIntermediateDirectories: true)
     }
 
     func ensureLog() {

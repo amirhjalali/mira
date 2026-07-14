@@ -12,6 +12,8 @@
   <string>APPL</string>
   <key>LSUIElement</key>
   <true/>
+  <key>LSMultipleInstancesProhibited</key>
+  <true/>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>CFBundleShortVersionString</key>

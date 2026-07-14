@@ -1,5 +1,6 @@
 #!/bin/bash
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/macrig-config.sh"
+acquire_action_lock "Sync Remote Displays" || exit $?
 
 # mac-resolution-toggle.sh <ultrawide|laptop>
 #
@@ -12,8 +13,9 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.sh"
 #
 # Reaches the Macs over TAILSCALE first (works from anywhere — home or a phone
 # hotspot), then falls back to .local (home LAN) if Tailscale is down. Both Macs
-# hold a single BetterDisplay virtual screen whose resolution list contains both
-# shapes, so this is a fast, gentle per-name set (no recreate).
+# hold separate 21:9 and 16:10 BetterDisplay virtual screens. The remote helper
+# connects the desired screen and verifies its exact mode before disconnecting
+# the other one.
 
 MODE="${1:-}"
 case "$MODE" in
@@ -22,19 +24,27 @@ case "$MODE" in
   *) echo "usage: $(basename "$0") <ultrawide|laptop>"; exit 2 ;;
 esac
 
-B="$BDCLI"
 LOG="$LOG_DIR/dock-watch.log"
 echo "=== $(date '+%F %T')  ->  $MODE ($RES) ===" >>"$LOG"
+
+if ! display_control_owned; then
+  echo "  display sync skipped: $VIEWER_ID does not own the shared lease" >>"$LOG"
+  echo "This viewer does not own remote display control. Use Take Display Control Here first." >&2
+  exit 1
+fi
 
 # Set one Mac. Tries Tailscale IP first, then .local. Retries a few rounds —
 # a dock/undock often coincides with the network handing off, so the first
 # attempt can briefly fail.
 set_mac() {
-  local name="$1" user="$2" ts="$3" lan="$4"
+  local name="$1" user="$2" ts="$3" lan="$4" remote_command
+  printf -v remote_command '%q %q %q %q %q' \
+    "/Users/$user/macrig-set-display.sh" "$MODE" "$RES" \
+    "$VSCREEN_ULTRAWIDE_NAME" "$VSCREEN_LAPTOP_NAME"
   for try in 1 2 3 4; do
     for host in "$ts" "$lan"; do
       if ssh -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$user@$host" \
-           "$B set -name=$VSCREEN_NAME -resolution=$RES; $B set -name=$VSCREEN_NAME -main=on" \
+           "$remote_command" \
            >>"$LOG" 2>&1; then
         echo "  $name: ok via $host (try $try)" >>"$LOG"
         return 0
@@ -47,7 +57,16 @@ set_mac() {
 }
 
 # Both in parallel so the whole switch finishes in a few seconds.
-set_mac "mini" "$MINI_USER" "$MINI_TS" "$MINI_LAN" &
-set_mac "air"  "$AIR_USER"  "$AIR_TS"  "$AIR_LAN"  &
-wait
+pids=()
+for i in 0 1; do
+  set_mac "${TARGET_NAMES[$i]}" "${TARGET_USERS[$i]}" \
+          "${TARGET_TS_HOSTS[$i]}" "${TARGET_LAN_HOSTS[$i]}" &
+  pids+=("$!")
+done
+
+result=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || result=1
+done
 echo "  done." >>"$LOG"
+exit "$result"

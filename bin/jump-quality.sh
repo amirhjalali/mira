@@ -1,5 +1,6 @@
 #!/bin/bash
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/macrig-config.sh"
+acquire_action_lock "Apply Jump Quality" || exit $?
 
 # jump-quality.sh [high|medium|low|auto]     (default: auto)
 #
@@ -12,7 +13,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.sh"
 #   PROFILE   RESOLUTION                BANDWIDTH  FPS  QUALITY   WHEN
 #   high      full (dock-aware shape)   Auto       60   Highest   home LAN (pristine)
 #   medium    full (dock-aware shape)   10 mbps    30   High      decent remote (hotel wifi)
-#   low       1728x1080 (fewest px)     4 mbps     15   Low       bad internet / cellular
+#   low       viewer laptop canvas      4 mbps     15   Low       bad internet / cellular
 #
 # auto measures RTT+jitter to the Macs and picks:
 #   on home LAN (<8ms)            -> high
@@ -27,7 +28,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.sh"
 # works across full-screen Spaces). Machines without an open session are
 # skipped. Needs Accessibility (same grant as open-both-macs.sh).
 
-MACHINES=("$MINI_NAME" "$AIR_NAME")
+MACHINES=("${TARGET_NAMES[@]}")
 TOGGLE="$MACRIG_DIR/bin/mac-resolution-toggle.sh"
 STATE="$PROFILE_STATE"   # last applied profile (for --if-changed)
 
@@ -44,18 +45,21 @@ done
 
 # ---------- auto-detect ----------
 if [ "$PROFILE" = "auto" ]; then
-  # Home LAN? The primary Mac's LAN hostname resolves to the configured subnet and answers fast.
-  lan_ip=$(dscacheutil -q host -a name "$MINI_LAN" 2>/dev/null | awk -v prefix="$HOME_SUBNET_PREFIX" '/^ip_address: / { if (index($2, prefix) == 1) { print $2; exit } }')
-  if [ -n "$lan_ip" ]; then
-    lan_avg=$(ping -c 2 -q "$lan_ip" 2>/dev/null | awk -F/ '/round-trip/{print $5}')
-    if [ -n "$lan_avg" ] && awk "BEGIN{exit !($lan_avg < 8)}"; then
-      PROFILE="high"
+  # Home LAN? Any target resolving inside the configured subnet is a suitable probe.
+  for lan_host in "${TARGET_LAN_HOSTS[@]}"; do
+    lan_ip=$(dscacheutil -q host -a name "$lan_host" 2>/dev/null | awk -v prefix="$HOME_SUBNET_PREFIX" '/^ip_address: / { if (index($2, prefix) == 1) { print $2; exit } }')
+    if [ -n "$lan_ip" ]; then
+      lan_avg=$(ping -c 2 -q "$lan_ip" 2>/dev/null | awk -F/ '/round-trip/{print $5}')
+      if [ -n "$lan_avg" ] && awk "BEGIN{exit !($lan_avg < 8)}"; then
+        PROFILE="high"
+        break
+      fi
     fi
-  fi
+  done
   # Not home -> measure the Tailscale path (5 samples; avg + jitter).
   if [ "$PROFILE" = "auto" ]; then
     stats=""
-    for ts in "$MINI_TS" "$AIR_TS"; do
+    for ts in "${TARGET_TS_HOSTS[@]}"; do
       stats=$(ping -c 5 -q "$ts" 2>/dev/null | awk -F/ '/round-trip/{print $5, $7}')
       [ -n "$stats" ] && break
     done
@@ -97,11 +101,17 @@ else
     shape="laptop"
   fi
 fi
-echo "resolution -> $shape (both Macs, via mac-resolution-toggle.sh)"
-"$TOGGLE" "$shape" >/dev/null 2>&1 &
-TOGGLE_PID=$!
+TOGGLE_PID=""
+if display_control_owned; then
+  echo "resolution -> $shape (both targets, via mac-resolution-toggle.sh)"
+  "$TOGGLE" "$shape" >/dev/null 2>&1 &
+  TOGGLE_PID=$!
+else
+  echo "resolution sync not owned by this viewer — remote displays unchanged"
+fi
 
 # ---------- 2. Jump per-session caps ----------
+ACTION_FAILED=0
 for name in "${MACHINES[@]}"; do
   result=$(/usr/bin/osascript <<EOF 2>&1
 tell application "System Events"
@@ -123,10 +133,19 @@ EOF
   case "$result" in
     applied)    echo "✓ $name — caps applied" ;;
     no-session) echo "- $name — no open session, skipped" ;;
-    *)          echo "✗ $name — $result" >&2 ;;
+    *)          echo "✗ $name — $result" >&2; ACTION_FAILED=1 ;;
   esac
 done
 
-wait "$TOGGLE_PID" 2>/dev/null
+if [ -n "$TOGGLE_PID" ] && ! wait "$TOGGLE_PID" 2>/dev/null; then
+  echo "✗ Remote display sync failed for one or more targets; see logs/dock-watch.log." >&2
+  ACTION_FAILED=1
+fi
+
+if [ "$ACTION_FAILED" -ne 0 ]; then
+  echo "profile was not recorded because one or more actions failed" >&2
+  exit 1
+fi
+
 echo "$PROFILE" > "$STATE"
 echo "done."

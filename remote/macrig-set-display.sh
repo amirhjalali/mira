@@ -1,8 +1,14 @@
 #!/bin/bash
-# macrig-set-display.sh <ultrawide|laptop> <resolution>
-# Switch atomically between MacRig's 21:9 and 16:10 virtual screens.
+# macrig-set-display.sh [--check] <ultrawide|laptop> <resolution>
+# Switch atomically between MacRig's 21:9 and 16:10 virtual screens, or verify
+# that the requested state is already active without changing anything.
 
 set -u
+ACTION="set"
+if [ "${1:-}" = "--check" ]; then
+  ACTION="check"
+  shift
+fi
 MODE="${1:-}"
 RESOLUTION="${2:-}"
 ULTRAWIDE_NAME="${3:-Ultrawide}"
@@ -14,13 +20,34 @@ case "$MODE" in
   *) echo "usage: $0 <ultrawide|laptop> <resolution>" >&2; exit 2 ;;
 esac
 
-B=""
-for candidate in /opt/homebrew/bin/betterdisplaycli /usr/local/bin/betterdisplaycli \
-    "/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" \
-    "$HOME/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay"; do
-  [ -x "$candidate" ] && B="$candidate" && break
-done
+B="${MACRIG_BDCLI:-}"
+if [ -z "$B" ]; then
+  for candidate in /opt/homebrew/bin/betterdisplaycli /usr/local/bin/betterdisplaycli \
+      "/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay" \
+      "$HOME/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay"; do
+    [ -x "$candidate" ] && B="$candidate" && break
+  done
+fi
 [ -n "$B" ] || { echo "BetterDisplay CLI not found." >&2; exit 1; }
+
+display_matches() {
+  local desired_connected desired_resolution other_connected
+  desired_connected=$("$B" get -name="$DESIRED" -connected 2>/dev/null || true)
+  desired_resolution=$("$B" get -name="$DESIRED" -resolution 2>/dev/null || true)
+  other_connected=$("$B" get -name="$OTHER" -connected 2>/dev/null || true)
+  [ "$desired_connected" = "on" ] \
+    && [ "$desired_resolution" = "$RESOLUTION" ] \
+    && [ "$other_connected" = "off" ]
+}
+
+if [ "$ACTION" = "check" ]; then
+  if display_matches; then
+    echo "$DESIRED=$RESOLUTION; $OTHER=off"
+    exit 0
+  fi
+  echo "display drift: expected $DESIRED=$RESOLUTION and $OTHER=off" >&2
+  exit 1
+fi
 
 "$B" set -name="$DESIRED" -connected=on >/dev/null 2>&1 || true
 sleep 3
@@ -41,4 +68,9 @@ fi
 "$B" set -name="$DESIRED" -main=on >/dev/null 2>&1 || true
 sleep 1
 "$B" set -name="$OTHER" -connected=off >/dev/null 2>&1 || true
+sleep 2
+if ! display_matches; then
+  echo "display did not remain at $DESIRED=$RESOLUTION with $OTHER disconnected." >&2
+  exit 1
+fi
 echo "$DESIRED=$RESOLUTION"

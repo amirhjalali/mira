@@ -77,7 +77,15 @@ fi
 
 # ---------- skip if nothing changed (--if-changed) ----------
 if [ -n "$IFCHANGED" ] && [ -f "$STATE" ] && [ "$(cat "$STATE" 2>/dev/null)" = "$PROFILE" ]; then
-  echo "profile unchanged ($PROFILE) — nothing to do"
+  echo "profile unchanged ($PROFILE) — Jump caps unchanged"
+  # Network recovery often follows a sleep/dock transition. Even when the
+  # quality profile is unchanged, reconcile the remote screen shape because
+  # the display callback may have occurred while this Mac was asleep and Jump
+  # can independently resize a remote virtual display.
+  if display_control_owned; then
+    echo "reconciling remote display shape"
+    "$MACRIG_DIR/bin/sync-display-now.sh"
+  fi
   exit 0
 fi
 

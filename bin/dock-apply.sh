@@ -33,6 +33,10 @@ wired_up() {
 }
 
 RESULT=0
+RESOLUTION_MODE="$MODE"
+if [ "$(cat "$PROFILE_STATE" 2>/dev/null)" = "low" ]; then
+  RESOLUTION_MODE="laptop"
+fi
 
 # Restore WiFi before any SSH work when undocking. This keeps the local viewer
 # online even when a remote target is slow or unavailable.
@@ -44,7 +48,7 @@ fi
 
 RESOLUTION_PID=""
 if display_control_owned; then
-  bash "$MACRIG_DIR/bin/mac-resolution-toggle.sh" "$MODE" &
+  bash "$MACRIG_DIR/bin/mac-resolution-toggle.sh" "$RESOLUTION_MODE" &
   RESOLUTION_PID=$!
 else
   if display_sync_enabled; then

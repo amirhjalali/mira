@@ -49,6 +49,10 @@ HOME="$GENERIC/home" bash -c '
   display_control_owned
   release_action_lock
   [ ! -d "$ACTION_LOCK_DIR" ]
+  target_ssh() { printf "%s\n" "$2" > "$HOME/target-command"; }
+  target_display_matches 0 laptop 1728x1080
+  grep -q -- "--check" "$HOME/target-command"
+  grep -q -- "1728x1080" "$HOME/target-command"
 ' _ "$GENERIC"
 
 LEGACY="$TMP_ROOT/legacy"
@@ -61,5 +65,25 @@ HOME="$LEGACY/home" bash -c '
   [ "$VSCREEN_ULTRAWIDE_NAME" = "Ultrawide" ]
   [ "$VSCREEN_LAPTOP_NAME" = "Laptop" ]
 ' _ "$LEGACY"
+
+FAKE_BDCLI="$TMP_ROOT/fake-betterdisplaycli"
+cat > "$FAKE_BDCLI" <<'FAKE'
+#!/bin/bash
+case "$*" in
+  "get -name=Laptop -connected") echo on ;;
+  "get -name=Laptop -resolution") echo 1728x1080 ;;
+  "get -name=Ultrawide -connected") echo off ;;
+  *) exit 1 ;;
+esac
+FAKE
+chmod +x "$FAKE_BDCLI"
+
+MACRIG_BDCLI="$FAKE_BDCLI" bash "$REPO_ROOT/remote/macrig-set-display.sh" \
+  --check laptop 1728x1080 >/dev/null
+if MACRIG_BDCLI="$FAKE_BDCLI" bash "$REPO_ROOT/remote/macrig-set-display.sh" \
+    --check laptop 1440x900 >/dev/null 2>&1; then
+  echo "remote display drift test unexpectedly passed" >&2
+  exit 1
+fi
 
 echo "MacRig tests: OK"

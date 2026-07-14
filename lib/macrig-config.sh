@@ -92,6 +92,14 @@ target_ssh() {
   return 1
 }
 
+target_display_matches() {
+  local index="$1" mode="$2" resolution="$3" command
+  printf -v command '%q %q %q %q %q %q' \
+    "/Users/${TARGET_USERS[$index]}/macrig-set-display.sh" --check \
+    "$mode" "$resolution" "$VSCREEN_ULTRAWIDE_NAME" "$VSCREEN_LAPTOP_NAME"
+  target_ssh "$index" "$command"
+}
+
 display_owner() {
   # shellcheck disable=SC2016 # $HOME must expand on the remote Mac
   target_ssh 1 'cat "$HOME/Library/Application Support/MacRig/display-owner" 2>/dev/null' 2>/dev/null \

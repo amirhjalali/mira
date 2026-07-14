@@ -11,14 +11,17 @@
 // Build:  swiftc -O watchers/dock-watch.swift -o build/dock-watch
 
 import CoreGraphics
+import AppKit
 import Foundation
 
 let root = ProcessInfo.processInfo.environment["MACRIG_DIR"] ?? "\(NSHomeDirectory())/macrig"
 let toggleScript = "\(root)/bin/dock-apply.sh"
+let healthScript = "\(root)/bin/sync-display-now.sh"
 let logPath = "\(root)/logs/dock-watch.log"
 var lastMode = ""
 var pending: DispatchWorkItem?
 var isApplying = false
+var isChecking = false
 var retryCount = 0
 
 func log(_ message: String) {
@@ -100,8 +103,54 @@ func schedule(after delay: TimeInterval = 1.5, resetRetries: Bool = true) {
     }
 }
 
+// Jump can dynamically resize a virtual screen without a local display event.
+// This is a cheap SSH state check; the shell helper only performs a full switch
+// when a target's active screen, resolution, or counterpart has drifted.
+func checkRemoteDisplays() {
+    if isApplying || isChecking { return }
+    isChecking = true
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = [healthScript, "--check"]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    process.terminationHandler = { process in
+        DispatchQueue.main.async {
+            isChecking = false
+            if process.terminationStatus != 0 && process.terminationStatus != 75 {
+                log("periodic display verification failed: exit \(process.terminationStatus)")
+            }
+        }
+    }
+    do {
+        try process.run()
+    } catch {
+        isChecking = false
+        log("periodic display verification could not start: \(error.localizedDescription)")
+    }
+}
+
 let callback: CGDisplayReconfigurationCallBack = { _, _, _ in schedule() }
 CGDisplayRegisterReconfigurationCallback(callback, nil)
+
+// A closed-lid or dock removal can happen while macOS is asleep, in which case
+// CoreGraphics never delivers the display transition to this process. Force a
+// fresh reconciliation after wake instead of trusting the pre-sleep mode.
+let wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.didWakeNotification,
+    object: nil,
+    queue: .main
+) { _ in
+    log("system wake -> display reconciliation")
+    lastMode = ""
+    schedule(after: 3.0)
+}
+
+// A five-minute safety net catches remote-only resolution drift. Event and
+// network recovery paths remain the fast path, so this is normally read-only.
+let healthTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
+    checkRemoteDisplays()
+}
 
 // Assert the correct mode shortly after launch (e.g. at login).
 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { apply() }

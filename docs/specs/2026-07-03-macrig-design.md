@@ -45,6 +45,8 @@ The old `net-watch.swift` logic now lives in `MacRig.swift`. `NWPathMonitor` key
 
 `dock-watch` remains a separate compiled LaunchAgent because display reconfiguration is independent of Jump's Accessibility-driven menus. It listens to CoreGraphics display events and calls `bin/dock-apply.sh`, which performs the resolution switch and local WiFi on/off behavior. It records a display mode only after the script succeeds and retries failures at 5, 15, and 30 seconds. All mutating scripts share an atomic action lock under `~/Library/Application Support/MacRig`.
 
+Sleep can hide a dock transition from CoreGraphics, so dock-watch also forces a fresh reconciliation after system wake. Network recovery provides a second safety net: an automatic quality check always reconciles the remote display shape even when the bandwidth/quality profile itself has not changed. A lightweight five-minute check verifies the desired screen, exact resolution, and disconnected counterpart on both targets, correcting only when state has drifted. The remote setter repeats that same verification after its changes settle, and Doctor reports active-state drift instead of merely checking that the display recipe exists.
+
 ## Interchangeable Viewers
 
 The target pair belongs to the local viewer's private config, rather than being fixed to mini and Air. The peer laptop is always target 1 and the Mac mini is target 2, producing the intended Spaces order: local desktop, remote laptop, then Mac mini. Jump quality is local to each viewer, but BetterDisplay resolution is global state on each target.

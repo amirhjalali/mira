@@ -59,6 +59,18 @@ else
 fi
 
 echo
+if [ "$(cat "$PROFILE_STATE" 2>/dev/null)" = "low" ]; then
+  expected_mode="laptop"
+elif system_profiler SPDisplaysDataType 2>/dev/null | grep -q "$DOCK_MARKER"; then
+  expected_mode="ultrawide"
+else
+  expected_mode="laptop"
+fi
+case "$expected_mode" in
+  ultrawide) expected_resolution="$RES_ULTRAWIDE" ;;
+  laptop) expected_resolution="$RES_LAPTOP" ;;
+esac
+
 for i in 0 1; do
   name="${TARGET_NAMES[$i]}"
   command="test -x '$BDCLI' && '$BDCLI' get -identifiers"
@@ -89,6 +101,13 @@ for i in 0 1; do
     pass "$name display recipe supports 3440x1440, 1728x1080, and 1440x900"
   else
     warn "$name display recipe is stale; rerun remote/setup-target-ultrawide.sh"
+    continue
+  fi
+
+  if target_display_matches "$i" "$expected_mode" "$expected_resolution" >/dev/null 2>&1; then
+    pass "$name active display matches this viewer ($expected_resolution)"
+  else
+    fail "$name active display drifted; run Sync Remote Displays"
   fi
 done
 

@@ -1,1 +1,0 @@
-{"path":"/Users/amirhjalali/macrig/codex_img_workdirs/mira-icon-raw/out.png","model":"gpt-image-2","width":1254,"height":1254,"gen_seconds":50.419}

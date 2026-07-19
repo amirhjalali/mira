@@ -30,14 +30,24 @@ if [ -z "$B" ]; then
 fi
 [ -n "$B" ] || { echo "BetterDisplay CLI not found." >&2; exit 1; }
 
+# BetterDisplay answers a name query once per matching entity: a connected
+# virtual screen reports both itself and its live display ("on,on"), while a
+# disconnected one reports a single "off". Accept any count as long as every
+# reported value is the expected one.
+all_values_are() {
+  local expected="$1" actual="$2"
+  [ -n "$actual" ] || return 1
+  ! printf '%s\n' "$actual" | tr ',' '\n' | grep -qv "^${expected}\$"
+}
+
 display_matches() {
   local desired_connected desired_resolution other_connected
   desired_connected=$("$B" get -name="$DESIRED" -connected 2>/dev/null || true)
   desired_resolution=$("$B" get -name="$DESIRED" -resolution 2>/dev/null || true)
   other_connected=$("$B" get -name="$OTHER" -connected 2>/dev/null || true)
-  [ "$desired_connected" = "on" ] \
-    && [ "$desired_resolution" = "$RESOLUTION" ] \
-    && [ "$other_connected" = "off" ]
+  all_values_are on "$desired_connected" \
+    && all_values_are "$RESOLUTION" "$desired_resolution" \
+    && all_values_are off "$other_connected"
 }
 
 if [ "$ACTION" = "check" ]; then
@@ -60,7 +70,7 @@ fi
 
 "$B" set -name="$DESIRED" -displayModeNumber="$mode_number" >/dev/null 2>&1 || true
 sleep 2
-if ! "$B" get -name="$DESIRED" -resolution 2>/dev/null | grep -q "^${RESOLUTION}$"; then
+if ! all_values_are "$RESOLUTION" "$("$B" get -name="$DESIRED" -resolution 2>/dev/null)"; then
   echo "$DESIRED did not reach $RESOLUTION." >&2
   exit 1
 fi

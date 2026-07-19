@@ -70,7 +70,8 @@ FAKE_BDCLI="$TMP_ROOT/fake-betterdisplaycli"
 cat > "$FAKE_BDCLI" <<'FAKE'
 #!/bin/bash
 case "$*" in
-  "get -name=Laptop -connected") echo on ;;
+  # A connected screen answers once per matching entity, like real BetterDisplay.
+  "get -name=Laptop -connected") echo on,on ;;
   "get -name=Laptop -resolution") echo 1728x1080 ;;
   "get -name=Ultrawide -connected") echo off ;;
   *) exit 1 ;;

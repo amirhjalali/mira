@@ -3,7 +3,7 @@
 <plist version="1.0"><dict>
  <key>Label</key><string>com.amir.dockwatch</string>
  <key>ProgramArguments</key>
- <array><string>__MACRIG_DIR__/build/dock-watch</string></array>
+ <array><string>__MACRIG_DIR__/build.noindex/dock-watch</string></array>
  <key>EnvironmentVariables</key>
  <dict><key>MACRIG_DIR</key><string>__MACRIG_DIR__</string></dict>
  <key>RunAtLoad</key><true/>

@@ -1,6 +1,6 @@
 state/*
 logs/*
-build/
+build.noindex/
 config.sh
 *.log
 .codex-last.txt

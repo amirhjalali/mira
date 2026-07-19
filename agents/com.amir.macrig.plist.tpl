@@ -3,7 +3,7 @@
 <plist version="1.0"><dict>
  <key>Label</key><string>com.amir.macrig</string>
  <key>ProgramArguments</key>
- <array><string>/Applications/MacRig.app/Contents/MacOS/MacRig</string></array>
+ <array><string>/Applications/MIRA.app/Contents/MacOS/MIRA</string></array>
  <key>EnvironmentVariables</key>
  <dict><key>MACRIG_DIR</key><string>__MACRIG_DIR__</string></dict>
  <key>RunAtLoad</key><true/>

@@ -45,7 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         ensurePaths()
-        log("MacRig started")
+        log("MIRA started")
         menu.delegate = self
         menu.autoenablesItems = false  // honor manual isEnabled flags (disable actions while a script runs)
         item.menu = menu
@@ -61,7 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sessionStatusItem = add(cachedSessionPresence, nil, enabled: false)
             refreshSessionPresence()
         } else {
-            add("Grant Accessibility to MacRig…", #selector(openAccessibilitySettings))
+            add("Grant Accessibility to MIRA…", #selector(openAccessibilitySettings))
         }
         sep()
         add("Start Workspace", #selector(startWorkspace), enabled: !isRunning)
@@ -84,9 +84,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             add("Take Display Control Here", #selector(takeDisplayControl), enabled: !isRunning)
         }
         sep()
-        add("Run MacRig Doctor", #selector(runDoctor), enabled: !isRunning)
+        add("Run MIRA Doctor", #selector(runDoctor), enabled: !isRunning)
         add("View Log", #selector(viewLog))
-        add("Quit MacRig", #selector(quit))
+        add("Quit MIRA", #selector(quit))
     }
 
     @discardableResult
@@ -123,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func releaseDisplayControl() { runScript("release-display-control.sh", [], label: "Release Display Control") }
 
-    @objc func runDoctor() { runScript("macrig-doctor.sh", [], label: "MacRig Doctor") }
+    @objc func runDoctor() { runScript("macrig-doctor.sh", [], label: "MIRA Doctor") }
 
     @objc func viewLog() { ensureLog(); NSWorkspace.shared.open(logFile) }
 
@@ -408,7 +408,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let escaped = message.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", "display notification \"\(escaped)\" with title \"MacRig\""]
+        process.arguments = ["-e", "display notification \"\(escaped)\" with title \"MIRA\""]
         try? process.run()
     }
 }

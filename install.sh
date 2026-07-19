@@ -17,19 +17,22 @@ if [ "$PRESERVE_SPACE_ORDER" = "on" ]; then
   killall Dock 2>/dev/null || true
 fi
 
-echo "2) Building MacRig.app..."
-mkdir -p build/MacRig.app/Contents/MacOS
-swiftc -O menubar/MacRig.swift -o build/MacRig.app/Contents/MacOS/MacRig
-cp menubar/Info.plist build/MacRig.app/Contents/
-chmod +x build/MacRig.app/Contents/MacOS/MacRig
+rm -rf build   # pre-rename build dir; Spotlight indexed its app copy
+
+echo "2) Building MIRA.app..."
+mkdir -p build.noindex/MIRA.app/Contents/MacOS build.noindex/MIRA.app/Contents/Resources
+swiftc -O menubar/MacRig.swift -o build.noindex/MIRA.app/Contents/MacOS/MIRA
+cp menubar/Info.plist build.noindex/MIRA.app/Contents/
+cp menubar/AppIcon.icns build.noindex/MIRA.app/Contents/Resources/
+chmod +x build.noindex/MIRA.app/Contents/MacOS/MIRA
 
 echo "3) Building dock-watch..."
-swiftc -O watchers/dock-watch.swift -o build/dock-watch
-chmod +x build/dock-watch
+swiftc -O watchers/dock-watch.swift -o build.noindex/dock-watch
+chmod +x build.noindex/dock-watch
 
-echo "4) Installing MacRig.app into /Applications..."
-rm -rf /Applications/MacRig.app
-cp -R build/MacRig.app /Applications/
+echo "4) Installing MIRA.app into /Applications..."
+rm -rf /Applications/MacRig.app /Applications/MIRA.app
+cp -R build.noindex/MIRA.app /Applications/
 
 echo "5) Installing LaunchAgents..."
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -40,12 +43,12 @@ sed "s|__MACRIG_DIR__|$SED_MACRIG_DIR|g" agents/com.amir.macrig.plist.tpl > "$HO
 echo "6) (Re)loading LaunchAgents..."
 launchctl unload "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist" 2>/dev/null || true
 launchctl unload "$HOME/Library/LaunchAgents/com.amir.macrig.plist" 2>/dev/null || true
-pkill -x MacRig 2>/dev/null || true
+pkill -x MacRig 2>/dev/null || true; pkill -x MIRA 2>/dev/null || true
 launchctl load "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist"
 launchctl load "$HOME/Library/LaunchAgents/com.amir.macrig.plist"
 
 echo
-echo "Done — MacRig is linked to this checkout: $MACRIG_DIR"
+echo "Done — MIRA is linked to this checkout: $MACRIG_DIR"
 echo "Mission Control automatic Space rearranging is disabled for stable target order."
-echo "MacRig appears in the menu bar as ○ until a profile is applied, then ●H, ●M, or ●L."
-echo "macOS will prompt for Accessibility on first use; approve MacRig in System Settings."
+echo "MIRA appears in the menu bar as ○ until a profile is applied, then ●H, ●M, or ●L."
+echo "macOS will prompt for Accessibility on first use; approve MIRA in System Settings."

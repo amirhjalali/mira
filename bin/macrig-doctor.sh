@@ -8,7 +8,7 @@ pass() { echo "✓ $*"; }
 warn() { echo "! $*"; WARNINGS=$((WARNINGS + 1)); }
 fail() { echo "✗ $*"; FAILURES=$((FAILURES + 1)); }
 
-echo "MacRig Doctor"
+echo "MIRA Doctor"
 echo "Viewer: $VIEWER_NAME ($VIEWER_ID)"
 echo "Root: $MACRIG_DIR"
 echo
@@ -19,9 +19,9 @@ AX_ENABLED=$(/usr/bin/osascript -e 'tell application "System Events" to get UI e
 if [ "$AX_ENABLED" = "true" ]; then pass "Accessibility automation enabled"; else fail "Accessibility automation is not enabled"; fi
 
 if launchctl print "gui/$(id -u)/com.amir.macrig" >/dev/null 2>&1; then
-  pass "MacRig LaunchAgent running"
+  pass "MIRA LaunchAgent running"
 else
-  fail "MacRig LaunchAgent is not running"
+  fail "MIRA LaunchAgent is not running"
 fi
 
 if launchctl print "gui/$(id -u)/com.amir.dockwatch" >/dev/null 2>&1; then

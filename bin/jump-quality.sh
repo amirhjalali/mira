@@ -56,22 +56,35 @@ if [ "$PROFILE" = "auto" ]; then
       fi
     fi
   done
-  # Not home -> measure the Tailscale path (5 samples; avg + jitter).
+  # Not home -> measure the Tailscale path (15 samples at 0.2s: ~3s wall time,
+  # a materially stabler stddev than 5 samples at the default 1s spacing).
   if [ "$PROFILE" = "auto" ]; then
     stats=""
     for ts in "${TARGET_TS_HOSTS[@]}"; do
       # macOS summary: round-trip min/avg/max/stddev = a/b/c/d ms
       # -> $5 is avg (clean), $7 is stddev with a trailing " ms" unit; strip it
       # so avg and jitter come out as single bare numbers.
-      stats=$(ping -c 5 -q "$ts" 2>/dev/null | awk -F/ '/round-trip/{gsub(/[^0-9.]/,"",$7); print $5, $7}')
+      stats=$(ping -c 15 -i 0.2 -q "$ts" 2>/dev/null | awk -F/ '/round-trip/{gsub(/[^0-9.]/,"",$7); print $5, $7}')
       [ -n "$stats" ] && break
     done
     if [ -z "$stats" ]; then
+      # 69 = EX_UNAVAILABLE. MIRA treats this as "network not up yet" (log +
+      # reschedule), unlike a real action failure — keep it distinct from 1.
       echo "✗ Can't reach either Mac (Tailscale down?). No changes made." >&2
-      exit 1
+      exit 69
     fi
     avg=${stats% *}; sdev=${stats#* }
-    if awk "BEGIN{exit !($avg < 60 && $sdev < 30)}"; then PROFILE="medium"; else PROFILE="low"; fi
+    # Hysteresis around the medium/low boundary: a link hovering near the
+    # cutoffs (e.g. jitter ~27-33ms) must not flip profiles — and remote
+    # resolutions — on every auto tune. Demoting from medium and returning
+    # from low each need to clear the boundary by a margin; any other prior
+    # state (high, empty, unreadable) uses the plain thresholds.
+    prev=$(cat "$STATE" 2>/dev/null)
+    case "$prev" in
+      medium) if awk "BEGIN{exit !($avg < 70 && $sdev < 35)}"; then PROFILE="medium"; else PROFILE="low"; fi ;;
+      low)    if awk "BEGIN{exit !($avg < 50 && $sdev < 22)}"; then PROFILE="medium"; else PROFILE="low"; fi ;;
+      *)      if awk "BEGIN{exit !($avg < 60 && $sdev < 30)}"; then PROFILE="medium"; else PROFILE="low"; fi ;;
+    esac
     echo "measured: avg=${avg}ms jitter=${sdev}ms -> $PROFILE"
   else
     echo "on home LAN (${lan_avg}ms) -> high"
@@ -87,7 +100,10 @@ if [ -n "$IFCHANGED" ] && [ -f "$STATE" ] && [ "$(cat "$STATE" 2>/dev/null)" = "
   # can independently resize a remote virtual display.
   if display_control_owned; then
     echo "reconciling remote display shape"
-    "$MACRIG_DIR/bin/sync-display-now.sh"
+    # --check: two cheap read-only SSH probes first; sync-display-now falls
+    # through to the full switch (>=8s of fixed sleeps per target) only when
+    # real drift is detected.
+    "$MACRIG_DIR/bin/sync-display-now.sh" --check
   fi
   exit 0
 fi
@@ -177,9 +193,16 @@ on applySetting(parentName, targetName)
       click menu item targetName of menu 1 of parentItem
       return "ok"
     on error errMsg number errNum
+      -- Close only menus that are actually open: the menu bar item stays
+      -- selected while its menu tree is open, and each Escape closes one
+      -- level. A blind Escape with no menu open would be forwarded to the
+      -- remote session instead.
       try
-        key code 53
-        key code 53
+        repeat 2 times
+          if not (selected of menu bar item "Remote" of menu bar 1) then exit repeat
+          key code 53
+          delay 0.15
+        end repeat
       end try
       return "AppleScript error " & errNum & " on " & parentName & ": " & errMsg
     end try

@@ -43,6 +43,7 @@ fi
 #    have a session window. Retry a couple of times (fresh launches can be
 #    slow to populate the menu bar).
 OPEN_FAILED=0
+OPENED_NAMES=()
 for name in "${MACHINES[@]}"; do
   ok=""
   for _ in 1 2 3; do
@@ -69,6 +70,8 @@ EOF
     echo "✗ $name — could not open via Jump's Open Recent menu." >&2
     echo "  Last error: $result" >&2
     echo "  (Did the connection get renamed? Check File > Open Recent in Jump.)" >&2
+  else
+    OPENED_NAMES+=("$name")
   fi
   sleep 2   # stagger the two sessions
 done
@@ -76,7 +79,9 @@ done
 # 3. Send each session to its own full-screen Space, in workspace order —
 #    fresh windows otherwise pile up floating on whatever Space is active.
 #    Already-fullscreen windows are left alone, so re-runs are no-ops.
-for name in "${MACHINES[@]}"; do
+#    Machines that failed to open are skipped — their 10s window wait would
+#    always time out.
+for name in ${OPENED_NAMES[@]+"${OPENED_NAMES[@]}"}; do
   /usr/bin/osascript <<EOF >/dev/null 2>&1
 tell application "System Events"
   tell process "Jump Desktop"

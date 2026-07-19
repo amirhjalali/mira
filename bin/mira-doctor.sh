@@ -44,7 +44,8 @@ on run argv
   set machineName to item 1 of argv
   tell application "System Events"
     tell process "Jump Desktop"
-      if exists window machineName then return "present"
+      -- Prefix match: single-display view retitles windows ("<name> - Display 1")
+      if exists (first window whose name begins with machineName) then return "present"
       if exists menu item machineName of menu 1 of menu item "Open Recent" of menu 1 of menu bar item "File" of menu bar 1 then return "present"
       return "missing"
     end tell
@@ -97,11 +98,21 @@ for i in 0 1; do
   fi
 
   # shellcheck disable=SC2016 # $HOME must expand on the target Mac
-  if target_ssh "$i" 'test -f "$HOME/.macrig-display-v3" && test -x "$HOME/mira-set-display.sh"' >/dev/null 2>&1; then
+  if target_ssh "$i" 'test -f "$HOME/.mira-display-v1" && test -x "$HOME/mira-set-display.sh"' >/dev/null 2>&1; then
     pass "$name display recipe supports 3440x1440, 1728x1080, and 1470x956"
   else
     warn "$name display recipe is stale; rerun remote/setup-target-ultrawide.sh"
     continue
+  fi
+
+  # Existence alone hides drift: compare the deployed helper's content with the
+  # repo copy so a stale helper is called out instead of failing mysteriously.
+  local_sum=$(cksum < "$MACRIG_DIR/remote/mira-set-display.sh")
+  remote_sum=$(target_ssh "$i" 'cksum < "$HOME/mira-set-display.sh"' 2>/dev/null)
+  if [ "$remote_sum" = "$local_sum" ]; then
+    pass "$name deployed display helper matches this repo"
+  else
+    warn "$name mira-set-display.sh differs from the repo copy; rerun remote/setup-target-ultrawide.sh"
   fi
 
   if target_display_matches "$i" "$expected_mode" "$expected_resolution" >/dev/null 2>&1; then

@@ -149,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard key != lastPathKey else { return }
         lastPathKey = key
         log("path change: \(key)")
-        pendingNetworkWork?.cancel()
+        cancelPendingTune()
 
         guard path.status == .satisfied else {
             log("network auto tune skipped: path status \(path.status)")
@@ -159,22 +159,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         scheduleNetworkTune(after: 12)
     }
 
+    // pendingNetworkWork is confined to the main queue; handle() runs on
+    // networkQueue and the script termination handler hops to main, so both
+    // funnel through these two entry points.
+    func cancelPendingTune() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { self.cancelPendingTune() }
+            return
+        }
+        pendingNetworkWork?.cancel()
+        pendingNetworkWork = nil
+    }
+
     func scheduleNetworkTune(after delay: TimeInterval) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { self.scheduleNetworkTune(after: delay) }
+            return
+        }
         pendingNetworkWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if self.mode() == "auto" {
-                    self.log("network settled -> jump-quality auto --if-changed")
-                    self.runScript("jump-quality.sh", ["auto", "--if-changed"], label: "Network Auto Tune", watcher: true)
-                } else {
-                    self.log("network settled -> manual mode, auto tune skipped")
-                }
+            guard let self else { return }
+            if self.mode() == "auto" {
+                self.log("network settled -> jump-quality auto --if-changed")
+                self.runScript("jump-quality.sh", ["auto", "--if-changed"], label: "Network Auto Tune", watcher: true)
+            } else {
+                self.log("network settled -> manual mode, auto tune skipped")
             }
         }
         pendingNetworkWork = work
         log("network auto tune scheduled in \(Int(delay))s")
-        networkQueue.asyncAfter(deadline: .now() + delay, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     func runScript(_ name: String, _ args: [String], label: String, watcher: Bool = false) {
@@ -193,12 +207,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshTitle()
         menu.update()
         let script = bin.appendingPathComponent(name)
-        guard let handle = FileHandle(forWritingAtPath: logFile.path) else {
+        guard let handle = appendHandle(logFile.path) else {
             finishStartFailure(label, "could not open the log file")
             return
         }
 
-        handle.seekToEndOfFile()
         handle.writeString("\n=== \(timestamp()) \(label): /bin/bash \(([script.path] + args).joined(separator: " ")) ===\n")
 
         let process = Process()
@@ -220,8 +233,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.menu.update()
                     return
                 }
-                self.lastActionFailed = code != 0
-                if code != 0 { self.notify("\(label) failed with exit \(code).") }
+                if watcher && code == 69 {
+                    // jump-quality exits 69 when neither Mac is reachable — a
+                    // routine state while Tailscale reconnects, not a failure.
+                    self.log("network auto tune skipped: targets unreachable")
+                    self.scheduleNetworkTune(after: 45)
+                    self.refreshTitle()
+                    self.menu.update()
+                    return
+                }
+                self.lastActionFailed = code != 0 && code != 75
+                if code == 75 {
+                    self.notify("MIRA is busy — try again in a moment.")
+                } else if code != 0 {
+                    self.notify("\(label) failed with exit \(code).")
+                }
                 self.refreshTitle()
                 self.menu.update()
             }
@@ -268,7 +294,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               set summary to ""
               repeat with machineName in argv
                 set mark to "—"
-                if (exists window (machineName as text)) then set mark to "✓"
+                -- Prefix match on the Window menu: single-display view retitles
+                -- windows ("<name> - Display 1"), and the menu also lists
+                -- sessions living on other full-screen Spaces.
+                if (exists (first menu item of menu 1 of menu bar item "Window" of menu bar 1 whose name begins with (machineName as text))) then set mark to "✓"
                 if summary is not "" then set summary to summary & " · "
                 set summary to summary & (machineName as text) & " " & mark
               end repeat
@@ -391,12 +420,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // O_APPEND so every write lands at the current end of file even while a
+    // script child process holds its own descriptor — plain FileHandle writers
+    // clobber lines appended after their last seek.
+    func appendHandle(_ path: String) -> FileHandle? {
+        let fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        guard fd >= 0 else { return nil }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
+
     func log(_ message: String) {
         let line = "\(timestamp()) \(message)\n"
         logQueue.async {
-            self.ensureLog()
-            guard let handle = FileHandle(forWritingAtPath: self.logFile.path) else { return }
-            handle.seekToEndOfFile()
+            guard let handle = self.appendHandle(self.logFile.path) else { return }
             handle.writeString(line)
             handle.closeFile()
         }

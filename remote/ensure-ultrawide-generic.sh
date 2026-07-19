@@ -15,7 +15,10 @@ done
 
 LOG="$HOME/ensure-ultrawide.log"
 exec >>"$LOG" 2>&1
-MARKER="$HOME/.macrig-display-v3"
+# Bump the marker version whenever the recipe below changes (resolution lists,
+# aspect ratios, HiDPI): a marker-less target rebuilds its screens on the next
+# run, so already-provisioned machines pick up the new recipe automatically.
+MARKER="$HOME/.mira-display-v1"
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') ensure MacRig displays (binary: ${B:-NONE}) ==="
 
 # A user at a physical screen owns the display arrangement; only steal main
@@ -54,6 +57,11 @@ if [ "${1:-}" = "--rebuild" ] \
   "$B" discard -type=VirtualScreen >/dev/null 2>&1 || true
   sleep 3
 
+  # HiDPI stays OFF on both screens: these are driven over Screen Sharing/VNC,
+  # which encodes the raw framebuffer — HiDPI would 4x the pixels (Laptop
+  # 1.4M -> 5.6M, Ultrawide 5.0M -> 19.8M) with no bandwidth or framerate cap
+  # available on VNC sessions to absorb it. A future Retina-sharp mode must be
+  # an explicit opt-in rebuild, never a runtime quality-tier switch.
   "$B" create -type=VirtualScreen -virtualScreenName="Ultrawide" \
     -aspectWidth=43 -aspectHeight=18 \
     -useResolutionList=on -resolutionList="3440x1440,2752x1152,1720x720" \

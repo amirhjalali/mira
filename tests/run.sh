@@ -87,4 +87,42 @@ if MACRIG_BDCLI="$FAKE_BDCLI" bash "$REPO_ROOT/remote/macrig-set-display.sh" \
   exit 1
 fi
 
+# console_is_active from ensure-ultrawide-generic.sh: a physically present
+# user keeps display ownership; headless or remote-only targets do not.
+CONSOLE_FN="$(sed -n '/^console_is_active()/,/^}/p' "$REPO_ROOT/remote/ensure-ultrawide-generic.sh")"
+[ -n "$CONSOLE_FN" ]
+
+SHIMS="$TMP_ROOT/shims"
+mkdir -p "$SHIMS"
+cat > "$SHIMS/stat" <<'SHIM'
+#!/bin/bash
+[ "$*" = "-f %Su /dev/console" ] && { echo "$FAKE_CONSOLE_USER"; exit 0; }
+exec /usr/bin/stat "$@"
+SHIM
+cat > "$SHIMS/system_profiler" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$FAKE_DISPLAY_BLOCK"
+SHIM
+chmod +x "$SHIMS/stat" "$SHIMS/system_profiler"
+
+PHYSICAL_BLOCK='Graphics/Displays:
+      Displays:
+        Color LCD:
+          Main Display: Yes'
+VIRTUAL_BLOCK='Graphics/Displays:
+      Displays:
+        Ultrawide:
+          Main Display: Yes'
+
+run_console_check() {
+  PATH="$SHIMS:$PATH" FAKE_CONSOLE_USER="$1" FAKE_DISPLAY_BLOCK="$2" \
+    bash -c "$CONSOLE_FN"$'\nconsole_is_active'
+}
+
+run_console_check someuser "$PHYSICAL_BLOCK"      # user present at a real screen
+! run_console_check loginwindow "$PHYSICAL_BLOCK" # nobody logged in
+! run_console_check root "$PHYSICAL_BLOCK"        # system session only
+! run_console_check someuser "$VIRTUAL_BLOCK"     # only virtual screens attached
+! run_console_check someuser ""                   # no displays at all
+
 echo "MacRig tests: OK"

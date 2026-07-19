@@ -17,6 +17,26 @@ LOG="$HOME/ensure-ultrawide.log"
 exec >>"$LOG" 2>&1
 MARKER="$HOME/.macrig-display-v3"
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') ensure MacRig displays (binary: ${B:-NONE}) ==="
+
+# A user at a physical screen owns the display arrangement; only steal main
+# for the virtual screen when the machine is headless or remote-only.
+# system_profiler lists connected displays as 8-space-indented "Name:" lines,
+# and a connected virtual screen appears there under its own name.
+console_is_active() {
+  local u names
+  u=$(stat -f %Su /dev/console 2>/dev/null)
+  case "$u" in ""|root|loginwindow|_mbsetupuser) return 1 ;; esac
+  names=$(system_profiler SPDisplaysDataType 2>/dev/null \
+    | grep -E '^ {8}[^ ].*:$' | sed -e 's/^ *//' -e 's/:$//')
+  [ -n "$names" ] || return 1
+  printf '%s\n' "$names" | grep -qvE '^(Ultrawide|Laptop)$'
+}
+
+if [ -f "$MARKER" ] && console_is_active; then
+  echo "result: console session active — displays untouched"
+  exit 0
+fi
+
 [ -n "$B" ] || { echo "BetterDisplay not found — install it first."; exit 1; }
 
 for _ in $(seq 1 30); do
@@ -58,6 +78,14 @@ if ! printf '%s\n' "$laptop_modes" | grep -q '1728x1080' \
   exit 1
 fi
 "$B" set -name=Laptop -connected=off >/dev/null 2>&1 || true
+
+# First run with a user at the console: the recipe is built and validated, so
+# record that and stop before rearranging their screens.
+if console_is_active; then
+  touch "$MARKER"
+  echo "result: console session active — recipe verified, displays untouched"
+  exit 0
+fi
 
 # Leave login in the safe/default docked state. Runtime switching is handled by
 # macrig-set-display.sh, which selects an exact mode before disconnecting this.

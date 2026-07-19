@@ -8,3 +8,4 @@ config.sh
 !state/.gitkeep
 !logs/.gitkeep
 attic/
+*.jdlicense

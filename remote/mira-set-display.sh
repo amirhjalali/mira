@@ -1,5 +1,5 @@
 #!/bin/bash
-# macrig-set-display.sh [--check] <ultrawide|laptop> <resolution>
+# mira-set-display.sh [--check] <ultrawide|laptop> <resolution>
 # Switch atomically between MacRig's 21:9 and 16:10 virtual screens, or verify
 # that the requested state is already active without changing anything.
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/macrig-config.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/mira-config.sh"
 
 FAILURES=0
 WARNINGS=0
@@ -18,7 +18,7 @@ if [ -d "/Applications/Jump Desktop.app" ]; then pass "Jump Desktop installed"; 
 AX_ENABLED=$(/usr/bin/osascript -e 'tell application "System Events" to get UI elements enabled' 2>/dev/null || echo false)
 if [ "$AX_ENABLED" = "true" ]; then pass "Accessibility automation enabled"; else fail "Accessibility automation is not enabled"; fi
 
-if launchctl print "gui/$(id -u)/com.amir.macrig" >/dev/null 2>&1; then
+if launchctl print "gui/$(id -u)/com.amir.mira" >/dev/null 2>&1; then
   pass "MIRA LaunchAgent running"
 else
   fail "MIRA LaunchAgent is not running"
@@ -90,14 +90,14 @@ for i in 0 1; do
   fi
 
   # shellcheck disable=SC2016 # command substitution must run on the target Mac
-  if target_ssh "$i" 'launchctl print "gui/$(id -u)/com.amir.macrig-display" >/dev/null 2>&1' >/dev/null 2>&1; then
+  if target_ssh "$i" 'launchctl print "gui/$(id -u)/com.amir.mira-display" >/dev/null 2>&1' >/dev/null 2>&1; then
     pass "$name display login agent running"
   else
     warn "$name display login agent is not running; rerun remote/setup-target-ultrawide.sh"
   fi
 
   # shellcheck disable=SC2016 # $HOME must expand on the target Mac
-  if target_ssh "$i" 'test -f "$HOME/.macrig-display-v3" && test -x "$HOME/macrig-set-display.sh"' >/dev/null 2>&1; then
+  if target_ssh "$i" 'test -f "$HOME/.macrig-display-v3" && test -x "$HOME/mira-set-display.sh"' >/dev/null 2>&1; then
     pass "$name display recipe supports 3440x1440, 1728x1080, and 1440x900"
   else
     warn "$name display recipe is stale; rerun remote/setup-target-ultrawide.sh"

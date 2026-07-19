@@ -88,7 +88,7 @@ if console_is_active; then
 fi
 
 # Leave login in the safe/default docked state. Runtime switching is handled by
-# macrig-set-display.sh, which selects an exact mode before disconnecting this.
+# mira-set-display.sh, which selects an exact mode before disconnecting this.
 "$B" set -name=Ultrawide -connected=on >/dev/null 2>&1 || true
 sleep 3
 ultra_modes=$("$B" get -name=Ultrawide -displayModeList 2>/dev/null || true)

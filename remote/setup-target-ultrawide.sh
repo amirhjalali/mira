@@ -31,15 +31,15 @@ ssh-copy-id -o AddressFamily=inet -i "$KEY" "$U@$HOST" || true
 echo "2/3  Installing the display script + login agent on the remote Mac…"
 scp -o AddressFamily=inet \
   "$SCRIPT_DIR/ensure-ultrawide-generic.sh" \
-  "$SCRIPT_DIR/macrig-set-display.sh" \
+  "$SCRIPT_DIR/mira-set-display.sh" \
   "$U@$HOST:/Users/$U/"
-"${SSH[@]}" 'mv ~/ensure-ultrawide-generic.sh ~/ensure-ultrawide.sh; chmod +x ~/ensure-ultrawide.sh ~/macrig-set-display.sh'
+"${SSH[@]}" 'mv ~/ensure-ultrawide-generic.sh ~/ensure-ultrawide.sh; chmod +x ~/ensure-ultrawide.sh ~/mira-set-display.sh'
 "${SSH[@]}" "mkdir -p ~/Library/LaunchAgents"
-"${SSH[@]}" "cat > ~/Library/LaunchAgents/com.amir.macrig-display.plist" <<PLIST
+"${SSH[@]}" "cat > ~/Library/LaunchAgents/com.amir.mira-display.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
- <key>Label</key><string>com.amir.macrig-display</string>
+ <key>Label</key><string>com.amir.mira-display</string>
  <key>ProgramArguments</key><array><string>/bin/bash</string><string>/Users/$U/ensure-ultrawide.sh</string></array>
  <key>RunAtLoad</key><true/>
  <key>ProcessType</key><string>Interactive</string>
@@ -47,6 +47,6 @@ scp -o AddressFamily=inet \
 PLIST
 
 echo "3/3  Installing both virtual screens and applying 3440x1440 now…"
-"${SSH[@]}" 'launchctl unload ~/Library/LaunchAgents/com.ultrawide.air.plist 2>/dev/null; rm -f ~/Library/LaunchAgents/com.ultrawide.air.plist; launchctl unload ~/Library/LaunchAgents/com.amir.macrig-display.plist 2>/dev/null; if ! bash ~/ensure-ultrawide.sh --ensure-recipe; then tail -12 ~/ensure-ultrawide.log; exit 1; fi; launchctl load -w ~/Library/LaunchAgents/com.amir.macrig-display.plist; sleep 2; grep "^result:" ~/ensure-ultrawide.log | tail -1; echo "login agent loaded: com.amir.macrig-display"'
+"${SSH[@]}" 'launchctl unload ~/Library/LaunchAgents/com.ultrawide.air.plist 2>/dev/null; rm -f ~/Library/LaunchAgents/com.ultrawide.air.plist; launchctl unload ~/Library/LaunchAgents/com.amir.macrig-display.plist 2>/dev/null; rm -f ~/Library/LaunchAgents/com.amir.macrig-display.plist; launchctl unload ~/Library/LaunchAgents/com.amir.mira-display.plist 2>/dev/null; if ! bash ~/ensure-ultrawide.sh --ensure-recipe; then tail -12 ~/ensure-ultrawide.log; exit 1; fi; launchctl load -w ~/Library/LaunchAgents/com.amir.mira-display.plist; sleep 2; grep "^result:" ~/ensure-ultrawide.log | tail -1; echo "login agent loaded: com.amir.mira-display"'
 echo
 echo "Done — the remote Mac should now show 3440x1440 in Jump. Use 'Start Workspace' in MacRig."

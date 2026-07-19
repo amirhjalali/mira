@@ -1,5 +1,5 @@
 #!/bin/bash
-# macrig config - copy this file to config.sh and edit it for your Macs.
+# mira config - copy this file to config.sh and edit it for your Macs.
 # config.sh is gitignored and should be the only file with private machine values.
 
 # This file is local to the viewer Mac. Target order is also the order in which

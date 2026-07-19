@@ -17,7 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let configured = ProcessInfo.processInfo.environment["MACRIG_DIR"], !configured.isEmpty {
             return URL(fileURLWithPath: configured, isDirectory: true)
         }
-        return URL(fileURLWithPath: home).appendingPathComponent("macrig", isDirectory: true)
+        return URL(fileURLWithPath: home).appendingPathComponent("mira", isDirectory: true)
     }()
     lazy var bin = root.appendingPathComponent("bin", isDirectory: true)
     lazy var stateDir = root.appendingPathComponent("state", isDirectory: true)
@@ -26,7 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     lazy var modeFile = stateDir.appendingPathComponent("mode")
     lazy var controlDir = URL(fileURLWithPath: home).appendingPathComponent("Library/Application Support/MacRig", isDirectory: true)
     lazy var displaySyncFile = controlDir.appendingPathComponent("display-sync")
-    lazy var logFile = logsDir.appendingPathComponent("macrig.log")
+    lazy var logFile = logsDir.appendingPathComponent("mira.log")
     lazy var configFile = root.appendingPathComponent("config.sh")
 
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -123,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func releaseDisplayControl() { runScript("release-display-control.sh", [], label: "Release Display Control") }
 
-    @objc func runDoctor() { runScript("macrig-doctor.sh", [], label: "MIRA Doctor") }
+    @objc func runDoctor() { runScript("mira-doctor.sh", [], label: "MIRA Doctor") }
 
     @objc func viewLog() { ensureLog(); NSWorkspace.shared.open(logFile) }
 

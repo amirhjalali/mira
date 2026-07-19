@@ -1,5 +1,5 @@
 #!/bin/bash
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/macrig-config.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/mira-config.sh"
 acquire_action_lock "Apply Jump Quality" || exit $?
 
 # jump-quality.sh [high|medium|low|auto]     (default: auto)

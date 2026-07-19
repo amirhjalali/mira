@@ -11,7 +11,7 @@ fi
 echo "1) Running tests..."
 bash tests/run.sh
 
-source lib/macrig-config.sh
+source lib/mira-config.sh
 if [ "$PRESERVE_SPACE_ORDER" = "on" ]; then
   defaults write com.apple.dock mru-spaces -bool false
   killall Dock 2>/dev/null || true
@@ -21,7 +21,7 @@ rm -rf build   # pre-rename build dir; Spotlight indexed its app copy
 
 echo "2) Building MIRA.app..."
 mkdir -p build.noindex/MIRA.app/Contents/MacOS build.noindex/MIRA.app/Contents/Resources
-swiftc -O menubar/MacRig.swift -o build.noindex/MIRA.app/Contents/MacOS/MIRA
+swiftc -O menubar/MIRA.swift -o build.noindex/MIRA.app/Contents/MacOS/MIRA
 cp menubar/Info.plist build.noindex/MIRA.app/Contents/
 cp menubar/AppIcon.icns build.noindex/MIRA.app/Contents/Resources/
 chmod +x build.noindex/MIRA.app/Contents/MacOS/MIRA
@@ -38,14 +38,16 @@ echo "5) Installing LaunchAgents..."
 mkdir -p "$HOME/Library/LaunchAgents"
 SED_MACRIG_DIR=$(printf '%s' "$MACRIG_DIR" | sed 's/[&|\\]/\\&/g')
 sed "s|__MACRIG_DIR__|$SED_MACRIG_DIR|g" agents/com.amir.dockwatch.plist.tpl > "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist"
-sed "s|__MACRIG_DIR__|$SED_MACRIG_DIR|g" agents/com.amir.macrig.plist.tpl > "$HOME/Library/LaunchAgents/com.amir.macrig.plist"
+sed "s|__MACRIG_DIR__|$SED_MACRIG_DIR|g" agents/com.amir.mira.plist.tpl > "$HOME/Library/LaunchAgents/com.amir.mira.plist"
 
 echo "6) (Re)loading LaunchAgents..."
+launchctl unload "$HOME/Library/LaunchAgents/com.amir.macrig.plist" 2>/dev/null || true   # pre-rename label
+rm -f "$HOME/Library/LaunchAgents/com.amir.macrig.plist"
 launchctl unload "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist" 2>/dev/null || true
-launchctl unload "$HOME/Library/LaunchAgents/com.amir.macrig.plist" 2>/dev/null || true
+launchctl unload "$HOME/Library/LaunchAgents/com.amir.mira.plist" 2>/dev/null || true
 pkill -x MacRig 2>/dev/null || true; pkill -x MIRA 2>/dev/null || true
 launchctl load "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist"
-launchctl load "$HOME/Library/LaunchAgents/com.amir.macrig.plist"
+launchctl load "$HOME/Library/LaunchAgents/com.amir.mira.plist"
 
 echo
 echo "Done — MIRA is linked to this checkout: $MACRIG_DIR"

@@ -8,7 +8,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 make_fixture() {
   local root="$1" style="$2"
   mkdir -p "$root/lib" "$root/home"
-  cp "$REPO_ROOT/lib/macrig-config.sh" "$root/lib/"
+  cp "$REPO_ROOT/lib/mira-config.sh" "$root/lib/"
 
   if [ "$style" = "generic" ]; then
     cat > "$root/config.sh" <<'CONFIG'
@@ -36,7 +36,7 @@ GENERIC="$TMP_ROOT/generic"
 make_fixture "$GENERIC" generic
 HOME="$GENERIC/home" bash -c '
   set -e
-  source "$1/lib/macrig-config.sh"
+  source "$1/lib/mira-config.sh"
   [ "$TARGET_1_NAME" = "MacBook Air" ]
   [ "$TARGET_2_NAME" = "Mac Mini" ]
   [ "$VSCREEN_ULTRAWIDE_NAME" = "Ultrawide" ]
@@ -59,7 +59,7 @@ LEGACY="$TMP_ROOT/legacy"
 make_fixture "$LEGACY" legacy
 HOME="$LEGACY/home" bash -c '
   set -e
-  source "$1/lib/macrig-config.sh"
+  source "$1/lib/mira-config.sh"
   [ "$TARGET_1_NAME" = "MacBook Air" ]
   [ "$TARGET_2_NAME" = "Mac Mini" ]
   [ "$VSCREEN_ULTRAWIDE_NAME" = "Ultrawide" ]
@@ -79,9 +79,9 @@ esac
 FAKE
 chmod +x "$FAKE_BDCLI"
 
-MACRIG_BDCLI="$FAKE_BDCLI" bash "$REPO_ROOT/remote/macrig-set-display.sh" \
+MACRIG_BDCLI="$FAKE_BDCLI" bash "$REPO_ROOT/remote/mira-set-display.sh" \
   --check laptop 1728x1080 >/dev/null
-if MACRIG_BDCLI="$FAKE_BDCLI" bash "$REPO_ROOT/remote/macrig-set-display.sh" \
+if MACRIG_BDCLI="$FAKE_BDCLI" bash "$REPO_ROOT/remote/mira-set-display.sh" \
     --check laptop 1440x900 >/dev/null 2>&1; then
   echo "remote display drift test unexpectedly passed" >&2
   exit 1
@@ -125,4 +125,4 @@ run_console_check someuser "$PHYSICAL_BLOCK"      # user present at a real scree
 ! run_console_check someuser "$VIRTUAL_BLOCK"     # only virtual screens attached
 ! run_console_check someuser ""                   # no displays at all
 
-echo "MacRig tests: OK"
+echo "MIRA tests: OK"

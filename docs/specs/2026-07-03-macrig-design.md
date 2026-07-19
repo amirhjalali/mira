@@ -12,7 +12,7 @@ Jump Desktop build 9.1.22 no longer accepts the previous `jump://` deep links fo
 
 - `config.example.sh`: public, viewer-local template for two target names, users, hostnames, Tailscale IPs, BetterDisplay path, and target resolutions.
 - `config.sh`: private gitignored config copied from `config.example.sh`.
-- `lib/macrig-config.sh`: compatibility loader that exposes neutral target arrays and accepts both current `TARGET_1_*`/`TARGET_2_*` fields and legacy `MINI_*`/`AIR_*` fields.
+- `lib/mira-config.sh`: compatibility loader that exposes neutral target arrays and accepts both current `TARGET_1_*`/`TARGET_2_*` fields and legacy `MINI_*`/`AIR_*` fields.
 - `bin/`: local scripts that open sessions, switch remote resolution, apply Jump quality, and react to dock state.
 - `menubar/`: `MacRig.swift` and its LSUIElement app plist.
 - `watchers/`: display-change watcher kept as a separate LaunchAgent.
@@ -53,7 +53,7 @@ The target pair belongs to the local viewer's private config, rather than being 
 
 Display handoff uses two layers. A local switch under `~/Library/Application Support/MacRig` lets an inactive viewer opt out cheaply. The authoritative `display-owner` lease lives on target 2, the shared Mac mini. Every resolution action verifies the lease; taking control overwrites it and also disables the peer's local switch best-effort. New viewers default to released.
 
-`macrig-doctor.sh` verifies the viewer and both targets without changing their display state. Laptop shape is viewer-specific: the 16-inch Pro uses a 1728x1080 clean 16:10 canvas and the 15-inch Air uses 1440x900. BetterDisplay filters custom modes by virtual-screen aspect ratio, so each target holds a 21:9 `Ultrawide` screen and a 16:10 `Laptop` screen. Runtime switching connects and verifies the desired screen before disconnecting the other; ownership can move without rebuilding displays.
+`mira-doctor.sh` verifies the viewer and both targets without changing their display state. Laptop shape is viewer-specific: the 16-inch Pro uses a 1728x1080 clean 16:10 canvas and the 15-inch Air uses 1440x900. BetterDisplay filters custom modes by virtual-screen aspect ratio, so each target holds a 21:9 `Ultrawide` screen and a 16:10 `Laptop` screen. Runtime switching connects and verifies the desired screen before disconnecting the other; ownership can move without rebuilding displays.
 
 MacRig and dock-watch obtain the checkout root from the `MACRIG_DIR` LaunchAgent environment variable. `install.sh` renders the current absolute checkout path into each agent, removing the earlier `~/home/macrig` deployment assumption.
 

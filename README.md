@@ -79,9 +79,9 @@ The menu-bar app shells out to the scripts in `bin/`. It uses macOS Accessibilit
 ## Uninstall
 
 ```bash
-launchctl unload "$HOME/Library/LaunchAgents/com.amir.macrig.plist" 2>/dev/null || true
+launchctl unload "$HOME/Library/LaunchAgents/com.amir.mira.plist" 2>/dev/null || true
 launchctl unload "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist" 2>/dev/null || true
 rm -rf /Applications/MIRA.app
-rm -f "$HOME/Library/LaunchAgents/com.amir.macrig.plist"
+rm -f "$HOME/Library/LaunchAgents/com.amir.mira.plist"
 rm -f "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist"
 ```

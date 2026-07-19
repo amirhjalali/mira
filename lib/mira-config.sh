@@ -95,7 +95,7 @@ target_ssh() {
 target_display_matches() {
   local index="$1" mode="$2" resolution="$3" command
   printf -v command '%q %q %q %q %q %q' \
-    "/Users/${TARGET_USERS[$index]}/macrig-set-display.sh" --check \
+    "/Users/${TARGET_USERS[$index]}/mira-set-display.sh" --check \
     "$mode" "$resolution" "$VSCREEN_ULTRAWIDE_NAME" "$VSCREEN_LAPTOP_NAME"
   target_ssh "$index" "$command"
 }

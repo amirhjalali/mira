@@ -1,5 +1,5 @@
 #!/bin/bash
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/macrig-config.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/mira-config.sh"
 acquire_action_lock "Sync Remote Displays" || exit $?
 
 # mac-resolution-toggle.sh <ultrawide|laptop>
@@ -39,7 +39,7 @@ fi
 set_mac() {
   local name="$1" user="$2" ts="$3" lan="$4" remote_command
   printf -v remote_command '%q %q %q %q %q' \
-    "/Users/$user/macrig-set-display.sh" "$MODE" "$RES" \
+    "/Users/$user/mira-set-display.sh" "$MODE" "$RES" \
     "$VSCREEN_ULTRAWIDE_NAME" "$VSCREEN_LAPTOP_NAME"
   for try in 1 2 3 4; do
     for host in "$ts" "$lan"; do

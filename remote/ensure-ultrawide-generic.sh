@@ -71,7 +71,7 @@ if [ "${1:-}" = "--rebuild" ] \
   "$B" create -type=VirtualScreen -virtualScreenName="Laptop" \
     -aspectWidth=16 -aspectHeight=10 \
     -useResolutionList=on -resolutionList="1728x1080,1470x956,1440x900" \
-    -virtualScreenHiDPI=off || { echo "Could not create Laptop."; exit 1; }
+    -virtualScreenHiDPI=on || { echo "Could not create Laptop."; exit 1; }
   sleep 3
 fi
 

@@ -98,7 +98,7 @@ for i in 0 1; do
 
   # shellcheck disable=SC2016 # $HOME must expand on the target Mac
   if target_ssh "$i" 'test -f "$HOME/.macrig-display-v3" && test -x "$HOME/mira-set-display.sh"' >/dev/null 2>&1; then
-    pass "$name display recipe supports 3440x1440, 1728x1080, and 1440x900"
+    pass "$name display recipe supports 3440x1440, 1728x1080, and 1470x956"
   else
     warn "$name display recipe is stale; rerun remote/setup-target-ultrawide.sh"
     continue

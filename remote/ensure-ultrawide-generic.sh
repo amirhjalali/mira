@@ -62,7 +62,7 @@ if [ "${1:-}" = "--rebuild" ] \
 
   "$B" create -type=VirtualScreen -virtualScreenName="Laptop" \
     -aspectWidth=16 -aspectHeight=10 \
-    -useResolutionList=on -resolutionList="1728x1080,1440x900" \
+    -useResolutionList=on -resolutionList="1728x1080,1470x956,1440x900" \
     -virtualScreenHiDPI=off || { echo "Could not create Laptop."; exit 1; }
   sleep 3
 fi
@@ -73,7 +73,7 @@ fi
 sleep 3
 laptop_modes=$("$B" get -name=Laptop -displayModeList 2>/dev/null || true)
 if ! printf '%s\n' "$laptop_modes" | grep -q '1728x1080' \
-    || ! printf '%s\n' "$laptop_modes" | grep -q '1440x900'; then
+    || ! printf '%s\n' "$laptop_modes" | grep -q '1470x956'; then
   echo "Laptop is missing a required 16:10 canvas."
   exit 1
 fi

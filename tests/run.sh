@@ -82,7 +82,7 @@ chmod +x "$FAKE_BDCLI"
 MACRIG_BDCLI="$FAKE_BDCLI" bash "$REPO_ROOT/remote/mira-set-display.sh" \
   --check laptop 1728x1080 >/dev/null
 if MACRIG_BDCLI="$FAKE_BDCLI" bash "$REPO_ROOT/remote/mira-set-display.sh" \
-    --check laptop 1440x900 >/dev/null 2>&1; then
+    --check laptop 1470x956 >/dev/null 2>&1; then
   echo "remote display drift test unexpectedly passed" >&2
   exit 1
 fi

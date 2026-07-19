@@ -59,9 +59,24 @@ if [ "$ACTION" = "check" ]; then
   exit 1
 fi
 
-"$B" set -name="$DESIRED" -connected=on >/dev/null 2>&1 || true
-sleep 3
-modes=$("$B" get -name="$DESIRED" -displayModeList 2>/dev/null || true)
+# A virtual screen's live display cannot materialize while the Mac's own
+# displays are asleep: -connected still reports on, but no display object is
+# created, so the mode list stays empty and -resolution reports "Failed". Hold a
+# display-wake assertion across the whole switch, then connect. If the mode list
+# is still empty — a half-connected screen left over from an earlier asleep
+# attempt, where -connected=on is a no-op — force one disconnect/reconnect.
+caffeinate -u -t 30 >/dev/null 2>&1 &
+connect_and_list_modes() {
+  "$B" set -name="$DESIRED" -connected=on >/dev/null 2>&1 || true
+  sleep 3
+  "$B" get -name="$DESIRED" -displayModeList 2>/dev/null || true
+}
+modes=$(connect_and_list_modes)
+if [ -z "$modes" ]; then
+  "$B" set -name="$DESIRED" -connected=off >/dev/null 2>&1 || true
+  sleep 3
+  modes=$(connect_and_list_modes)
+fi
 mode_number=$(printf '%s\n' "$modes" | awk -v resolution="$RESOLUTION" '$3 == resolution { print $1; exit }')
 if [ -z "$mode_number" ]; then
   echo "$DESIRED does not support $RESOLUTION." >&2
@@ -78,8 +93,15 @@ fi
 "$B" set -name="$DESIRED" -main=on >/dev/null 2>&1 || true
 sleep 1
 "$B" set -name="$OTHER" -connected=off >/dev/null 2>&1 || true
-sleep 2
-if ! display_matches; then
+# The disconnected screen's virtual-screen and live-display entities take a
+# moment to both report off (a name query briefly returns "on,off"); poll
+# instead of trusting a single fixed delay so a slow settle is not a failure.
+settled=""
+for _ in 1 2 3 4 5; do
+  sleep 2
+  if display_matches; then settled=1; break; fi
+done
+if [ -z "$settled" ]; then
   echo "display did not remain at $DESIRED=$RESOLUTION with $OTHER disconnected." >&2
   exit 1
 fi

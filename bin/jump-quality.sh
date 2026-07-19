@@ -60,7 +60,10 @@ if [ "$PROFILE" = "auto" ]; then
   if [ "$PROFILE" = "auto" ]; then
     stats=""
     for ts in "${TARGET_TS_HOSTS[@]}"; do
-      stats=$(ping -c 5 -q "$ts" 2>/dev/null | awk -F/ '/round-trip/{print $5, $7}')
+      # macOS summary: round-trip min/avg/max/stddev = a/b/c/d ms
+      # -> $5 is avg (clean), $7 is stddev with a trailing " ms" unit; strip it
+      # so avg and jitter come out as single bare numbers.
+      stats=$(ping -c 5 -q "$ts" 2>/dev/null | awk -F/ '/round-trip/{gsub(/[^0-9.]/,"",$7); print $5, $7}')
       [ -n "$stats" ] && break
     done
     if [ -z "$stats" ]; then
@@ -119,29 +122,108 @@ else
 fi
 
 # ---------- 2. Jump per-session caps ----------
+# Disabled by default: driving Jump's menus at runtime steals focus, can strand
+# a menu open (blocking all input), and doesn't persist anyway — quality and
+# High Bandwidth Mode are per-connection settings that reassert on reconnect.
+# Set them once in the saved connection instead. Resolution (section 1) is the
+# real bandwidth lever and syncs over SSH without touching the screen.
+# Set MACRIG_JUMP_MENUS=on to re-enable the legacy menu automation.
 ACTION_FAILED=0
+if [ "${MACRIG_JUMP_MENUS:-off}" != "on" ]; then
+  echo "- Jump menu automation off (quality lives in the saved connections)"
+  MACHINES=()
+fi
 for name in "${MACHINES[@]}"; do
   result=$(/usr/bin/osascript <<EOF 2>&1
+on joinNames(theList)
+  set outText to ""
+  repeat with anItem in theList
+    set nm to (contents of anItem)
+    if nm is missing value then set nm to "(separator)"
+    if outText is "" then
+      set outText to nm
+    else
+      set outText to outText & ", " & nm
+    end if
+  end repeat
+  return outText
+end joinNames
+
+-- Apply one Remote-menu setting. Jump 10.15.6 populates submenus lazily, so the
+-- parent item must be physically clicked open before its target item exists;
+-- deep one-shot clicks fail with -1728. Escape (consumed by the open menu, not
+-- forwarded to the remote session) closes the menu on any failure.
+on applySetting(parentName, targetName)
+  tell application "System Events" to tell process "Jump Desktop"
+    try
+      click menu bar item "Remote" of menu bar 1
+      delay 0.35
+      set parentItem to menu item parentName of menu 1 of menu bar item "Remote" of menu bar 1
+      -- Disabled parent: on VNC sessions Maximum Bandwidth and Framerate are
+      -- never available (Fluid-only); Quality is available whenever the
+      -- session is actually connected. The caller decides what disabled means.
+      if not (enabled of parentItem) then
+        key code 53 -- Escape: close the Remote menu
+        return "disabled"
+      end if
+      click parentItem -- open the submenu so its lazy items populate
+      delay 0.35
+      if not (exists menu item targetName of menu 1 of parentItem) then
+        set avail to my joinNames(name of every menu item of menu 1 of parentItem)
+        key code 53 -- close submenu
+        key code 53 -- close Remote menu
+        return "no '" & targetName & "' under " & parentName & " (have: " & avail & ")"
+      end if
+      click menu item targetName of menu 1 of parentItem
+      return "ok"
+    on error errMsg number errNum
+      try
+        key code 53
+        key code 53
+      end try
+      return "AppleScript error " & errNum & " on " & parentName & ": " & errMsg
+    end try
+  end tell
+end applySetting
+
 tell application "System Events"
   tell process "Jump Desktop"
-    if not (exists menu item "$name" of menu 1 of menu bar item "Window" of menu bar 1) then return "no-session"
+    -- Prefix match: viewing a single remote display retitles the window
+    -- (e.g. "Amir's MacBook Pro - Display 1"), so exact names go stale.
+    if not (exists (first menu item of menu 1 of menu bar item "Window" of menu bar 1 whose name begins with "$name")) then return "no-session"
     set frontmost to true
-    click menu item "$name" of menu 1 of menu bar item "Window" of menu bar 1
+    click (first menu item of menu 1 of menu bar item "Window" of menu bar 1 whose name begins with "$name")
     delay 1.5 -- allow Space switch to the session
-    click menu item "$BW" of menu 1 of menu item "Maximum Bandwidth" of menu 1 of menu bar item "Remote" of menu bar 1
-    delay 0.4
-    click menu item "$FPS" of menu 1 of menu item "Framerate" of menu 1 of menu bar item "Remote" of menu bar 1
-    delay 0.4
-    click menu item "$QUAL" of menu 1 of menu item "Quality" of menu 1 of menu bar item "Remote" of menu bar 1
-    return "applied"
   end tell
 end tell
+-- VNC (Screen Sharing, port 5900) sessions expose only Quality; Maximum
+-- Bandwidth and Framerate exist for Fluid sessions. Skip what the protocol
+-- lacks, but treat a disabled Quality menu as a dead session.
+set skipped to {}
+set r to applySetting("Maximum Bandwidth", "$BW")
+if r is "disabled" then
+  set end of skipped to "bandwidth"
+else if r is not "ok" then
+  return r
+end if
+set r to applySetting("Framerate", "$FPS")
+if r is "disabled" then
+  set end of skipped to "framerate"
+else if r is not "ok" then
+  return r
+end if
+set r to applySetting("Quality", "$QUAL")
+if r is "disabled" then return "not-connected"
+if r is not "ok" then return r
+if (count of skipped) is 0 then return "applied"
+return "applied (" & my joinNames(skipped) & " unavailable on this protocol)"
 EOF
   )
   case "$result" in
-    applied)    echo "✓ $name — caps applied" ;;
-    no-session) echo "- $name — no open session, skipped" ;;
-    *)          echo "✗ $name — $result" >&2; ACTION_FAILED=1 ;;
+    applied*)      echo "✓ $name — caps applied${result#applied}" ;;
+    no-session)    echo "- $name — no open session, skipped" ;;
+    not-connected) echo "✗ $name — session window open but not connected; caps need a live connection" >&2; ACTION_FAILED=1 ;;
+    *)             echo "✗ $name — $result" >&2; ACTION_FAILED=1 ;;
   esac
 done
 

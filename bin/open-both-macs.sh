@@ -18,8 +18,8 @@ acquire_action_lock "Open Both Macs" || exit $?
 # FIRST RUN: macOS may ask to grant Accessibility to the caller. Approve once
 # in System Settings > Privacy & Security > Accessibility.
 #
-# TIP: once a window is up, press  Ctrl+Cmd+F  to send it to its own full-screen
-# desktop, then two-finger swipe between the sessions.
+# Each session window is then sent to its own full-screen Space in workspace
+# order — two-finger swipe between the sessions.
 #
 # If Jump ever misbehaves, the fallback is native Screen Sharing to one Mac at a
 # time on LAN using the hostnames in config.sh.
@@ -50,7 +50,8 @@ for name in "${MACHINES[@]}"; do
 tell application "System Events"
   tell process "Jump Desktop"
     set frontmost to true
-    if (exists window "$name") then return "already-open"
+    -- Prefix match: single-display view retitles windows ("<name> - Display 1")
+    if (exists (first window whose name begins with "$name")) then return "already-open"
     click menu item "$name" of menu 1 of menu item "Open Recent" of menu 1 of menu bar item "File" of menu bar 1
     return "opened"
   end tell
@@ -72,7 +73,32 @@ EOF
   sleep 2   # stagger the two sessions
 done
 
-# 3. Auto-tune quality to the network we're on (high at home, medium/low away).
+# 3. Send each session to its own full-screen Space, in workspace order —
+#    fresh windows otherwise pile up floating on whatever Space is active.
+#    Already-fullscreen windows are left alone, so re-runs are no-ops.
+for name in "${MACHINES[@]}"; do
+  /usr/bin/osascript <<EOF >/dev/null 2>&1
+tell application "System Events"
+  tell process "Jump Desktop"
+    repeat 20 times
+      if exists (first window whose name begins with "$name") then exit repeat
+      delay 0.5
+    end repeat
+    if not (exists (first window whose name begins with "$name")) then return "no-window"
+    set w to first window whose name begins with "$name"
+    if (value of attribute "AXFullScreen" of w) is not true then
+      set frontmost to true
+      perform action "AXRaise" of w
+      delay 0.5
+      set value of attribute "AXFullScreen" of w to true
+      delay 3.5 -- let the Space transition finish before moving the next window
+    end if
+  end tell
+end tell
+EOF
+done
+
+# 4. Auto-tune quality to the network we're on (high at home, medium/low away).
 sleep 4   # let sessions finish connecting first
 QUALITY_STATUS=0
 "$MACRIG_DIR/bin/jump-quality.sh" auto || QUALITY_STATUS=$?

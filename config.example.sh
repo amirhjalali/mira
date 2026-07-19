@@ -37,7 +37,7 @@ VSCREEN_LAPTOP_NAME="Laptop"
 RES_ULTRAWIDE="3440x1440"   # when the MacBook Pro is docked (external ultrawide present)
 # Viewer-specific clean 16:10 remote canvas:
 #   16-inch MacBook Pro: 1728x1080
-#   15-inch MacBook Air: 1440x900
+#   15-inch MacBook Air (M4): 1470x956 (native point resolution, 2880x1864 @2x)
 RES_LAPTOP="1728x1080"
 DOCK_MARKER="3440"          # substring in system_profiler output that means "docked"
 

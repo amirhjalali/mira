@@ -37,18 +37,30 @@ fi
 # a dock/undock often coincides with the network handing off, so the first
 # attempt can briefly fail.
 set_mac() {
-  local name="$1" user="$2" ts="$3" lan="$4" remote_command
+  local name="$1" user="$2" ts="$3" lan="$4" remote_command out rc
   printf -v remote_command '%q %q %q %q %q' \
     "/Users/$user/mira-set-display.sh" "$MODE" "$RES" \
     "$VSCREEN_ULTRAWIDE_NAME" "$VSCREEN_LAPTOP_NAME"
   for try in 1 2 3 4; do
     for host in "$ts" "$lan"; do
-      if ssh -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$user@$host" \
-           "$remote_command" \
-           >>"$LOG" 2>&1; then
+      out=$(ssh -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+              "$user@$host" "$remote_command" 2>&1)
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        [ -n "$out" ] && printf '%s\n' "$out" >>"$LOG"
         echo "  $name: ok via $host (try $try)" >>"$LOG"
         return 0
       fi
+      # ssh returns 255 only for its own connect failures; any other nonzero
+      # code means the remote helper ran and rejected the request (e.g. an
+      # unsupported mode). Retrying other hosts/rounds can't fix that, so
+      # surface the real message and stop instead of blaming the network.
+      if [ "$rc" -ne 255 ]; then
+        printf '%s\n' "$out" >>"$LOG"
+        echo "  $name: FAILED (remote error, exit $rc): ${out:-no output}" >>"$LOG"
+        return 1
+      fi
+      echo "  $name: connect failed via $host (try $try): ${out:-ssh exit 255}" >>"$LOG"
     done
     sleep 3
   done

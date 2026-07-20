@@ -311,6 +311,9 @@ final class Reconciler {
         case .passenger(let canvasKey, let hidpi):
             guard let canvas = cfg.canvases[canvasKey] else { return }
             let wantHi = hidpi && canvas.hidpi
+            // A passenger never streams outward — enforce every tick, not just
+            // on transition (the viewer can be relaunched under us).
+            sh("pkill -x 'Jump Desktop' 2>/dev/null")
             if engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi),
                lastMode == mode { return }
             log("converge -> passenger(\(canvasKey), hidpi=\(wantHi))")

@@ -470,13 +470,23 @@ final class MenuApp: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "◈"
         rebuild()
     }
     var driving: Bool { FileManager.default.fileExists(atPath: drivingFlag.path) }
+    func setIcon() {
+        let name = driving ? "steeringwheel" : "display.2"
+        if let img = NSImage(systemSymbolName: name, accessibilityDescription: "MIRA") {
+            img.isTemplate = true
+            item.button?.image = img
+            item.button?.title = ""
+        } else {
+            item.button?.title = "◈"
+        }
+    }
     func rebuild() {
+        setIcon()
         let m = NSMenu()
-        m.addItem(withTitle: driving ? "◈ driving" : "◈ parked", action: nil, keyEquivalent: "")
+        m.addItem(withTitle: driving ? "Driving" : "Parked", action: nil, keyEquivalent: "")
         m.addItem(.separator())
         m.addItem(withTitle: "Drive from here", action: #selector(drive), keyEquivalent: "").target = self
         m.addItem(withTitle: "Stop driving", action: #selector(stop), keyEquivalent: "").target = self

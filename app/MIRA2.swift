@@ -6,6 +6,7 @@
 //   --daemon     reconciler daemon (every Mac; passengers converge here)
 //   drive | stop | status | doctor | console | selftest
 import AppKit
+import CoreAudio
 import Foundation
 
 // MARK: - Shell (small residue: ssh, ping, osascript)
@@ -142,6 +143,94 @@ func tierWantsHiDPI(_ t: Tier) -> Bool { t == .full || t == .standard }
 // Docked means any physical display at least 3000px wide is attached.
 func pickCanvas(physicalWidths: [Int], dockedCanvas: String, laptopCanvas: String) -> String {
     physicalWidths.contains { $0 >= 3000 } ? dockedCanvas : laptopCanvas
+}
+
+// MARK: - Native audio engine (CoreAudio, public API)
+
+struct AudioDev { let id: AudioDeviceID; let name: String; let builtIn: Bool
+                  let hasOutput: Bool; let hasInput: Bool }
+
+func listAudioDevices() -> [AudioDev] {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),
+                                         &addr, 0, nil, &size) == noErr else { return [] }
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids.map { id in
+        var nameAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceNameCFString,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var cfName: CFString = "" as CFString
+        var nSize = UInt32(MemoryLayout<CFString>.size)
+        withUnsafeMutablePointer(to: &cfName) { p in
+            _ = AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &nSize, p)
+        }
+        var tAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var transport: UInt32 = 0
+        var tSize = UInt32(MemoryLayout<UInt32>.size)
+        _ = AudioObjectGetPropertyData(id, &tAddr, 0, nil, &tSize, &transport)
+        func streams(_ scope: AudioObjectPropertyScope) -> Bool {
+            var sAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams, mScope: scope,
+                mElement: kAudioObjectPropertyElementMain)
+            var sSize: UInt32 = 0
+            AudioObjectGetPropertyDataSize(id, &sAddr, 0, nil, &sSize)
+            return sSize > 0
+        }
+        return AudioDev(id: id, name: cfName as String,
+                        builtIn: transport == kAudioDeviceTransportTypeBuiltIn,
+                        hasOutput: streams(kAudioObjectPropertyScopeOutput),
+                        hasInput: streams(kAudioObjectPropertyScopeInput))
+    }
+}
+
+func setDefaultAudio(_ id: AudioDeviceID, selector: AudioObjectPropertySelector) {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var dev = id
+    AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                               &addr, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &dev)
+}
+
+// Pure: choose the output/input device names for a mode.
+func pickAudioNames(passenger: Bool, deviceNames: [String]) -> (output: String?, input: String?) {
+    if passenger {
+        return (deviceNames.first { $0 == "Jump Desktop Audio" },
+                deviceNames.first { $0 == "Jump Desktop Microphone" })
+    }
+    return (nil, nil)  // console: caller falls back to built-in transport
+}
+
+func routeAudio(passenger: Bool) {
+    let devs = listAudioDevices()
+    let picked = pickAudioNames(passenger: passenger, deviceNames: devs.map { $0.name })
+    if passenger {
+        if let o = devs.first(where: { $0.name == picked.output }) {
+            setDefaultAudio(o.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
+            setDefaultAudio(o.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        }
+        if let i = devs.first(where: { $0.name == picked.input }) {
+            setDefaultAudio(i.id, selector: kAudioHardwarePropertyDefaultInputDevice)
+        }
+    } else {
+        if let o = devs.first(where: { $0.builtIn && $0.hasOutput }) {
+            setDefaultAudio(o.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
+            setDefaultAudio(o.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        }
+        if let i = devs.first(where: { $0.builtIn && $0.hasInput }) {
+            setDefaultAudio(i.id, selector: kAudioHardwarePropertyDefaultInputDevice)
+        }
+    }
 }
 
 // MARK: - Native display engine
@@ -323,6 +412,7 @@ final class Reconciler {
             guard engine.ensureVirtual(canvas: canvas) else { log("virtual create FAILED"); return }
             _ = engine.setVirtualMode(canvas: canvas, hidpi: wantHi)
             _ = engine.mirrorPhysicalsOntoVirtual()
+            routeAudio(passenger: true)
             let ok = engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi)
             log("passenger converged=\(ok)")
             lastMode = mode
@@ -334,6 +424,7 @@ final class Reconciler {
             log("converge -> console")
             engine.destroyVirtual()
             restoreArrangement(engine: engine)
+            routeAudio(passenger: false)
             lastMode = .console
         }
     }
@@ -573,6 +664,13 @@ func selftest() -> Never {
                       laptopCanvas: "laptop-air") == "laptop-air", "builtin only -> laptop canvas")
     expect(pickCanvas(physicalWidths: [], dockedCanvas: "ultrawide",
                       laptopCanvas: "laptop-air") == "laptop-air", "headless -> laptop canvas")
+    // audio picks
+    let names = ["MacBook Air Speakers", "Jump Desktop Audio", "Jump Desktop Microphone", "ZoomAudioDevice"]
+    let pa = pickAudioNames(passenger: true, deviceNames: names)
+    expect(pa.output == "Jump Desktop Audio" && pa.input == "Jump Desktop Microphone",
+           "passenger audio -> jump devices")
+    let ca = pickAudioNames(passenger: false, deviceNames: names)
+    expect(ca.output == nil && ca.input == nil, "console audio -> builtin fallback")
     // config sanity
     let cfg = loadConfig()
     expect(cfg.machines.count >= 3, "config has machines")

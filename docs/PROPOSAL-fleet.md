@@ -47,9 +47,10 @@ One explicit click is the simplicity contract.
   Pro 1728x1080, Air-15 1470x956, future Air-13 1440x900). Dock/undock is a
   canvas change the daemon debounces (~10s) and rolls out as one coordinated
   transition — never a mid-session yank.
-- Mac passengers: one BetterDisplay virtual screen shaped to the canvas,
-  physical displays mirrored onto it (works unlicensed — capture-then-restore
-  arrangement via displayplacer), HiDPI when the quality tier allows.
+- Mac passengers: one MIRA-native virtual screen shaped to the canvas,
+  physical displays mirrored onto it (CoreGraphics mirroring; the previous
+  arrangement is captured first and restored on release), HiDPI when the
+  quality tier allows.
 - Windows passengers: RDP dynamic resolution already follows the client
   window; MIRA just sizes the Space. No agent needed on Windows.
 
@@ -84,16 +85,33 @@ reversible, all recorded in the passenger's state file:
 - Nothing destructive: every setting is captured before change and restored
   on release.
 
-## Upgrade safety (the BetterDisplay/Jump/Scroll-Reverser reality)
+## Native display + input engine (fewer apps, fewer icons)
 
-A `knownGood` block in the config pins the tool versions the rig trusts
-(BetterDisplay 4.3.5, Jump Desktop 10.15.6 direct-download — never the 9.1.9
-cask, displayplacer, Scroll Reverser). The doctor compares installed vs
-known-good on every machine and flags drift *before* it bites; upgrades are a
-deliberate per-machine act (upgrade one passenger, doctor, then roll on). All
-tool quirks live behind one adapter layer in the binary (the per-entity
-answer parsing, wake-before-connect, etc.), so a tool update breaks one file,
-not five scripts.
+MIRA absorbs the only things we used BetterDisplay and Scroll Reverser for:
+
+- **Virtual screens natively** via the CGVirtualDisplay engine (the same
+  mechanism DeskPad-class apps use), including HiDPI modes. MIRA creates and
+  destroys them directly — no connect/disconnect negotiation with another app,
+  no Pro-license gates, no CLI quirk adapters.
+- **Mirroring, resolution, and main-display switching** via public
+  CoreGraphics display-configuration APIs — displayplacer is dropped too.
+- **Scroll reversal** as a built-in event tap (mouse reversed, trackpad
+  natural, per-device), using the Accessibility permission MIRA already has.
+
+BetterDisplay, displayplacer, and Scroll Reverser are then uninstalled.
+Menu bar ends with ONE MIRA icon (Jump Connect and Tailscale hide theirs via
+their own settings). Caveat, stated honestly: CGVirtualDisplay is a private
+API — stable across years and many shipping apps, but macOS major updates are
+gated by the doctor before adoption.
+
+## Upgrade safety (the Jump/macOS reality)
+
+A `knownGood` block in the config pins what the rig trusts: Jump Desktop
+10.15.6 direct-download (never the 9.1.9 cask), Jump Connect, and the macOS
+version each machine has been validated on (the virtual-display engine is
+re-validated by the doctor before any macOS major upgrade is adopted).
+Upgrades are a deliberate per-machine act: upgrade one passenger, doctor,
+then roll on.
 
 ## Live session add / remove
 

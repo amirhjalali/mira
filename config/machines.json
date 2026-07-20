@@ -1,0 +1,41 @@
+{
+  "comment": "The whole rig in one tracked file. A machine finds itself by unix user name.",
+  "claimTTLSeconds": 90,
+  "heartbeatSeconds": 30,
+  "reconcileSeconds": 15,
+  "dockMarker": "3440",
+  "canvases": {
+    "laptop":    { "resolution": "1470x956",  "hidpi": true,  "screen": "Laptop" },
+    "ultrawide": { "resolution": "3440x1440", "hidpi": false, "screen": "Ultrawide" }
+  },
+  "virtualScreens": {
+    "Laptop":    { "aspect": [16, 10], "resolutions": ["1728x1080", "1470x956", "1440x900"] },
+    "Ultrawide": { "aspect": [43, 18], "resolutions": ["3440x1440", "2752x1152", "1720x720"] }
+  },
+  "machines": [
+    {
+      "id": "pro",
+      "jumpName": "Amir’s MacBook Pro",
+      "host": "Amirs-MacBook-Pro.local",
+      "tailscale": "100.91.23.16",
+      "user": "amirhjalali",
+      "roles": ["viewer", "target"]
+    },
+    {
+      "id": "air",
+      "jumpName": "Amir’s MacBook Air",
+      "host": "MacBook-Air-3.local",
+      "tailscale": "100.118.137.45",
+      "user": "amirjalali",
+      "roles": ["viewer", "target"]
+    },
+    {
+      "id": "mini",
+      "jumpName": "Amir’s Mac mini",
+      "host": "gabooja.local",
+      "tailscale": "100.105.19.90",
+      "user": "gabooja",
+      "roles": ["target"]
+    }
+  ]
+}

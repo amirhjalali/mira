@@ -1,12 +1,14 @@
-// MIRA 2 — one binary: menu-bar app, reconciler daemon, CLI.
-// See docs/DESIGN-2.md. Modes:
-//   (no args)   menu-bar app
-//   --daemon    reconciler loop (LaunchAgent)
-//   status | claim | release | console | doctor | selftest
+// MIRA 2 — one binary: menu-bar app, passenger daemon, CLI. Native display
+// engine (CGVirtualDisplay + CoreGraphics config) — no BetterDisplay, no
+// displayplacer. See docs/DESIGN-2.md and docs/PROPOSAL-fleet.md.
+//
+//   (no args)    menu-bar app (driver UI)
+//   --daemon     reconciler daemon (every Mac; passengers converge here)
+//   drive | stop | status | doctor | console | selftest
 import AppKit
 import Foundation
 
-// MARK: - Shell
+// MARK: - Shell (small residue: ssh, ping, osascript)
 
 @discardableResult
 func sh(_ cmd: String, timeout: TimeInterval = 30) -> (out: String, code: Int32) {
@@ -25,30 +27,20 @@ func sh(_ cmd: String, timeout: TimeInterval = 30) -> (out: String, code: Int32)
     return (String(data: data, encoding: .utf8) ?? "", p.terminationStatus)
 }
 
-let BDCLI: String = {
-    for c in ["/opt/homebrew/bin/betterdisplaycli", "/usr/local/bin/betterdisplaycli"]
-    where FileManager.default.isExecutableFile(atPath: c) { return c }
-    return "betterdisplaycli"
-}()
-let DISPLAYPLACER: String = {
-    for c in ["/opt/homebrew/bin/displayplacer", "/usr/local/bin/displayplacer"]
-    where FileManager.default.isExecutableFile(atPath: c) { return c }
-    return "displayplacer"
-}()
-
 // MARK: - Config
 
-struct Canvas: Codable { let resolution: String; let hidpi: Bool; let screen: String }
-struct VScreenSpec: Codable { let aspect: [Int]; let resolutions: [String] }
+struct Canvas: Codable { let width: Int; let height: Int; let hidpi: Bool }
 struct Machine: Codable {
     let id: String, jumpName: String, host: String, tailscale: String, user: String
     let roles: [String]
+    let laptopCanvas: String?     // canvas key when this machine drives undocked
+    let type: String?             // "mac" (default) | "windows"
 }
 struct Config: Codable {
-    let claimTTLSeconds: Double, heartbeatSeconds: Double, reconcileSeconds: Double
-    let dockMarker: String
+    let rideTTLSeconds: Double, heartbeatSeconds: Double, reconcileSeconds: Double
+    let homeSubnetPrefix: String
+    let dockedCanvas: String
     let canvases: [String: Canvas]
-    let virtualScreens: [String: VScreenSpec]
     let machines: [Machine]
 }
 
@@ -60,12 +52,15 @@ func repoRoot() -> URL {
 }
 
 func loadConfig() -> Config {
-    let url = repoRoot().appendingPathComponent("config/machines.json")
-    guard let data = try? Data(contentsOf: url),
-          let cfg = try? JSONDecoder().decode(Config.self, from: data) else {
-        fatalError("cannot load \(url.path)")
+    let candidates = [
+        repoRoot().appendingPathComponent("config/machines.json"),
+        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/mira/machines.json"),
+    ]
+    for url in candidates {
+        if let data = try? Data(contentsOf: url),
+           let cfg = try? JSONDecoder().decode(Config.self, from: data) { return cfg }
     }
-    return cfg
+    fatalError("cannot load machines.json from repo or ~/.config/mira/")
 }
 
 func selfMachine(_ cfg: Config) -> Machine {
@@ -74,12 +69,13 @@ func selfMachine(_ cfg: Config) -> Machine {
     fatalError("no machine in machines.json with user \(me)")
 }
 
-// MARK: - State dir
+// MARK: - State
 
 let stateDir = URL(fileURLWithPath: NSHomeDirectory())
     .appendingPathComponent("Library/Application Support/MacRig", isDirectory: true)
-let claimFile = stateDir.appendingPathComponent("claim.json")
-let restoreFile = stateDir.appendingPathComponent("console-arrangement.sh")
+let rideFile = stateDir.appendingPathComponent("ride.json")
+let drivingFlag = stateDir.appendingPathComponent("driving")
+let arrangementFile = stateDir.appendingPathComponent("arrangement.json")
 let logFile = repoRoot().appendingPathComponent("logs/mira2.log")
 
 func log(_ msg: String) {
@@ -93,128 +89,209 @@ func log(_ msg: String) {
     FileHandle.standardOutput.write(line.data(using: .utf8)!)
 }
 
-// MARK: - Claim
+// MARK: - Ride (a driver's claim on this passenger)
 
-struct Claim: Codable {
-    let viewer: String       // machine id of the claiming viewer
-    let canvas: String       // key into cfg.canvases
-    let ts: Double           // unix time of last heartbeat
+struct Ride: Codable {
+    let driver: String
+    let canvas: String
+    let hidpi: Bool
+    let ts: Double
     func isLive(ttl: Double, now: Double = Date().timeIntervalSince1970) -> Bool {
         now - ts < ttl
     }
 }
 
-func readClaim() -> Claim? {
-    guard let d = try? Data(contentsOf: claimFile) else { return nil }
-    return try? JSONDecoder().decode(Claim.self, from: d)
+func readRide() -> Ride? {
+    guard let d = try? Data(contentsOf: rideFile) else { return nil }
+    return try? JSONDecoder().decode(Ride.self, from: d)
 }
 
-func writeClaimLocal(_ c: Claim?) {
-    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
-    if let c = c, let d = try? JSONEncoder().encode(c) { try? d.write(to: claimFile) }
-    else { try? FileManager.default.removeItem(at: claimFile) }
-}
+// MARK: - Mode (pure, selftested)
 
-// MARK: - Console evidence
+enum Mode: Equatable { case console; case passenger(canvas: String, hidpi: Bool) }
 
-let virtualNames = ["Ultrawide", "Laptop"]
-
-func consoleUser() -> String {
-    sh("stat -f %Su /dev/console").out.trimmingCharacters(in: .whitespacesAndNewlines)
-}
-
-struct DisplayEntity { let name: String; let deviceType: String }
-
-func bdIdentifiers() -> [DisplayEntity] {
-    let raw = sh("\(BDCLI) get -identifiers 2>/dev/null").out
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !raw.isEmpty, let data = "[\(raw)]".data(using: .utf8),
-          let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
-    return arr.compactMap { o in
-        guard let n = o["name"] as? String, let t = o["deviceType"] as? String else { return nil }
-        return DisplayEntity(name: n, deviceType: t)
+func computeMode(ride: Ride?, ttl: Double, now: Double) -> Mode {
+    if let r = ride, r.isLive(ttl: ttl, now: now) {
+        return .passenger(canvas: r.canvas, hidpi: r.hidpi)
     }
-}
-
-// Pure: is a real user present at a physical screen?
-func computeConsoleActive(user: String, entities: [DisplayEntity]) -> Bool {
-    switch user { case "", "root", "loginwindow", "_mbsetupuser": return false; default: break }
-    return entities.contains { $0.deviceType == "Display" && !virtualNames.contains($0.name) }
-}
-
-// MARK: - Desired state (pure core, selftested)
-
-enum Mode: Equatable { case console; case target(canvas: String) }
-
-// The one rule: a live claim makes this machine a target; otherwise, console.
-// Console evidence does not veto a live claim (the viewer asked for the screen);
-// it decides the default when no claim exists and gates login-time behavior.
-func computeMode(claim: Claim?, ttl: Double, now: Double) -> Mode {
-    if let c = claim, c.isLive(ttl: ttl, now: now) { return .target(canvas: c.canvas) }
     return .console
 }
 
-// MARK: - Displays: observation
+// MARK: - Tier engine (pure, selftested)
 
-struct DisplaysSnapshot {
-    let activeNames: [String]          // section names from system_profiler
-    let mirrorOn: [String: Bool]
-    let mainName: String?
-}
+enum Tier: String { case full, standard, travel, lifeline }
 
-func parseDisplaysProfile(_ text: String) -> DisplaysSnapshot {
-    var names: [String] = [], mirror: [String: Bool] = [:], main: String?
-    var current: String?
-    for line in text.components(separatedBy: "\n") {
-        if line.hasPrefix("        "), !line.hasPrefix("         "), line.hasSuffix(":") {
-            current = String(line.dropFirst(8).dropLast())
-            names.append(current!)
-        } else if let c = current {
-            if line.contains("Mirror: On") { mirror[c] = true }
-            if line.contains("Mirror: Off") { mirror[c] = false }
-            if line.contains("Main Display: Yes") { main = c }
-        }
+// Hysteresis thresholds proven in v1: demote at avg>=70 || jitter>=35;
+// recover only when avg<50 && jitter<22.
+func computeTier(previous: Tier, avgMs: Double, jitterMs: Double,
+                 home: Bool, docked: Bool) -> Tier {
+    if home { return docked ? .full : .standard }
+    let bad = avgMs >= 70 || jitterMs >= 35
+    let good = avgMs < 50 && jitterMs < 22
+    switch previous {
+    case .travel: return bad ? .lifeline : .travel
+    case .lifeline: return good ? .travel : .lifeline
+    default: return bad ? .lifeline : .travel
     }
-    return DisplaysSnapshot(activeNames: names, mirrorOn: mirror, mainName: main)
 }
 
-func displaysSnapshot() -> DisplaysSnapshot {
-    parseDisplaysProfile(sh("system_profiler SPDisplaysDataType 2>/dev/null").out)
+func tierWantsHiDPI(_ t: Tier) -> Bool { t == .full || t == .standard }
+
+// MARK: - Canvas pick (pure, selftested)
+
+// Docked means any physical display at least 3000px wide is attached.
+func pickCanvas(physicalWidths: [Int], dockedCanvas: String, laptopCanvas: String) -> String {
+    physicalWidths.contains { $0 >= 3000 } ? dockedCanvas : laptopCanvas
 }
 
-// BetterDisplay answers once per matching entity ("on,on"); every value must match.
-func allValuesAre(_ expected: String, _ actual: String) -> Bool {
-    let vals = actual.trimmingCharacters(in: .whitespacesAndNewlines)
-        .components(separatedBy: ",").filter { !$0.isEmpty }
-    return !vals.isEmpty && vals.allSatisfy { $0 == expected }
-}
+// MARK: - Native display engine
 
-func vsConnected(_ name: String) -> Bool {
-    allValuesAre("on", sh("\(BDCLI) get -name=\(name) -connected 2>/dev/null").out)
-}
+let miraVendorID: UInt32 = 0x4D49_5241 & 0xFFFF  // "RA" tail of 'MIRA'
 
-// MARK: - displayplacer helpers
+final class DisplayEngine {
+    private var virtualDisplay: CGVirtualDisplay?
+    private(set) var virtualID: CGDirectDisplayID = 0
 
-// The last "displayplacer \"..." line of `displayplacer list` is the exact
-// command that restores the current arrangement.
-func parseRestoreCommand(_ listOutput: String) -> String? {
-    listOutput.components(separatedBy: "\n").last { $0.hasPrefix("displayplacer \"") }
-}
-
-struct PlacerScreen { let persistentId: String; let type: String }
-
-func parsePlacerScreens(_ listOutput: String) -> [PlacerScreen] {
-    var out: [PlacerScreen] = []
-    var pid: String?
-    for line in listOutput.components(separatedBy: "\n") {
-        if line.hasPrefix("Persistent screen id: ") {
-            pid = String(line.dropFirst("Persistent screen id: ".count))
-        } else if line.hasPrefix("Type: "), let p = pid {
-            out.append(PlacerScreen(persistentId: p, type: String(line.dropFirst("Type: ".count))))
-            pid = nil
-        }
+    func onlineDisplays() -> [CGDirectDisplayID] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        CGGetOnlineDisplayList(16, &ids, &count)
+        return Array(ids.prefix(Int(count)))
     }
-    return out
+
+    func physicalDisplays() -> [CGDirectDisplayID] {
+        onlineDisplays().filter { $0 != virtualID && CGDisplayVendorNumber($0) != miraVendorID }
+    }
+
+    func physicalWidths() -> [Int] {
+        physicalDisplays().map { Int(CGDisplayPixelsWide($0)) }
+    }
+
+    // Create (or reuse) the virtual display for a canvas. hiDPI is a
+    // create-time property: publish both 2x and 1x modes under hiDPI so tier
+    // changes are mode switches, not recreations.
+    func ensureVirtual(canvas: Canvas) -> Bool {
+        if virtualDisplay != nil { return true }
+        let desc = CGVirtualDisplayDescriptor()
+        desc.name = "MIRA"
+        desc.maxPixelsWide = 6880
+        desc.maxPixelsHigh = 3824
+        desc.sizeInMillimeters = CGSize(width: 800, height: 335)
+        desc.serialNum = 1
+        desc.productID = 0x4D32
+        desc.vendorID = miraVendorID
+        desc.queue = DispatchQueue.main
+        desc.terminationHandler = { _, _ in log("virtual display terminated by system") }
+        guard let display = CGVirtualDisplay(descriptor: desc) else { return false }
+        let settings = CGVirtualDisplaySettings()
+        settings.hiDPI = 1
+        var modes: [CGVirtualDisplayMode] = []
+        for c in [canvas] {
+            modes.append(CGVirtualDisplayMode(width: UInt32(c.width * 2),
+                                              height: UInt32(c.height * 2), refreshRate: 60))
+            modes.append(CGVirtualDisplayMode(width: UInt32(c.width),
+                                              height: UInt32(c.height), refreshRate: 60))
+        }
+        settings.modes = modes
+        guard display.apply(settings) else { return false }
+        virtualDisplay = display
+        virtualID = display.displayID
+        log("virtual display created id=\(virtualID) for \(canvas.width)x\(canvas.height)")
+        return true
+    }
+
+    func destroyVirtual() {
+        if virtualDisplay != nil { log("virtual display destroyed") }
+        virtualDisplay = nil
+        virtualID = 0
+    }
+
+    // Choose a mode on the virtual display: UI size WxH at 2x (hidpi) or 1x.
+    func setVirtualMode(canvas: Canvas, hidpi: Bool) -> Bool {
+        guard virtualID != 0 else { return false }
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+        guard let modes = CGDisplayCopyAllDisplayModes(virtualID, opts) as? [CGDisplayMode] else { return false }
+        let want = modes.first { m in
+            m.width == canvas.width && m.height == canvas.height &&
+            (hidpi ? m.pixelWidth == canvas.width * 2 : m.pixelWidth == canvas.width)
+        }
+        guard let mode = want else { return false }
+        var cfg: CGDisplayConfigRef?
+        CGBeginDisplayConfiguration(&cfg)
+        CGConfigureDisplayWithDisplayMode(cfg, virtualID, mode, nil)
+        return CGCompleteDisplayConfiguration(cfg, .permanently) == .success
+    }
+
+    func mirrorPhysicalsOntoVirtual() -> Bool {
+        guard virtualID != 0 else { return false }
+        var cfg: CGDisplayConfigRef?
+        CGBeginDisplayConfiguration(&cfg)
+        for p in physicalDisplays() { CGConfigureDisplayMirrorOfDisplay(cfg, p, virtualID) }
+        CGConfigureDisplayOrigin(cfg, virtualID, 0, 0)  // main
+        return CGCompleteDisplayConfiguration(cfg, .permanently) == .success
+    }
+
+    func unmirrorAll() {
+        var cfg: CGDisplayConfigRef?
+        CGBeginDisplayConfiguration(&cfg)
+        for d in onlineDisplays() where d != virtualID {
+            CGConfigureDisplayMirrorOfDisplay(cfg, d, kCGNullDirectDisplay)
+        }
+        CGCompleteDisplayConfiguration(cfg, .permanently)
+    }
+
+    func setMain(_ id: CGDirectDisplayID) {
+        var cfg: CGDisplayConfigRef?
+        CGBeginDisplayConfiguration(&cfg)
+        CGConfigureDisplayOrigin(cfg, id, 0, 0)
+        CGCompleteDisplayConfiguration(cfg, .permanently)
+    }
+
+    // Invariant: virtual exists at canvas/hidpi, is main, every physical mirrors it.
+    func passengerInvariantHolds(canvas: Canvas, hidpi: Bool) -> Bool {
+        guard virtualID != 0, CGDisplayIsMain(virtualID) != 0 else { return false }
+        guard Int(CGDisplayPixelsWide(virtualID)) == (hidpi ? canvas.width : canvas.width) else { return false }
+        let m = CGDisplayCopyDisplayMode(virtualID)
+        if hidpi, let m = m, m.pixelWidth != canvas.width * 2 { return false }
+        for p in physicalDisplays() where CGDisplayMirrorsDisplay(p) != virtualID { return false }
+        return true
+    }
+}
+
+// MARK: - Arrangement capture / restore (origins of physical displays)
+
+struct SavedDisplay: Codable { let id: UInt32; let x: Int; let y: Int; let main: Bool }
+
+func captureArrangement(engine: DisplayEngine) {
+    guard !FileManager.default.fileExists(atPath: arrangementFile.path) else { return }
+    let saved = engine.physicalDisplays().map { d -> SavedDisplay in
+        let b = CGDisplayBounds(d)
+        return SavedDisplay(id: d, x: Int(b.origin.x), y: Int(b.origin.y),
+                            main: CGDisplayIsMain(d) != 0)
+    }
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    if let d = try? JSONEncoder().encode(saved) { try? d.write(to: arrangementFile) }
+}
+
+func restoreArrangement(engine: DisplayEngine) {
+    engine.unmirrorAll()
+    guard let data = try? Data(contentsOf: arrangementFile),
+          let saved = try? JSONDecoder().decode([SavedDisplay].self, from: data) else {
+        if let first = engine.physicalDisplays().first { engine.setMain(first) }
+        return
+    }
+    var cfg: CGDisplayConfigRef?
+    CGBeginDisplayConfiguration(&cfg)
+    for s in saved where engine.onlineDisplays().contains(s.id) {
+        CGConfigureDisplayOrigin(cfg, s.id, Int32(s.x), Int32(s.y))
+    }
+    CGCompleteDisplayConfiguration(cfg, .permanently)
+    if let main = saved.first(where: { $0.main }), engine.onlineDisplays().contains(main.id) {
+        engine.setMain(main.id)
+    } else if let first = engine.physicalDisplays().first {
+        engine.setMain(first)
+    }
+    try? FileManager.default.removeItem(at: arrangementFile)
 }
 
 // MARK: - Reconciler
@@ -222,174 +299,129 @@ func parsePlacerScreens(_ listOutput: String) -> [PlacerScreen] {
 final class Reconciler {
     let cfg: Config
     let me: Machine
+    let engine = DisplayEngine()
     var lastMode: Mode?
+
     init(cfg: Config) { self.cfg = cfg; self.me = selfMachine(cfg) }
 
-    func targetInvariantHolds(_ canvas: Canvas) -> Bool {
-        let snap = displaysSnapshot()
-        guard vsConnected(canvas.screen), snap.mainName == canvas.screen else { return false }
-        let physicals = snap.activeNames.filter { !virtualNames.contains($0) }
-        return physicals.allSatisfy { snap.mirrorOn[$0] == true }
-    }
-
-    func ensureVirtualScreen(_ name: String) {
-        let ids = bdIdentifiers()
-        if ids.contains(where: { $0.name == name && $0.deviceType == "VirtualScreen" }) { return }
-        guard let spec = cfg.virtualScreens[name] else { return }
-        let hidpi = cfg.canvases.values.first { $0.screen == name }?.hidpi ?? false
-        log("creating virtual screen \(name)")
-        sh("""
-        \(BDCLI) create -type=VirtualScreen -virtualScreenName=\(name) \
-          -aspectWidth=\(spec.aspect[0]) -aspectHeight=\(spec.aspect[1]) \
-          -useResolutionList=on -resolutionList="\(spec.resolutions.joined(separator: ","))" \
-          -virtualScreenHiDPI=\(hidpi ? "on" : "off")
-        """, timeout: 60)
-        sleep(3)
-    }
-
-    func captureArrangementIfNeeded() {
-        // Only capture from a clean console state, never mid-target.
-        guard lastMode == nil || lastMode == .console else { return }
-        let listing = sh("\(DISPLAYPLACER) list", timeout: 20).out
-        if let restore = parseRestoreCommand(listing) {
-            try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
-            try? "#!/bin/bash\n\(DISPLAYPLACER.replacingOccurrences(of: "displayplacer", with: "displayplacer"))\n"
-                .write(to: restoreFile, atomically: true, encoding: .utf8)
-            try? "#!/bin/bash\n\(restore)\n".write(to: restoreFile, atomically: true, encoding: .utf8)
-        }
-    }
-
-    func convergeTarget(canvasKey: String) {
-        guard let canvas = cfg.canvases[canvasKey] else { return }
-        if targetInvariantHolds(canvas) { return }
-        log("converge -> target(\(canvasKey))")
-        captureArrangementIfNeeded()
-        ensureVirtualScreen(canvas.screen)
-        // A machine in target mode never streams outward: end our own viewer.
-        sh("pkill -x 'Jump Desktop' 2>/dev/null")
-        // Wake displays so the virtual screen can materialize, then connect.
-        sh("caffeinate -u -t 20 >/dev/null 2>&1 &")
-        sh("\(BDCLI) set -name=\(canvas.screen) -connected=on", timeout: 20); sleep(3)
-        if !vsConnected(canvas.screen) {  // zombie half-connect: force a cycle
-            sh("\(BDCLI) set -name=\(canvas.screen) -connected=off"); sleep(3)
-            sh("\(BDCLI) set -name=\(canvas.screen) -connected=on", timeout: 20); sleep(3)
-        }
-        // Pick the mode: prefer HiDPI row when the canvas wants it.
-        let modes = sh("\(BDCLI) get -name=\(canvas.screen) -displayModeList 2>/dev/null").out
-        var modeNumber: String?
-        for line in modes.components(separatedBy: "\n") {
-            let f = line.split(separator: " ").map(String.init)
-            guard f.count >= 3, f[2] == canvas.resolution else { continue }
-            let isHi = line.contains("HiDPI")
-            if canvas.hidpi == isHi { modeNumber = f[0]; break }
-            if modeNumber == nil { modeNumber = f[0] }
-        }
-        if let n = modeNumber {
-            sh("\(BDCLI) set -name=\(canvas.screen) -displayModeNumber=\(n)"); sleep(2)
-        }
-        // Mirror every physical screen onto the virtual and make it main.
-        let placer = sh("\(DISPLAYPLACER) list", timeout: 20).out
-        let screens = parsePlacerScreens(placer)
-        // displayplacer names virtual screens by size class; identify physicals
-        // as "MacBook built in screen" or screens whose type mentions inch and
-        // whose id is not the virtual's. The virtual is the one whose current
-        // resolution equals the canvas (fallback: first screen listed).
-        let virtualId = screens.first { s in
-            placer.contains("Persistent screen id: \(s.persistentId)")
-        }.map { _ in "" }
-        _ = virtualId // resolved below via mirror grouping by exclusion
-        let idList = screens.map { $0.persistentId }
-        if idList.count >= 2 {
-            let grouped = idList.joined(separator: "+")
-            sh("\(DISPLAYPLACER) \"id:\(grouped) res:\(canvas.resolution) scaling:\(canvas.hidpi ? "on" : "off") origin:(0,0) degree:0\" 2>&1 | grep -v 'could not find res' || true", timeout: 30)
-        }
-        sh("\(BDCLI) set -name=\(canvas.screen) -main=on"); sleep(1)
-        let ok = targetInvariantHolds(canvas)
-        log("target(\(canvasKey)) converged=\(ok)")
-        lastMode = .target(canvas: canvasKey)
-    }
-
-    func convergeConsole() {
-        let snap = displaysSnapshot()
-        let virtualsActive = snap.activeNames.filter { virtualNames.contains($0) }
-        let alreadyClean = virtualsActive.isEmpty && !(snap.activeNames.isEmpty)
-        if alreadyClean && lastMode == .console { return }
-        if !virtualsActive.isEmpty || lastMode != .console {
-            log("converge -> console")
-            for v in virtualNames { sh("\(BDCLI) set -name=\(v) -connected=off") }
-            sleep(2)
-            if FileManager.default.fileExists(atPath: restoreFile.path) {
-                sh("bash '\(restoreFile.path)' 2>/dev/null", timeout: 30)
-                try? FileManager.default.removeItem(at: restoreFile)
-            }
-            sh("\(BDCLI) set -namelike=Built -main=on 2>/dev/null")
-        }
-        lastMode = .console
-    }
-
     func tick() {
-        let mode = computeMode(claim: readClaim(), ttl: cfg.claimTTLSeconds,
+        let mode = computeMode(ride: readRide(), ttl: cfg.rideTTLSeconds,
                                now: Date().timeIntervalSince1970)
         switch mode {
-        case .target(let canvasKey): convergeTarget(canvasKey: canvasKey)
-        case .console: convergeConsole()
+        case .passenger(let canvasKey, let hidpi):
+            guard let canvas = cfg.canvases[canvasKey] else { return }
+            let wantHi = hidpi && canvas.hidpi
+            if engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi),
+               lastMode == mode { return }
+            log("converge -> passenger(\(canvasKey), hidpi=\(wantHi))")
+            captureArrangement(engine: engine)
+            sh("pkill -x 'Jump Desktop' 2>/dev/null")          // never stream outward
+            sh("caffeinate -u -t 15 >/dev/null 2>&1 &")        // wake display stack
+            guard engine.ensureVirtual(canvas: canvas) else { log("virtual create FAILED"); return }
+            _ = engine.setVirtualMode(canvas: canvas, hidpi: wantHi)
+            _ = engine.mirrorPhysicalsOntoVirtual()
+            let ok = engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi)
+            log("passenger converged=\(ok)")
+            lastMode = mode
+        case .console:
+            if lastMode == .console || (lastMode == nil && engine.virtualID == 0
+                && !FileManager.default.fileExists(atPath: arrangementFile.path)) {
+                lastMode = .console; return
+            }
+            log("converge -> console")
+            engine.destroyVirtual()
+            restoreArrangement(engine: engine)
+            lastMode = .console
         }
     }
 }
 
-// MARK: - SSH to peers (multiplexed)
+// MARK: - SSH to peers (multiplexed; sockets live in ~/.ssh — no spaces)
 
-func sshArgs(_ m: Machine) -> String {
-    let ctl = "\(stateDir.path)/ssh-%r@%h"
-    return "-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new " +
-           "-o ControlMaster=auto -o ControlPath='\(ctl)' -o ControlPersist=120"
+func sshArgs() -> String {
+    "-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new " +
+    "-o ControlMaster=auto -o ControlPath=~/.ssh/mira-%C -o ControlPersist=120"
 }
 
 func peerRun(_ m: Machine, _ cmd: String, timeout: TimeInterval = 20) -> (out: String, code: Int32) {
     let q = cmd.replacingOccurrences(of: "'", with: "'\\''")
-    return sh("ssh \(sshArgs(m)) \(m.user)@\(m.tailscale) '\(q)'", timeout: timeout)
+    return sh("ssh \(sshArgs()) \(m.user)@\(m.tailscale) '\(q)'", timeout: timeout)
 }
 
-func placeClaim(on target: Machine, canvas: String, viewer: String, cfg: Config) -> Bool {
-    let claim = Claim(viewer: viewer, canvas: canvas, ts: Date().timeIntervalSince1970)
-    guard let d = try? JSONEncoder().encode(claim), let json = String(data: d, encoding: .utf8)
-    else { return false }
+// MARK: - Driver side
+
+func atHome(cfg: Config) -> Bool {
+    sh("ifconfig 2>/dev/null | awk '/inet /{print $2}'").out
+        .contains(cfg.homeSubnetPrefix)
+}
+
+func measureNet(to m: Machine) -> (avg: Double, jitter: Double)? {
+    let out = sh("ping -c 15 -i 0.2 -q \(m.tailscale) 2>/dev/null | awk -F/ '/round-trip/{gsub(/[^0-9.]/,\"\",$7); print $5, $7}'", timeout: 15).out
+    let parts = out.split(separator: " ").compactMap { Double($0) }
+    guard parts.count == 2 else { return nil }
+    return (parts[0], parts[1])
+}
+
+func driverCanvasKey(cfg: Config, me: Machine, engine: DisplayEngine) -> String {
+    pickCanvas(physicalWidths: engine.physicalWidths(),
+               dockedCanvas: cfg.dockedCanvas,
+               laptopCanvas: me.laptopCanvas ?? "laptop-pro")
+}
+
+func placeRide(on target: Machine, canvas: String, hidpi: Bool, driver: String) -> Bool {
+    let ride = Ride(driver: driver, canvas: canvas, hidpi: hidpi,
+                    ts: Date().timeIntervalSince1970)
+    guard let d = try? JSONEncoder().encode(ride),
+          let json = String(data: d, encoding: .utf8) else { return false }
     let dir = "$HOME/Library/Application Support/MacRig"
-    let r = peerRun(target, "mkdir -p \"\(dir)\" && printf %s '\(json)' > \"\(dir)/claim.json\"")
-    return r.code == 0
+    return peerRun(target, "mkdir -p \"\(dir)\" && printf %s '\(json)' > \"\(dir)/ride.json\"").code == 0
 }
 
-func releaseClaim(on target: Machine) {
-    _ = peerRun(target, "rm -f \"$HOME/Library/Application Support/MacRig/claim.json\"")
+func endRide(on target: Machine) {
+    _ = peerRun(target, "rm -f \"$HOME/Library/Application Support/MacRig/ride.json\"")
+}
+
+func macPassengers(cfg: Config, me: Machine) -> [Machine] {
+    cfg.machines.filter { $0.id != me.id && $0.roles.contains("target") && ($0.type ?? "mac") == "mac" }
+}
+
+func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Tier) -> Tier {
+    let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
+    let home = atHome(cfg: cfg)
+    let docked = canvas == cfg.dockedCanvas
+    var tier = previousTier
+    if let net = macPassengers(cfg: cfg, me: me).lazy.compactMap({ measureNet(to: $0) }).first {
+        tier = computeTier(previous: previousTier, avgMs: net.avg, jitterMs: net.jitter,
+                           home: home, docked: docked)
+    }
+    for t in macPassengers(cfg: cfg, me: me) {
+        _ = placeRide(on: t, canvas: canvas, hidpi: tierWantsHiDPI(tier), driver: me.id)
+    }
+    return tier
 }
 
 // MARK: - Doctor
 
 func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
-    var lines: [String] = ["MIRA 2 Doctor — \(me.id)"], failures = 0
-    let targets = cfg.machines.filter { $0.id != me.id && $0.roles.contains("target") }
-    let group = DispatchGroup()
-    let lock = NSLock()
-    var peerLines: [String] = []
-    for t in targets {
+    var lines = ["MIRA 2 Doctor — \(me.id)"], failures = 0
+    let group = DispatchGroup(); let lock = NSLock(); var peerLines: [String] = []
+    for t in macPassengers(cfg: cfg, me: me) {
         group.enter()
         DispatchQueue.global().async {
             var l: [String] = []
             let probe = peerRun(t, """
             echo user=$(whoami); \
-            test -x /opt/homebrew/bin/betterdisplaycli && echo bdcli=ok || echo bdcli=missing; \
-            /opt/homebrew/bin/betterdisplaycli get -identifiers 2>/dev/null | grep -c VirtualScreen; \
-            cat "$HOME/Library/Application Support/MacRig/claim.json" 2>/dev/null || echo no-claim
+            pgrep -f 'MIRA2 --daemon' >/dev/null && echo daemon=ok || echo daemon=missing; \
+            cat "$HOME/Library/Application Support/MacRig/ride.json" 2>/dev/null || echo no-ride
             """, timeout: 15)
-            if probe.code != 0 {
-                l.append("✗ \(t.id) unreachable"); lock.lock(); failures += 1; lock.unlock()
-            } else {
+            if probe.code != 0 { l.append("✗ \(t.id) unreachable"); lock.lock(); failures += 1; lock.unlock() }
+            else {
                 let o = probe.out
-                l.append(o.contains("bdcli=ok") ? "✓ \(t.id) reachable, BetterDisplay ok"
-                                                : "✗ \(t.id) missing BetterDisplay CLI")
-                if !o.contains("bdcli=ok") { lock.lock(); failures += 1; lock.unlock() }
-                l.append(o.contains("no-claim") ? "  \(t.id): no active claim"
-                                                : "  \(t.id): claim present")
+                l.append("✓ \(t.id) reachable")
+                if o.contains("daemon=missing") {
+                    l.append("✗ \(t.id) daemon not running"); lock.lock(); failures += 1; lock.unlock()
+                } else { l.append("✓ \(t.id) daemon running") }
+                l.append(o.contains("no-ride") ? "  \(t.id): parked" : "  \(t.id): being driven")
             }
             lock.lock(); peerLines.append(contentsOf: l); lock.unlock()
             group.leave()
@@ -397,55 +429,29 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
     }
     group.wait()
     lines.append(contentsOf: peerLines.sorted())
-    // Transport: a busy screensharingd while we are a target means VNC.
     let vnc = sh("ps -Aro pcpu,comm | awk '$2 ~ /screensharingd/ && $1+0 > 5'").out
     if !vnc.trimmingCharacters(in: .whitespaces).isEmpty {
-        lines.append("✗ inbound session is VNC (screensharingd busy) — use the Fluid entry")
-        failures += 1
-    } else {
-        lines.append("✓ no VNC session detected")
-    }
+        lines.append("✗ inbound session is VNC — use the Fluid entry"); failures += 1
+    } else { lines.append("✓ no VNC session detected") }
     lines.append(failures == 0 ? "Doctor: ready" : "Doctor: \(failures) failure(s)")
     return (lines.joined(separator: "\n"), failures)
-}
-
-// MARK: - Viewer actions
-
-func currentCanvasKey(cfg: Config) -> String {
-    let displays = sh("system_profiler SPDisplaysDataType 2>/dev/null").out
-    return displays.contains(cfg.dockMarker) ? "ultrawide" : "laptop"
-}
-
-func claimAllTargets(cfg: Config, me: Machine) -> String {
-    let canvas = currentCanvasKey(cfg: cfg)
-    var results: [String] = []
-    for t in cfg.machines where t.id != me.id && t.roles.contains("target") {
-        let ok = placeClaim(on: t, canvas: canvas, viewer: me.id, cfg: cfg)
-        results.append("\(t.id): \(ok ? "claimed (\(canvas))" : "CLAIM FAILED")")
-    }
-    return results.joined(separator: "\n")
-}
-
-func releaseAllTargets(cfg: Config, me: Machine) {
-    for t in cfg.machines where t.id != me.id && t.roles.contains("target") { releaseClaim(on: t) }
 }
 
 // MARK: - Daemon
 
 func runDaemon(cfg: Config) -> Never {
     let rec = Reconciler(cfg: cfg)
-    let me = rec.me
-    log("mira2 daemon started on \(me.id)")
-    var heartbeatCountdown = 0.0
+    log("mira2 daemon started on \(rec.me.id) (driver+passenger roles: \(rec.me.roles))")
+    var tier: Tier = .standard
+    var beat = 0.0
     while true {
         rec.tick()
-        // Viewer duty: heartbeat our claims so targets keep them alive.
-        if me.roles.contains("viewer") {
-            heartbeatCountdown -= cfg.reconcileSeconds
-            if heartbeatCountdown <= 0,
-               FileManager.default.fileExists(atPath: stateDir.appendingPathComponent("claiming").path) {
-                _ = claimAllTargets(cfg: cfg, me: me)
-                heartbeatCountdown = cfg.heartbeatSeconds
+        if rec.me.roles.contains("viewer"),
+           FileManager.default.fileExists(atPath: drivingFlag.path) {
+            beat -= cfg.reconcileSeconds
+            if beat <= 0 {
+                tier = driveTick(cfg: cfg, me: rec.me, engine: rec.engine, previousTier: tier)
+                beat = cfg.heartbeatSeconds
             }
         }
         Thread.sleep(forTimeInterval: cfg.reconcileSeconds)
@@ -464,25 +470,25 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         item.button?.title = "◈"
         rebuild()
     }
+    var driving: Bool { FileManager.default.fileExists(atPath: drivingFlag.path) }
     func rebuild() {
         let m = NSMenu()
-        let claiming = FileManager.default.fileExists(
-            atPath: stateDir.appendingPathComponent("claiming").path)
-        m.addItem(withTitle: claiming ? "Workspace: active" : "Workspace: released",
-                  action: nil, keyEquivalent: "")
+        m.addItem(withTitle: driving ? "◈ driving" : "◈ parked", action: nil, keyEquivalent: "")
         m.addItem(.separator())
-        m.addItem(withTitle: "Start Workspace", action: #selector(start), keyEquivalent: "").target = self
-        m.addItem(withTitle: "Release Targets", action: #selector(releaseTargets), keyEquivalent: "").target = self
-        m.addItem(withTitle: "Run Doctor", action: #selector(runDoctor), keyEquivalent: "").target = self
+        m.addItem(withTitle: "Drive from here", action: #selector(drive), keyEquivalent: "").target = self
+        m.addItem(withTitle: "Stop driving", action: #selector(stop), keyEquivalent: "").target = self
+        m.addItem(withTitle: "Run Doctor", action: #selector(runDoc), keyEquivalent: "").target = self
         m.addItem(.separator())
         m.addItem(withTitle: "Quit MIRA 2", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = m
     }
-    @objc func start() {
+    @objc func drive() {
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
-        FileManager.default.createFile(atPath: stateDir.appendingPathComponent("claiming").path, contents: nil)
-        let result = claimAllTargets(cfg: cfg, me: me)
-        for t in cfg.machines where t.id != me.id && t.roles.contains("target") {
+        FileManager.default.createFile(atPath: drivingFlag.path, contents: nil)
+        let engine = DisplayEngine()
+        let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
+        for t in macPassengers(cfg: cfg, me: me) {
+            _ = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
             sh("""
             osascript -e 'tell application "Jump Desktop" to activate' \
               -e 'delay 0.6' \
@@ -493,16 +499,16 @@ final class MenuApp: NSObject, NSApplicationDelegate {
               -e 'tell application "System Events" to tell process "Jump Desktop" to click menu item "\(t.jumpName)" of menu 1 of menu item "Open Recent" of menu 1 of menu bar item "File" of menu bar 1' 2>/dev/null
             """)
         }
-        notify("Workspace started\n\(result)")
+        notify("Driving \(macPassengers(cfg: cfg, me: me).count) passengers (\(canvas))")
         rebuild()
     }
-    @objc func releaseTargets() {
-        try? FileManager.default.removeItem(at: stateDir.appendingPathComponent("claiming"))
-        releaseAllTargets(cfg: cfg, me: me)
-        notify("Targets released — they return to console mode")
+    @objc func stop() {
+        try? FileManager.default.removeItem(at: drivingFlag)
+        for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
+        notify("Stopped driving — passengers return to console")
         rebuild()
     }
-    @objc func runDoctor() {
+    @objc func runDoc() {
         DispatchQueue.global().async {
             let (report, _) = doctor(cfg: self.cfg, me: self.me)
             log(report)
@@ -522,58 +528,46 @@ func selftest() -> Never {
     func expect(_ cond: Bool, _ name: String) {
         print("\(cond ? "ok" : "FAIL") - \(name)"); if !cond { failures += 1 }
     }
-    // allValuesAre: per-entity answers
-    expect(allValuesAre("on", "on"), "single on")
-    expect(allValuesAre("on", "on,on"), "double on")
-    expect(!allValuesAre("on", "on,off"), "mixed rejected")
-    expect(!allValuesAre("on", ""), "empty rejected")
-    // computeMode: claims and TTL
     let now = 1_000_000.0
-    let live = Claim(viewer: "air", canvas: "laptop", ts: now - 10)
-    let stale = Claim(viewer: "air", canvas: "laptop", ts: now - 120)
-    expect(computeMode(claim: live, ttl: 90, now: now) == .target(canvas: "laptop"), "live claim -> target")
-    expect(computeMode(claim: stale, ttl: 90, now: now) == .console, "stale claim -> console")
-    expect(computeMode(claim: nil, ttl: 90, now: now) == .console, "no claim -> console")
-    // console evidence
-    let physical = [DisplayEntity(name: "Color LCD", deviceType: "Display")]
-    let virtualOnly = [DisplayEntity(name: "Laptop", deviceType: "Display"),
-                       DisplayEntity(name: "Laptop", deviceType: "VirtualScreen")]
-    expect(computeConsoleActive(user: "amir", entities: physical), "user+physical -> active")
-    expect(!computeConsoleActive(user: "loginwindow", entities: physical), "loginwindow -> inactive")
-    expect(!computeConsoleActive(user: "amir", entities: virtualOnly), "virtual-only -> inactive")
-    // displayplacer parsing
-    let listing = """
-    Persistent screen id: AAA-111
-    Type: MacBook built in screen
-    Resolution: 3456x2234
-
-    Persistent screen id: BBB-222
-    Type: 24 inch external screen
-
-    Execute the command below to restore:
-    displayplacer "id:AAA-111 res:1728x1117 origin:(0,0)" "id:BBB-222 res:1470x956 origin:(1728,0)"
-    """
-    let screens = parsePlacerScreens(listing)
-    expect(screens.count == 2 && screens[0].persistentId == "AAA-111", "placer screens parsed")
-    expect(parseRestoreCommand(listing)?.hasPrefix("displayplacer \"id:AAA-111") == true, "restore cmd parsed")
-    // profile parsing
-    let prof = """
-    Graphics/Displays:
-          Displays:
-            Laptop:
-              Main Display: Yes
-              Mirror: On
-            Color LCD:
-              Mirror: On
-    """
-    let snap = parseDisplaysProfile(prof)
-    expect(snap.activeNames == ["Laptop", "Color LCD"], "profile names")
-    expect(snap.mainName == "Laptop", "profile main")
-    expect(snap.mirrorOn["Color LCD"] == true, "profile mirror")
-    // config loads and self-identifies
+    // ride TTL
+    let live = Ride(driver: "air", canvas: "laptop-air", hidpi: true, ts: now - 10)
+    let stale = Ride(driver: "air", canvas: "laptop-air", hidpi: true, ts: now - 120)
+    expect(computeMode(ride: live, ttl: 90, now: now) == .passenger(canvas: "laptop-air", hidpi: true),
+           "live ride -> passenger")
+    expect(computeMode(ride: stale, ttl: 90, now: now) == .console, "stale ride -> console")
+    expect(computeMode(ride: nil, ttl: 90, now: now) == .console, "no ride -> console")
+    // tier engine
+    expect(computeTier(previous: .travel, avgMs: 5, jitterMs: 2, home: true, docked: true) == .full,
+           "home docked -> full")
+    expect(computeTier(previous: .full, avgMs: 5, jitterMs: 2, home: true, docked: false) == .standard,
+           "home undocked -> standard")
+    expect(computeTier(previous: .standard, avgMs: 40, jitterMs: 10, home: false, docked: false) == .travel,
+           "away good -> travel")
+    expect(computeTier(previous: .travel, avgMs: 80, jitterMs: 10, home: false, docked: false) == .lifeline,
+           "away bad avg -> lifeline")
+    expect(computeTier(previous: .travel, avgMs: 40, jitterMs: 40, home: false, docked: false) == .lifeline,
+           "away bad jitter -> lifeline")
+    expect(computeTier(previous: .lifeline, avgMs: 60, jitterMs: 20, home: false, docked: false) == .lifeline,
+           "hysteresis: 60ms stays lifeline")
+    expect(computeTier(previous: .lifeline, avgMs: 40, jitterMs: 10, home: false, docked: false) == .travel,
+           "hysteresis: clean recovery -> travel")
+    expect(tierWantsHiDPI(.full) && tierWantsHiDPI(.standard), "home tiers hidpi on")
+    expect(!tierWantsHiDPI(.travel) && !tierWantsHiDPI(.lifeline), "away tiers hidpi off")
+    // canvas pick
+    expect(pickCanvas(physicalWidths: [3456, 3440], dockedCanvas: "ultrawide",
+                      laptopCanvas: "laptop-pro") == "ultrawide", "widescreen present -> ultrawide")
+    expect(pickCanvas(physicalWidths: [2940], dockedCanvas: "ultrawide",
+                      laptopCanvas: "laptop-air") == "laptop-air", "builtin only -> laptop canvas")
+    expect(pickCanvas(physicalWidths: [], dockedCanvas: "ultrawide",
+                      laptopCanvas: "laptop-air") == "laptop-air", "headless -> laptop canvas")
+    // config sanity
     let cfg = loadConfig()
-    expect(cfg.machines.count == 3, "config has 3 machines")
-    expect(cfg.canvases["laptop"]?.hidpi == true, "laptop canvas is HiDPI")
+    expect(cfg.machines.count >= 3, "config has machines")
+    expect(cfg.canvases[cfg.dockedCanvas] != nil, "docked canvas defined")
+    for m in cfg.machines where m.roles.contains("viewer") {
+        expect(m.laptopCanvas != nil && cfg.canvases[m.laptopCanvas!] != nil,
+               "viewer \(m.id) has laptop canvas")
+    }
     print(failures == 0 ? "MIRA2 selftest: OK" : "MIRA2 selftest: \(failures) FAILURES")
     exit(failures == 0 ? 0 : 1)
 }
@@ -585,17 +579,32 @@ switch args.count > 1 ? args[1] : "" {
 case "selftest": selftest()
 case "--daemon": runDaemon(cfg: loadConfig())
 case "status":
-    let cfg = loadConfig()
-    let me = selfMachine(cfg)
-    let mode = computeMode(claim: readClaim(), ttl: cfg.claimTTLSeconds,
+    let cfg = loadConfig(); let me = selfMachine(cfg)
+    let mode = computeMode(ride: readRide(), ttl: cfg.rideTTLSeconds,
                            now: Date().timeIntervalSince1970)
-    print("machine: \(me.id)  mode: \(mode)  console: \(computeConsoleActive(user: consoleUser(), entities: bdIdentifiers()))")
-case "claim":
-    let cfg = loadConfig(); print(claimAllTargets(cfg: cfg, me: selfMachine(cfg)))
-case "release":
-    let cfg = loadConfig(); releaseAllTargets(cfg: cfg, me: selfMachine(cfg)); print("released")
+    let driving = FileManager.default.fileExists(atPath: drivingFlag.path)
+    print("machine: \(me.id)  mode: \(mode)  driving: \(driving)")
+case "drive":
+    let cfg = loadConfig(); let me = selfMachine(cfg)
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    FileManager.default.createFile(atPath: drivingFlag.path, contents: nil)
+    let engine = DisplayEngine()
+    let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
+    for t in macPassengers(cfg: cfg, me: me) {
+        let ok = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
+        print("\(t.id): \(ok ? "riding (\(canvas))" : "RIDE FAILED")")
+    }
+case "stop":
+    let cfg = loadConfig(); let me = selfMachine(cfg)
+    try? FileManager.default.removeItem(at: drivingFlag)
+    for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
+    print("stopped — passengers return to console")
 case "console":
-    let cfg = loadConfig(); writeClaimLocal(nil); Reconciler(cfg: cfg).convergeConsole(); print("console mode")
+    let cfg = loadConfig()
+    try? FileManager.default.removeItem(at: rideFile)
+    let rec = Reconciler(cfg: cfg); rec.lastMode = .passenger(canvas: "", hidpi: false)
+    rec.tick()
+    print("console mode")
 case "doctor":
     let cfg = loadConfig()
     let (report, failures) = doctor(cfg: cfg, me: selfMachine(cfg))

@@ -19,11 +19,13 @@ one config file, one binary.
 `config/machines.json` describes every machine once:
 
 - Macs: `type: mac`, transport **Jump Fluid** (account-paired Connect).
-- Windows boxes: `type: windows`, transport **RDP — through Jump Desktop**,
-  not the Microsoft Windows App. Jump is already the Mac client and does RDP
-  natively with dynamic resolution; one client means one automation surface,
-  one place quality lives, one Space-per-machine pattern. (The Windows App
-  stays installed as a fallback; nothing depends on it.)
+- Windows boxes: `type: windows`, transport **Microsoft Windows App** (the
+  native RDP client — it works well and stays). MIRA generates a `.rdp` file
+  per machine from the registry (address, credentials profile, canvas-sized
+  defaults, `dynamic resolution:i:1`) and opens it with the Windows App; its
+  native dynamic resolution then follows the window, so tier changes need no
+  reconnect. MIRA's job is launch, Space placement, and inclusion in the
+  driver's session list — nothing deeper.
 - Future machines (M1 Air, new Windows boxes) are one JSON entry + one
   installer run. Nothing else to deploy anywhere.
 
@@ -130,9 +132,8 @@ code speaks the same language as the menu.
 
 ## Open questions
 
-1. Windows depth: is opening each Windows box as a Jump RDP Space enough, or
-   do you want per-tier resolution forcing there too (possible, slightly
-   clunkier — RDP reconnect on tier change)?
+1. ~~Windows depth~~ RESOLVED: native Windows App, `.rdp` launch, dynamic
+   resolution follows the window — no per-tier forcing needed.
 2. Should the mini ever be drivable? (Proposal assumes no — targets-only.)
 3. Hygiene: OK for MIRA to switch passengers to a static wallpaper and a
    "Passenger" Focus automatically? (Both restored on release.)

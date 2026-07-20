@@ -107,3 +107,11 @@ v2 installs alongside v1 (label `com.amir.mira2` during transition). Cutover
 per machine: stop v1 agents, `mira claim/console` proves transitions, then v1
 artifacts move to `attic/v1/`. The Air is the portability test: clone, run
 `install.sh`, done — no target-side deploy step exists anymore.
+
+## Naming (decided 2026-07-19)
+
+"MIRA 2" is a transitional identity only, used while v1 and v2 run side by
+side (bundle com.amir.mira2, /Applications/MIRA2.app). At final cutover the
+new binary takes the real name — /Applications/MIRA.app, the ◈ menu icon,
+LaunchAgent com.amir.mira — and no user-visible "2" survives. v1 moves to
+attic/.

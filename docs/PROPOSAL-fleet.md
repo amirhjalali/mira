@@ -98,7 +98,7 @@ not five scripts.
 ## Live session add / remove
 
 The menu lists every fleet machine with a checkbox-style toggle:
-- **Add**: places a claim + opens its Space (Fluid or RDP through Jump).
+- **Add**: places a claim + opens its Space (Jump Fluid for Macs, Windows App for Windows).
 - **Remove**: releases the claim — the passenger restores itself; its Space
   closes. Both work mid-session; claims are independent per machine.
 
@@ -125,7 +125,7 @@ code speaks the same language as the menu.
    multiplexing (socket path), dock-aware canvas, tier engine with hysteresis.
    Prove on Pro+mini from the Air.
 2. **Passenger hygiene** profile + restore.
-3. **Windows passengers** via Jump RDP entries + Space management.
+3. **Windows passengers** via generated `.rdp` files + Windows App launch and Space management.
 4. **Live add/remove UI** + fleet registry polish (M1 Air becomes a 5-minute
    add).
 5. **Known-good version doctor** + upgrade runbook.

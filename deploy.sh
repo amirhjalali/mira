@@ -140,6 +140,10 @@ PL
     launchctl bootout "gui/$uid" "$HOME/Library/LaunchAgents/com.amir.mira2.plist" 2>/dev/null || true
     rm -f "$HOME/Library/LaunchAgents/com.amir.mira2.plist"           "$HOME/Library/LaunchAgents/com.amir.mira-display.plist"           "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist"
     rm -rf "$HOME/Applications/MIRA2.app" "/Applications/MIRA2.app" 2>/dev/null || true
+    # v1 shell-era app (bundle id com.amir.macrig) lived in /Applications on viewers
+    if plutil -p "/Applications/MIRA.app/Contents/Info.plist" 2>/dev/null | grep -q com.amir.macrig; then
+      rm -rf "/Applications/MIRA.app"
+    fi
     rm -f "$HOME/ensure-ultrawide.sh" "$HOME/mira-set-display.sh"           "$HOME/collapse-displays.sh" "$HOME/restore-displays.sh"
     # remove legacy raw binary if present
     rm -f "$HOME/bin/mira"

@@ -136,6 +136,12 @@ func readHandbackTS() -> Double? {
 }
 
 func log(_ msg: String) {
+    if let sz = try? FileManager.default.attributesOfItem(atPath: logFile.path)[.size] as? Int,
+       sz > 1_000_000 {
+        let old = logFile.deletingPathExtension().appendingPathExtension("old.log")
+        try? FileManager.default.removeItem(at: old)
+        try? FileManager.default.moveItem(at: logFile, to: old)
+    }
     let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd HH:mm:ss"
     let line = "\(df.string(from: Date())) \(msg)\n"
     if let h = try? FileHandle(forWritingTo: logFile) {
@@ -672,6 +678,7 @@ final class Reconciler {
             sh("pkill -x 'Jump Desktop' 2>/dev/null; pkill -f 'MacOS/Jump Desktop$' 2>/dev/null")
             if engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi),
                lastMode == mode { checkWalkupTriggers(); return }
+            let t0 = Date()
             log("converge -> passenger(\(canvasKey), hidpi=\(wantHi))")
             captureArrangement(engine: engine)
             applyHygiene()
@@ -684,7 +691,7 @@ final class Reconciler {
             engine.setMain(engine.virtualID)
             routeAudio(passenger: true)
             let ok = engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi)
-            log("passenger converged=\(ok)")
+            log("passenger converged=\(ok) in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
             lastMode = mode
             checkWalkupTriggers()
         case .console:
@@ -832,6 +839,9 @@ func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Ti
     if let net = macPassengers(cfg: cfg, me: me).lazy.compactMap({ measureNet(to: $0) }).first {
         tier = computeTier(previous: previousTier, avgMs: net.avg, jitterMs: net.jitter,
                            home: home, docked: docked)
+        if tier != previousTier {
+            log("tier \(previousTier.rawValue) -> \(tier.rawValue) (avg=\(String(format: "%.0f", net.avg))ms jitter=\(String(format: "%.0f", net.jitter))ms home=\(home) canvas=\(canvas))")
+        }
     }
     for t in macPassengers(cfg: cfg, me: me) {
         if targetWalkedUp(t, cfg: cfg) { continue }
@@ -905,6 +915,11 @@ func runDaemon(cfg: Config) -> Never {
 // gestures untouched. Re-enables the tap if the system disables it.
 var scrollReversalEnabled = loadSettings().reverseScroll
 
+// Pure, selftested: reverse only phase-less scrolls (real wheels).
+func shouldReverseScroll(phase: Int64, momentum: Int64) -> Bool {
+    phase == 0 && momentum == 0
+}
+
 func scrollTapCallback(proxy: CGEventTapProxy, type: CGEventType,
                        event: CGEvent, userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -914,8 +929,12 @@ func scrollTapCallback(proxy: CGEventTapProxy, type: CGEventType,
         }
         return Unmanaged.passUnretained(event)
     }
+    // A wheel — classic or hi-res "continuous" — never carries gesture phases;
+    // trackpad and Magic Mouse scrolls always do (live phase or momentum).
     guard scrollReversalEnabled, type == .scrollWheel,
-          event.getIntegerValueField(.scrollWheelEventIsContinuous) == 0 else {
+          shouldReverseScroll(
+              phase: event.getIntegerValueField(.scrollWheelEventScrollPhase),
+              momentum: event.getIntegerValueField(.scrollWheelEventMomentumPhase)) else {
         return Unmanaged.passUnretained(event)
     }
     // Line/point deltas are exact integers.
@@ -1180,6 +1199,10 @@ func selftest() -> Never {
                       laptopCanvas: "laptop-air") == "laptop-air", "builtin only -> laptop canvas")
     expect(pickCanvas(physicalWidths: [], dockedCanvas: "ultrawide",
                       laptopCanvas: "laptop-air") == "laptop-air", "headless -> laptop canvas")
+    // scroll discrimination: wheels reversed, gesture devices untouched
+    expect(shouldReverseScroll(phase: 0, momentum: 0), "classic wheel reversed")
+    expect(!shouldReverseScroll(phase: 2, momentum: 0), "trackpad live gesture untouched")
+    expect(!shouldReverseScroll(phase: 0, momentum: 1), "trackpad momentum untouched")
     // audio picks
     let names = ["MacBook Air Speakers", "Jump Desktop Audio", "Jump Desktop Microphone", "ZoomAudioDevice"]
     let pa = pickAudioNames(passenger: true, deviceNames: names)
@@ -1266,6 +1289,28 @@ case "handback":
     let rec = Reconciler(cfg: cfg); rec.lastMode = .passenger(canvas: "", hidpi: false)
     rec.tick()   // fresh handback -> immediate console converge
     print("handback — returned to console")
+case "report":
+    let text = ((try? String(contentsOf: logFile, encoding: .utf8)) ?? "")
+        + ((try? String(contentsOf: logFile.deletingPathExtension().appendingPathExtension("old.log"), encoding: .utf8)) ?? "")
+    let lines = text.components(separatedBy: "\n")
+    func count(_ needle: String) -> Int { lines.filter { $0.contains(needle) }.count }
+    let convergeTimes = lines.compactMap { line -> Double? in
+        guard line.contains("converged=true in ") else { return nil }
+        return Double(line.components(separatedBy: " in ").last?.dropLast(1) ?? "")
+    }
+    let avg = convergeTimes.isEmpty ? 0 : convergeTimes.reduce(0, +) / Double(convergeTimes.count)
+    print("""
+    MIRA report (\(lines.count) log lines)
+      daemon starts:        \(count("daemon started"))
+      passenger converges:  \(count("converged=true"))  (avg \(String(format: "%.1f", avg))s)
+      converge failures:    \(count("converged=false"))
+      virtual create fails: \(count("virtual create FAILED"))
+      console restores:     \(count("converge -> console"))
+      walk-up handbacks:    \(count("handback"))
+      tier changes:         \(count("tier "))
+      ride failures:        \(count("ride placement FAILED"))
+      scroll tap:           active=\(count("scroll tap active")) failed=\(count("scroll tap creation failed"))
+    """)
 case "doctor":
     let cfg = loadConfig()
     let (report, failures) = doctor(cfg: cfg, me: selfMachine(cfg))

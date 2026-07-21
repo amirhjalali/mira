@@ -1,4 +1,4 @@
-// MIRA 2 — one binary: menu-bar app, passenger daemon, CLI. Native display
+// MIRA — one binary: menu-bar app, passenger daemon, CLI. Native display
 // engine (CGVirtualDisplay + CoreGraphics config) — no BetterDisplay, no
 // displayplacer. See docs/DESIGN-2.md and docs/PROPOSAL-fleet.md.
 //
@@ -87,7 +87,41 @@ let drivingFlag = stateDir.appendingPathComponent("driving")
 let arrangementFile = stateDir.appendingPathComponent("arrangement.json")
 let handbackFile = stateDir.appendingPathComponent("handback")
 let hygieneFile = stateDir.appendingPathComponent("hygiene.json")
-let logFile = repoRoot().appendingPathComponent("logs/mira2.log")
+let excludedFile = stateDir.appendingPathComponent("excluded.json")
+
+func loadExcluded() -> Set<String> {
+    guard let d = try? Data(contentsOf: excludedFile),
+          let a = try? JSONDecoder().decode([String].self, from: d) else { return [] }
+    return Set(a)
+}
+
+func saveExcluded(_ e: Set<String>) {
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    if let d = try? JSONEncoder().encode(Array(e).sorted()) { try? d.write(to: excludedFile) }
+}
+
+let settingsFile = URL(fileURLWithPath: NSHomeDirectory())
+    .appendingPathComponent(".config/mira/settings.json")
+
+// Viewer-local settings, editable from the menu. Missing file = all defaults.
+struct Settings: Codable {
+    var reverseScroll: Bool = true
+    var walkupHandback: Bool = true
+    var hidpiRides: Bool = true
+}
+
+func loadSettings() -> Settings {
+    guard let d = try? Data(contentsOf: settingsFile),
+          let s = try? JSONDecoder().decode(Settings.self, from: d) else { return Settings() }
+    return s
+}
+
+func saveSettings(_ s: Settings) {
+    try? FileManager.default.createDirectory(
+        at: settingsFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if let d = try? JSONEncoder().encode(s) { try? d.write(to: settingsFile) }
+}
+let logFile = repoRoot().appendingPathComponent("logs/mira.log")
 
 // Walk-up handback: a laptop that its owner physically returns to writes this
 // file (unix ts) so the reconciler hands control back to the local console.
@@ -684,7 +718,7 @@ final class Reconciler {
     // Laptops only, while converged: lid-open transition or a real-input burst
     // writes the handback file (acted on next tick).
     func checkWalkupTriggers() {
-        guard isLaptop else { return }
+        guard isLaptop, loadSettings().walkupHandback else { return }
         let converged = passengerConverged
         let burst = walkup.consumeBurst()
         let nowClam = readClamshellState()
@@ -801,7 +835,7 @@ func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Ti
     }
     for t in macPassengers(cfg: cfg, me: me) {
         if targetWalkedUp(t, cfg: cfg) { continue }
-        _ = placeRide(on: t, canvas: canvas, hidpi: tierWantsHiDPI(tier), driver: me.id)
+        _ = placeRide(on: t, canvas: canvas, hidpi: tierWantsHiDPI(tier) && loadSettings().hidpiRides, driver: me.id)
     }
     return tier
 }
@@ -809,7 +843,7 @@ func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Ti
 // MARK: - Doctor
 
 func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
-    var lines = ["MIRA 2 Doctor — \(me.id)"], failures = 0
+    var lines = ["MIRA Doctor — \(me.id)"], failures = 0
     let group = DispatchGroup(); let lock = NSLock(); var peerLines: [String] = []
     for t in macPassengers(cfg: cfg, me: me) {
         group.enter()
@@ -817,7 +851,7 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
             var l: [String] = []
             let probe = peerRun(t, """
             echo user=$(whoami); \
-            pgrep -f 'MIRA2 --daemon' >/dev/null && echo daemon=ok || echo daemon=missing; \
+            pgrep -f 'MIRA.app/Contents/MacOS/MIRA --daemon' >/dev/null && echo daemon=ok || echo daemon=missing; \
             cat "$HOME/Library/Application Support/MacRig/ride.json" 2>/dev/null || echo no-ride
             """, timeout: 15)
             if probe.code != 0 { l.append("✗ \(t.id) unreachable"); lock.lock(); failures += 1; lock.unlock() }
@@ -848,7 +882,7 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
 func runDaemon(cfg: Config) -> Never {
     let rec = Reconciler(cfg: cfg)
     rec.startWatchers()
-    log("mira2 daemon started on \(rec.me.id) (driver+passenger roles: \(rec.me.roles))")
+    log("mira daemon started on \(rec.me.id) (driver+passenger roles: \(rec.me.roles))")
     var tier: Tier = .standard
     var beat = 0.0
     while true {
@@ -869,6 +903,8 @@ func runDaemon(cfg: Config) -> Never {
 
 // Negate classic wheel-mouse deltas; leave continuous (trackpad/Magic Mouse)
 // gestures untouched. Re-enables the tap if the system disables it.
+var scrollReversalEnabled = loadSettings().reverseScroll
+
 func scrollTapCallback(proxy: CGEventTapProxy, type: CGEventType,
                        event: CGEvent, userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -878,7 +914,7 @@ func scrollTapCallback(proxy: CGEventTapProxy, type: CGEventType,
         }
         return Unmanaged.passUnretained(event)
     }
-    guard type == .scrollWheel,
+    guard scrollReversalEnabled, type == .scrollWheel,
           event.getIntegerValueField(.scrollWheelEventIsContinuous) == 0 else {
         return Unmanaged.passUnretained(event)
     }
@@ -910,7 +946,6 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     }
 
     func installScrollTap() {
-        guard cfg.reverseScroll ?? true else { return }
         let mask = CGEventMask(1 << CGEventType.scrollWheel.rawValue)
         guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                           options: .defaultTap, eventsOfInterest: mask,
@@ -939,15 +974,87 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     func rebuild() {
         setIcon()
         let m = NSMenu()
-        m.addItem(withTitle: driving ? "Driving" : "Parked", action: nil, keyEquivalent: "")
+        let excluded = loadExcluded()
+        let riding = macPassengers(cfg: cfg, me: me).filter { !excluded.contains($0.id) }.count
+        let header = driving ? "Driving \(riding) passenger\(riding == 1 ? "" : "s")" : "Parked"
+        m.addItem(withTitle: header, action: nil, keyEquivalent: "")
         m.addItem(.separator())
-        m.addItem(withTitle: "Drive from here", action: #selector(drive), keyEquivalent: "").target = self
-        m.addItem(withTitle: "Stop driving", action: #selector(stop), keyEquivalent: "").target = self
+        if driving {
+            m.addItem(withTitle: "Stop Driving", action: #selector(stop), keyEquivalent: "d").target = self
+        } else {
+            m.addItem(withTitle: "Drive from Here", action: #selector(drive), keyEquivalent: "d").target = self
+        }
+        m.addItem(.separator())
+        for t in macPassengers(cfg: cfg, me: me) {
+            let mi = NSMenuItem(title: t.jumpName, action: #selector(toggleMachine(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = t.id
+            mi.state = excluded.contains(t.id) ? .off : .on
+            mi.isEnabled = true
+            m.addItem(mi)
+        }
+        m.addItem(.separator())
+        let settings = loadSettings()
+        let sub = NSMenu()
+        for (title, sel, on) in [
+            ("Reverse Mouse Scrolling", #selector(toggleScroll), settings.reverseScroll),
+            ("Walk-Up Handback", #selector(toggleWalkup), settings.walkupHandback),
+            ("Retina Passengers (HiDPI)", #selector(toggleHiDPI), settings.hidpiRides),
+        ] {
+            let mi = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            mi.target = self
+            mi.state = on ? .on : .off
+            sub.addItem(mi)
+        }
+        let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+        m.addItem(settingsItem)
+        m.setSubmenu(sub, for: settingsItem)
         m.addItem(withTitle: "Run Doctor", action: #selector(runDoc), keyEquivalent: "").target = self
+        m.addItem(withTitle: "View Log", action: #selector(viewLog), keyEquivalent: "").target = self
         m.addItem(.separator())
-        m.addItem(withTitle: "Quit MIRA 2", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        m.addItem(withTitle: "Quit MIRA", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = m
     }
+
+    @objc func toggleMachine(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let t = cfg.machines.first(where: { $0.id == id }) else { return }
+        var excluded = loadExcluded()
+        if excluded.contains(id) {
+            excluded.remove(id)
+            saveExcluded(excluded)
+            if driving {
+                let engine = DisplayEngine()
+                let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
+                DispatchQueue.global().async { [self] in
+                    clearRemoteHandback(on: t)
+                    _ = placeRide(on: t, canvas: canvas, hidpi: loadSettings().hidpiRides, driver: me.id)
+                    let names = [t.jumpName] + (t.jumpAliases ?? [])
+                    _ = names.contains(where: { openJumpSession($0) })
+                }
+            }
+        } else {
+            excluded.insert(id)
+            saveExcluded(excluded)
+            if driving { DispatchQueue.global().async { endRide(on: t) } }
+        }
+        rebuild()
+    }
+
+    @objc func toggleScroll() {
+        var s = loadSettings(); s.reverseScroll.toggle(); saveSettings(s)
+        scrollReversalEnabled = s.reverseScroll
+        // A grant made after launch: retry the tap on demand.
+        if s.reverseScroll && scrollTap == nil { installScrollTap() }
+        rebuild()
+    }
+    @objc func toggleWalkup() {
+        var s = loadSettings(); s.walkupHandback.toggle(); saveSettings(s); rebuild()
+    }
+    @objc func toggleHiDPI() {
+        var s = loadSettings(); s.hidpiRides.toggle(); saveSettings(s); rebuild()
+    }
+    @objc func viewLog() { sh("open -a Console '\(logFile.path)'") }
     // Jump populates submenus lazily: the parent must be clicked open and given
     // time before its items exist; Escape (consumed by the open menu) cleans up.
     func openJumpSession(_ name: String) -> Bool {
@@ -1000,7 +1107,8 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
         DispatchQueue.global().async { [self] in
             var opened = 0
-            for t in macPassengers(cfg: cfg, me: me) {
+            let excluded = loadExcluded()
+            for t in macPassengers(cfg: cfg, me: me) where !excluded.contains(t.id) {
                 clearRemoteHandback(on: t)   // override any walk-up on the target
                 _ = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
                 let names = [t.jumpName] + (t.jumpAliases ?? [])
@@ -1029,7 +1137,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     }
     func notify(_ text: String) {
         let esc = text.replacingOccurrences(of: "\"", with: "\\\"")
-        sh("osascript -e 'display notification \"\(esc)\" with title \"MIRA 2\"'")
+        sh("osascript -e 'display notification \"\(esc)\" with title \"MIRA\"'")
     }
 }
 
@@ -1113,7 +1221,7 @@ func selftest() -> Never {
         expect(m.laptopCanvas != nil && cfg.canvases[m.laptopCanvas!] != nil,
                "viewer \(m.id) has laptop canvas")
     }
-    print(failures == 0 ? "MIRA2 selftest: OK" : "MIRA2 selftest: \(failures) FAILURES")
+    print(failures == 0 ? "MIRA selftest: OK" : "MIRA selftest: \(failures) FAILURES")
     exit(failures == 0 ? 0 : 1)
 }
 

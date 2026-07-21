@@ -1,6 +1,6 @@
 #!/bin/bash
-# MIRA 2 remote deployer. Builds + selftests locally, assembles and signs the
-# MIRA2.app bundle, then pushes it (plus config + daemon LaunchAgent) to the
+# MIRA remote deployer. Builds + selftests locally, assembles and signs the
+# MIRA.app bundle, then pushes it (plus config + daemon LaunchAgent) to the
 # peer Macs over SSH and (re)starts the daemon there.
 #
 # Usage:  bash deploy.sh [air] [mini]     (no args => both)
@@ -29,24 +29,26 @@ fi
 
 # ---- 1) build + selftest gate ----------------------------------------------
 echo "1) Build + selftest…"
-bash tests/run2.sh build.noindex/mira2
+bash tests/run.sh build.noindex/mira
 
 # ---- 2) assemble + sign the bundle locally ---------------------------------
-echo "2) Bundle MIRA2.app…"
-APP=build.noindex/MIRA2.app
+echo "2) Bundle MIRA.app…"
+APP=build.noindex/MIRA.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-cp build.noindex/mira2 "$APP/Contents/MacOS/MIRA2"
+cp build.noindex/mira "$APP/Contents/MacOS/MIRA"
+mkdir -p "$APP/Contents/Resources"
+cp app/AppIcon.icns "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleIdentifier</key><string>com.amir.mira2</string>
+  <key>CFBundleIdentifier</key><string>com.amir.mira</string>
   <key>CFBundleName</key><string>MIRA 2</string>
-  <key>CFBundleExecutable</key><string>MIRA2</string>
+  <key>CFBundleExecutable</key><string>MIRA</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
-  <key>CFBundleShortVersionString</key><string>2.0</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>\n  <key>CFBundleShortVersionString</key><string>2.0</string>
 </dict></plist>
 PLIST
 if security find-identity -p codesigning 2>/dev/null | grep -q "MIRA Signing"; then
@@ -72,14 +74,14 @@ deploy_one() {
   ssh $SSH_OPTS "$tgt" 'echo ok' >/dev/null
 
   # stage bundle to a scratch path in the target home, then swap into place
-  ssh $SSH_OPTS "$tgt" 'rm -rf "$HOME/.mira2-stage" && mkdir -p "$HOME/.mira2-stage"'
-  scp -O -r "$APP" "$tgt:.mira2-stage/MIRA2.app"
+  ssh $SSH_OPTS "$tgt" 'rm -rf "$HOME/.mira-stage" && mkdir -p "$HOME/.mira-stage"'
+  scp -O -r "$APP" "$tgt:.mira-stage/MIRA.app"
   ssh $SSH_OPTS "$tgt" '
     set -e
     mkdir -p "$HOME/Applications"
-    rm -rf "$HOME/Applications/MIRA2.app"
-    mv "$HOME/.mira2-stage/MIRA2.app" "$HOME/Applications/MIRA2.app"
-    rmdir "$HOME/.mira2-stage" 2>/dev/null || true
+    rm -rf "$HOME/Applications/MIRA.app"
+    mv "$HOME/.mira-stage/MIRA.app" "$HOME/Applications/MIRA.app"
+    rmdir "$HOME/.mira-stage" 2>/dev/null || true
   '
 
   # remote re-sign. For an identity target, a stable "MIRA Signing" signature is
@@ -87,7 +89,7 @@ deploy_one() {
   # requirement and revokes the Accessibility grant). Ad-hoc only where intended.
   ssh $SSH_OPTS "$tgt" "SIGN_MODE='$sign_mode' bash -s" <<'REMOTE_SIGN'
     set -e
-    APP="$HOME/Applications/MIRA2.app"
+    APP="$HOME/Applications/MIRA.app"
     if [ "$SIGN_MODE" = "identity" ]; then
       # Unlock login keychain if a GUI session hasn't already (harmless if locked
       # non-interactively — the failure is caught below, not silently ad-hoc'd).
@@ -112,17 +114,17 @@ REMOTE_SIGN
   ssh $SSH_OPTS "$tgt" '
     set -e
     mkdir -p "$HOME/Library/LaunchAgents"
-    PLIST="$HOME/Library/LaunchAgents/com.amir.mira2.plist"
-    EXE="$HOME/Applications/MIRA2.app/Contents/MacOS/MIRA2"
+    PLIST="$HOME/Library/LaunchAgents/com.amir.mira.plist"
+    EXE="$HOME/Applications/MIRA.app/Contents/MacOS/MIRA"
     cat > "$PLIST" <<PL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.amir.mira2</string>
+  <key>Label</key><string>com.amir.mira</string>
   <key>ProgramArguments</key>
   <array><string>$EXE</string><string>--daemon</string></array>
-  <key>StandardOutPath</key><string>/tmp/mira2-daemon.log</string>
-  <key>StandardErrorPath</key><string>/tmp/mira2-daemon.log</string>
+  <key>StandardOutPath</key><string>/tmp/mira-daemon.log</string>
+  <key>StandardErrorPath</key><string>/tmp/mira-daemon.log</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict></plist>
@@ -134,22 +136,27 @@ PL
     launchctl bootout "gui/$uid" "$PLIST" 2>/dev/null || true
     launchctl bootstrap "gui/$uid" "$PLIST"
 
+    # retire the transitional MIRA2 generation and v1 leftovers
+    launchctl bootout "gui/$uid" "$HOME/Library/LaunchAgents/com.amir.mira2.plist" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/com.amir.mira2.plist"           "$HOME/Library/LaunchAgents/com.amir.mira-display.plist"           "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist"
+    rm -rf "$HOME/Applications/MIRA2.app" "/Applications/MIRA2.app" 2>/dev/null || true
+    rm -f "$HOME/ensure-ultrawide.sh" "$HOME/mira-set-display.sh"           "$HOME/collapse-displays.sh" "$HOME/restore-displays.sh"
     # remove legacy raw binary if present
-    rm -f "$HOME/bin/mira2"
+    rm -f "$HOME/bin/mira"
   '
 
   # verify the daemon is up — RunAtLoad exec can lag, so retry a few times
   # before declaring failure.
   if ssh $SSH_OPTS "$tgt" '
     for i in 1 2 3 4 5; do
-      pgrep -f "MIRA2 --daemon" >/dev/null && exit 0
+      pgrep -f "MIRA --daemon" >/dev/null && exit 0
       sleep 1
     done
     exit 1
   '; then
     echo "$name: OK"
   else
-    echo "$name: FAILED — daemon not running (see /tmp/mira2-daemon.log on $host)" >&2
+    echo "$name: FAILED — daemon not running (see /tmp/mira-daemon.log on $host)" >&2
     return 1
   fi
 }

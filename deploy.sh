@@ -48,7 +48,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>MIRA</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
-  <key>CFBundleIconFile</key><string>AppIcon</string>\n  <key>CFBundleShortVersionString</key><string>2.0</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleShortVersionString</key><string>2.0</string>
 </dict></plist>
 PLIST
 if security find-identity -p codesigning 2>/dev/null | grep -q "MIRA Signing"; then

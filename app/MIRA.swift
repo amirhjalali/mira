@@ -937,16 +937,22 @@ func scrollTapCallback(proxy: CGEventTapProxy, type: CGEventType,
               momentum: event.getIntegerValueField(.scrollWheelEventMomentumPhase)) else {
         return Unmanaged.passUnretained(event)
     }
-    // Line/point deltas are exact integers.
-    for f in [CGEventField.scrollWheelEventDeltaAxis1, .scrollWheelEventDeltaAxis2,
-              .scrollWheelEventPointDeltaAxis1, .scrollWheelEventPointDeltaAxis2] {
-        event.setIntegerValueField(f, value: -event.getIntegerValueField(f))
-    }
-    // Fixed-point (Q16.16) deltas carry a fractional part — negate as doubles so
-    // sub-integer/accelerated magnitudes survive the reversal.
-    for f in [CGEventField.scrollWheelEventFixedPtDeltaAxis1, .scrollWheelEventFixedPtDeltaAxis2] {
-        event.setDoubleValueField(f, value: -event.getDoubleValueField(f))
-    }
+    // The delta fields are linked views onto shared storage: writing one can
+    // update another, so a naive negate-in-sequence re-flips earlier writes
+    // (observed: line delta reversed, point delta untouched). Read every
+    // original first, then write all negations from the saved values.
+    let d1 = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+    let d2 = event.getIntegerValueField(.scrollWheelEventDeltaAxis2)
+    let p1 = event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1)
+    let p2 = event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2)
+    let f1 = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1)
+    let f2 = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2)
+    event.setIntegerValueField(.scrollWheelEventDeltaAxis1, value: -d1)
+    event.setIntegerValueField(.scrollWheelEventDeltaAxis2, value: -d2)
+    event.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: -p1)
+    event.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: -p2)
+    event.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: -f1)
+    event.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: -f2)
     return Unmanaged.passUnretained(event)
 }
 

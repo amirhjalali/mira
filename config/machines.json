@@ -5,6 +5,9 @@
   "reconcileSeconds": 15,
   "homeSubnetPrefix": "192.168.1.",
   "dockedCanvas": "ultrawide",
+  "handbackHoldSeconds": 600,
+  "walkupInputEvents": 20,
+  "reverseScroll": true,
   "canvases": {
     "laptop-pro": {
       "width": 1728,

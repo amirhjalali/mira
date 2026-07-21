@@ -8,6 +8,9 @@
 import AppKit
 import CoreAudio
 import Foundation
+import IOKit
+import IOKit.hid
+import IOKit.pwr_mgt
 
 // MARK: - Shell (small residue: ssh, ping, osascript)
 
@@ -43,6 +46,10 @@ struct Config: Codable {
     let dockedCanvas: String
     let canvases: [String: Canvas]
     let machines: [Machine]
+    // Optional (decodeIfPresent via synthesized Codable — older configs stay valid).
+    let handbackHoldSeconds: Double?
+    let walkupInputEvents: Double?
+    let reverseScroll: Bool?
 }
 
 func repoRoot() -> URL {
@@ -77,7 +84,21 @@ let stateDir = URL(fileURLWithPath: NSHomeDirectory())
 let rideFile = stateDir.appendingPathComponent("ride.json")
 let drivingFlag = stateDir.appendingPathComponent("driving")
 let arrangementFile = stateDir.appendingPathComponent("arrangement.json")
+let handbackFile = stateDir.appendingPathComponent("handback")
+let hygieneFile = stateDir.appendingPathComponent("hygiene.json")
 let logFile = repoRoot().appendingPathComponent("logs/mira2.log")
+
+// Walk-up handback: a laptop that its owner physically returns to writes this
+// file (unix ts) so the reconciler hands control back to the local console.
+func writeHandback() {
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    try? String(Date().timeIntervalSince1970).write(to: handbackFile, atomically: true, encoding: .utf8)
+}
+
+func readHandbackTS() -> Double? {
+    guard let s = try? String(contentsOf: handbackFile, encoding: .utf8) else { return nil }
+    return Double(s.trimmingCharacters(in: .whitespacesAndNewlines))
+}
 
 func log(_ msg: String) {
     let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd HH:mm:ss"
@@ -116,6 +137,23 @@ func computeMode(ride: Ride?, ttl: Double, now: Double) -> Mode {
         return .passenger(canvas: r.canvas, hidpi: r.hidpi)
     }
     return .console
+}
+
+// MARK: - Handback (pure, selftested)
+
+// Fresh handback: within the hold window. Used both to force console locally
+// and to make a driver skip a walked-up target.
+func handbackIsFresh(ts: Double, hold: Double, now: Double = Date().timeIntervalSince1970) -> Bool {
+    now - ts < hold
+}
+
+// Clamshell convention: true = lid closed. A closed->open transition or a burst
+// of real local input, while this machine is a converged passenger, hands back.
+func shouldHandback(prevClamshell: Bool, nowClamshell: Bool,
+                    inputBurst: Bool, passengerConverged: Bool) -> Bool {
+    guard passengerConverged else { return false }
+    let lidOpened = prevClamshell && !nowClamshell
+    return lidOpened || inputBurst
 }
 
 // MARK: - Tier engine (pure, selftested)
@@ -240,6 +278,7 @@ let miraVendorID: UInt32 = 0x4D49_5241 & 0xFFFF  // "RA" tail of 'MIRA'
 final class DisplayEngine {
     private var virtualDisplay: CGVirtualDisplay?
     private(set) var virtualID: CGDirectDisplayID = 0
+    private var builtCanvas: Canvas?     // dims the current virtual was created for
 
     func onlineDisplays() -> [CGDirectDisplayID] {
         var ids = [CGDirectDisplayID](repeating: 0, count: 16)
@@ -260,7 +299,14 @@ final class DisplayEngine {
     // create-time property: publish both 2x and 1x modes under hiDPI so tier
     // changes are mode switches, not recreations.
     func ensureVirtual(canvas: Canvas) -> Bool {
-        if virtualDisplay != nil { return true }
+        if virtualDisplay != nil {
+            // Reuse only if built for the same canvas; a live ride whose canvas
+            // changed (driver undocks: ultrawide->laptop) must rebuild, else
+            // setVirtualMode can never match and the passenger reconverges forever.
+            if let b = builtCanvas, b.width == canvas.width, b.height == canvas.height { return true }
+            log("virtual canvas changed \(builtCanvas.map { "\($0.width)x\($0.height)" } ?? "?") -> \(canvas.width)x\(canvas.height); rebuilding")
+            destroyVirtual()
+        }
         let desc = CGVirtualDisplayDescriptor()
         desc.name = "MIRA"
         desc.maxPixelsWide = 6880
@@ -285,6 +331,7 @@ final class DisplayEngine {
         guard display.apply(settings) else { return false }
         virtualDisplay = display
         virtualID = display.displayID
+        builtCanvas = canvas
         log("virtual display created id=\(virtualID) for \(canvas.width)x\(canvas.height)")
         return true
     }
@@ -293,6 +340,7 @@ final class DisplayEngine {
         if virtualDisplay != nil { log("virtual display destroyed") }
         virtualDisplay = nil
         virtualID = 0
+        builtCanvas = nil
     }
 
     // Choose a mode on the virtual display: UI size WxH at 2x (hidpi) or 1x.
@@ -340,7 +388,7 @@ final class DisplayEngine {
     // Invariant: virtual exists at canvas/hidpi, is main, every physical mirrors it.
     func passengerInvariantHolds(canvas: Canvas, hidpi: Bool) -> Bool {
         guard virtualID != 0, CGDisplayIsMain(virtualID) != 0 else { return false }
-        guard Int(CGDisplayPixelsWide(virtualID)) == (hidpi ? canvas.width : canvas.width) else { return false }
+        guard Int(CGDisplayPixelsWide(virtualID)) == canvas.width else { return false }
         let m = CGDisplayCopyDisplayMode(virtualID)
         if hidpi, let m = m, m.pixelWidth != canvas.width * 2 { return false }
         for p in physicalDisplays() where CGDisplayMirrorsDisplay(p) != virtualID { return false }
@@ -350,38 +398,179 @@ final class DisplayEngine {
 
 // MARK: - Arrangement capture / restore (origins of physical displays)
 
-struct SavedDisplay: Codable { let id: UInt32; let x: Int; let y: Int; let main: Bool }
+// mirrorOf: nil = independent display; else the master display it mirrors.
+struct SavedDisplay: Codable { let id: UInt32; let x: Int; let y: Int; let main: Bool; let mirrorOf: UInt32? }
 
 func captureArrangement(engine: DisplayEngine) {
     guard !FileManager.default.fileExists(atPath: arrangementFile.path) else { return }
     let saved = engine.physicalDisplays().map { d -> SavedDisplay in
         let b = CGDisplayBounds(d)
+        let master = CGDisplayMirrorsDisplay(d)
         return SavedDisplay(id: d, x: Int(b.origin.x), y: Int(b.origin.y),
-                            main: CGDisplayIsMain(d) != 0)
+                            main: CGDisplayIsMain(d) != 0,
+                            mirrorOf: master == kCGNullDirectDisplay ? nil : master)
     }
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
     if let d = try? JSONEncoder().encode(saved) { try? d.write(to: arrangementFile) }
 }
 
-func restoreArrangement(engine: DisplayEngine) {
+// Returns true when the arrangement is restored (or there is nothing to
+// restore). Returns false on a transient CG config failure so the caller can
+// retry next tick — arrangement.json is deleted only on success, never losing
+// the user's docked BenQ-master/built-in-mirror preference.
+@discardableResult
+func restoreArrangement(engine: DisplayEngine) -> Bool {
     engine.unmirrorAll()
     guard let data = try? Data(contentsOf: arrangementFile),
           let saved = try? JSONDecoder().decode([SavedDisplay].self, from: data) else {
         if let first = engine.physicalDisplays().first { engine.setMain(first) }
-        return
+        return true   // nothing captured -> nothing to retry
     }
+    let online = Set(engine.onlineDisplays())
     var cfg: CGDisplayConfigRef?
     CGBeginDisplayConfiguration(&cfg)
-    for s in saved where engine.onlineDisplays().contains(s.id) {
-        CGConfigureDisplayOrigin(cfg, s.id, Int32(s.x), Int32(s.y))
+    for s in saved where online.contains(s.id) {
+        if let master = s.mirrorOf, online.contains(master) {
+            CGConfigureDisplayMirrorOfDisplay(cfg, s.id, master)   // restore mirror topology
+        } else {
+            CGConfigureDisplayOrigin(cfg, s.id, Int32(s.x), Int32(s.y))
+        }
     }
-    CGCompleteDisplayConfiguration(cfg, .permanently)
-    if let main = saved.first(where: { $0.main }), engine.onlineDisplays().contains(main.id) {
+    guard CGCompleteDisplayConfiguration(cfg, .permanently) == .success else {
+        log("restoreArrangement config failed — leaving arrangement.json for retry")
+        return false
+    }
+    if let main = saved.first(where: { $0.main }), online.contains(main.id) {
         engine.setMain(main.id)
     } else if let first = engine.physicalDisplays().first {
         engine.setMain(first)
     }
     try? FileManager.default.removeItem(at: arrangementFile)
+    return true
+}
+
+// MARK: - Hygiene (Universal Control off while passenger)
+
+struct Hygiene: Codable { let ucDisable: String?; let ucDisableMagicEdges: String? }
+
+private func readDefault(_ domain: String, _ key: String) -> String? {
+    let r = sh("defaults read \(domain) \(key) 2>/dev/null")
+    if r.code != 0 { return nil }
+    let v = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+    return v.isEmpty ? nil : v
+}
+
+// Save originals once, then force Universal Control off so a walk-up on another
+// Mac's edge doesn't steal the cursor from the passenger canvas.
+func applyHygiene() {
+    if !FileManager.default.fileExists(atPath: hygieneFile.path) {
+        let h = Hygiene(ucDisable: readDefault("com.apple.universalcontrol", "Disable"),
+                        ucDisableMagicEdges: readDefault("com.apple.universalcontrol", "DisableMagicEdges"))
+        try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        if let d = try? JSONEncoder().encode(h) { try? d.write(to: hygieneFile) }
+    }
+    sh("defaults write com.apple.universalcontrol Disable -bool true")
+    sh("defaults write com.apple.universalcontrol DisableMagicEdges -bool true")
+    sh("killall UniversalControl 2>/dev/null")
+}
+
+func restoreHygiene() {
+    guard let data = try? Data(contentsOf: hygieneFile),
+          let h = try? JSONDecoder().decode(Hygiene.self, from: data) else { return }
+    func restore(_ key: String, _ val: String?) {
+        if let v = val {
+            sh("defaults write com.apple.universalcontrol \(key) -bool \(v == "0" ? "false" : "true")")
+        } else {
+            sh("defaults delete com.apple.universalcontrol \(key) 2>/dev/null")   // missing originally
+        }
+    }
+    restore("Disable", h.ucDisable)
+    restore("DisableMagicEdges", h.ucDisableMagicEdges)
+    try? FileManager.default.removeItem(at: hygieneFile)
+    sh("killall UniversalControl 2>/dev/null")
+}
+
+// MARK: - Clamshell (lid) state via IORegistry
+
+// Returns true when the lid is closed (clamshell), false when open, nil if the
+// property is absent (desktops, or reading failed).
+func readClamshellState() -> Bool? {
+    let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+    guard service != 0 else { return nil }
+    defer { IOObjectRelease(service) }
+    guard let prop = IORegistryEntryCreateCFProperty(service, "AppleClamshellState" as CFString,
+                                                     kCFAllocatorDefault, 0) else { return nil }
+    let value = prop.takeRetainedValue()
+    if CFGetTypeID(value) == CFBooleanGetTypeID() { return CFBooleanGetValue((value as! CFBoolean)) }
+    if let n = value as? NSNumber { return n.boolValue }
+    return nil
+}
+
+// MARK: - Walk-up input watch (internal keyboard/trackpad via IOHIDManager)
+
+// A burst of real local HID input means the owner is physically back. Synthetic
+// remote events (Jump Desktop) never reach the internal device — that's the point.
+final class WalkupWatcher {
+    private var manager: IOHIDManager?
+    private var timestamps: [Double] = []
+    private var burstLatched = false   // sticky: survives until the next poll
+    private let lock = NSLock()
+    private let threshold: Int
+    private static var loggedUnavailable = false
+
+    init(threshold: Int) { self.threshold = threshold }
+
+    func start() {
+        Thread.detachNewThread { [weak self] in
+            guard let self = self else { return }
+            let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+            let matches: [[String: Any]] = [
+                [kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+                 kIOHIDDeviceUsageKey as String: kHIDUsage_GD_Keyboard],
+                [kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+                 kIOHIDDeviceUsageKey as String: kHIDUsage_GD_Mouse],
+                [kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+                 kIOHIDDeviceUsageKey as String: kHIDUsage_GD_Pointer],
+            ]
+            IOHIDManagerSetDeviceMatchingMultiple(mgr, matches as CFArray)
+            let ctx = Unmanaged.passUnretained(self).toOpaque()
+            IOHIDManagerRegisterInputValueCallback(mgr, { context, _, _, _ in
+                guard let context = context else { return }
+                Unmanaged<WalkupWatcher>.fromOpaque(context).takeUnretainedValue().recordEvent()
+            }, ctx)
+            if IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone)) != kIOReturnSuccess {
+                if !WalkupWatcher.loggedUnavailable {
+                    WalkupWatcher.loggedUnavailable = true
+                    log("walk-up input watch unavailable (grant Input Monitoring for full walk-up)")
+                }
+                return  // fall back to lid-only detection
+            }
+            self.manager = mgr
+            IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+            RunLoop.current.run()
+        }
+    }
+
+    func recordEvent() {
+        let now = Date().timeIntervalSince1970
+        lock.lock(); defer { lock.unlock() }
+        timestamps.append(now)
+        timestamps.removeAll { now - $0 > 5 }   // keep a rolling 5 s window
+        // Latch the moment the window crosses threshold; the poll interval
+        // (reconcileSeconds) is longer than the 5 s window, so a brief burst
+        // would otherwise be pruned before the next consumeBurst.
+        if timestamps.count >= threshold { burstLatched = true }
+    }
+
+    // True if a >= threshold burst has landed since the last poll; read-and-clears
+    // the latch (and the window).
+    func consumeBurst() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard burstLatched else { return false }
+        burstLatched = false
+        timestamps.removeAll()
+        return true
+    }
 }
 
 // MARK: - Reconciler
@@ -391,25 +580,52 @@ final class Reconciler {
     let me: Machine
     let engine = DisplayEngine()
     var lastMode: Mode?
+    lazy var walkup = WalkupWatcher(threshold: Int(cfg.walkupInputEvents ?? 20))
+    var prevClamshell: Bool?
+    var displaySleepAssertion: IOPMAssertionID = 0
 
     init(cfg: Config) { self.cfg = cfg; self.me = selfMachine(cfg) }
 
+    var isLaptop: Bool { me.laptopCanvas != nil }
+    var passengerConverged: Bool { if case .passenger = lastMode { return true }; return false }
+
+    // Started by the daemon only (not one-shot CLI ticks).
+    func startWatchers() { if isLaptop { walkup.start() } }
+
     func tick() {
+        // Walk-up handback: a fresh handback file forces console regardless of ride.
+        if let hts = readHandbackTS() {
+            let hold = cfg.handbackHoldSeconds ?? 600
+            if handbackIsFresh(ts: hts, hold: hold) {
+                try? FileManager.default.removeItem(at: rideFile)
+                convergeConsole()
+                return
+            }
+            try? FileManager.default.removeItem(at: handbackFile)   // stale
+        }
+
         let mode = computeMode(ride: readRide(), ttl: cfg.rideTTLSeconds,
                                now: Date().timeIntervalSince1970)
         switch mode {
         case .passenger(let canvasKey, let hidpi):
+            // Two simultaneous drivers is a bug; a machine being driven is never
+            // itself a driver — drop the flag if it lingered.
+            if FileManager.default.fileExists(atPath: drivingFlag.path) {
+                try? FileManager.default.removeItem(at: drivingFlag)
+                log("driving flag cleared: now a passenger")
+            }
             guard let canvas = cfg.canvases[canvasKey] else { return }
             let wantHi = hidpi && canvas.hidpi
             // A passenger never streams outward — enforce every tick, not just
             // on transition (the viewer can be relaunched under us).
             sh("pkill -x 'Jump Desktop' 2>/dev/null; pkill -f 'MacOS/Jump Desktop$' 2>/dev/null")
             if engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi),
-               lastMode == mode { return }
+               lastMode == mode { checkWalkupTriggers(); return }
             log("converge -> passenger(\(canvasKey), hidpi=\(wantHi))")
             captureArrangement(engine: engine)
+            applyHygiene()
+            holdDisplayAwake()                                 // wake+hold display stack
             sh("pkill -x 'Jump Desktop' 2>/dev/null")          // never stream outward
-            sh("caffeinate -u -t 15 >/dev/null 2>&1 &")        // wake display stack
             guard engine.ensureVirtual(canvas: canvas) else { log("virtual create FAILED"); return }
             engine.unmirrorAll()
             _ = engine.setVirtualMode(canvas: canvas, hidpi: wantHi)
@@ -419,16 +635,61 @@ final class Reconciler {
             let ok = engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi)
             log("passenger converged=\(ok)")
             lastMode = mode
+            checkWalkupTriggers()
         case .console:
-            if lastMode == .console || (lastMode == nil && engine.virtualID == 0
-                && !FileManager.default.fileExists(atPath: arrangementFile.path)) {
-                lastMode = .console; return
-            }
-            log("converge -> console")
-            engine.destroyVirtual()
-            restoreArrangement(engine: engine)
-            routeAudio(passenger: false)
-            lastMode = .console
+            convergeConsole()
+        }
+    }
+
+    func convergeConsole() {
+        if lastMode == .console || (lastMode == nil && engine.virtualID == 0
+            && !FileManager.default.fileExists(atPath: arrangementFile.path)) {
+            lastMode = .console; return
+        }
+        log("converge -> console")
+        engine.destroyVirtual()
+        let restored = restoreArrangement(engine: engine)
+        restoreHygiene()
+        releaseDisplayAwake()
+        routeAudio(passenger: false)
+        // Re-baseline the lid so the first checkWalkupTriggers of the next
+        // passenger session sees no phantom closed->open transition.
+        prevClamshell = nil
+        // On a failed arrangement restore, leave lastMode unset so the next
+        // tick retries instead of permanently losing the saved arrangement.
+        lastMode = restored ? .console : nil
+    }
+
+    // Laptops only, while converged: lid-open transition or a real-input burst
+    // writes the handback file (acted on next tick).
+    func checkWalkupTriggers() {
+        guard isLaptop else { return }
+        let converged = passengerConverged
+        let burst = walkup.consumeBurst()
+        let nowClam = readClamshellState()
+        let prev = prevClamshell ?? (nowClam ?? false)
+        if shouldHandback(prevClamshell: prev, nowClamshell: nowClam ?? false,
+                          inputBurst: burst, passengerConverged: converged) {
+            writeHandback()
+            log("walk-up detected -> handback")
+        }
+        if let nc = nowClam { prevClamshell = nc }
+    }
+
+    func holdDisplayAwake() {
+        guard displaySleepAssertion == 0 else { return }
+        var aid: IOPMAssertionID = 0
+        if IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                                       IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                       "MIRA passenger" as CFString, &aid) == kIOReturnSuccess {
+            displaySleepAssertion = aid
+        }
+    }
+
+    func releaseDisplayAwake() {
+        if displaySleepAssertion != 0 {
+            IOPMAssertionRelease(displaySleepAssertion)
+            displaySleepAssertion = 0
         }
     }
 }
@@ -478,8 +739,34 @@ func endRide(on target: Machine) {
     _ = peerRun(target, "rm -f \"$HOME/Library/Application Support/MacRig/ride.json\"")
 }
 
+// An explicit Drive is a deliberate override: clear the target's own walk-up
+// handback so its daemon stops forcing console, and forget any noticed state so
+// the driver stops skipping it.
+func clearRemoteHandback(on target: Machine) {
+    _ = peerRun(target, "rm -f \"$HOME/Library/Application Support/MacRig/handback\"")
+    handbackNoticed.remove(target.id)
+}
+
 func macPassengers(cfg: Config, me: Machine) -> [Machine] {
     cfg.machines.filter { $0.id != me.id && $0.roles.contains("target") && ($0.type ?? "mac") == "mac" }
+}
+
+// Targets whose fresh handback we've already logged this walk-up (log once each).
+var handbackNoticed: Set<String> = []
+
+// A target that has walked itself up (fresh handback) is left alone this beat.
+func targetWalkedUp(_ t: Machine, cfg: Config) -> Bool {
+    let hb = peerRun(t, "cat \"$HOME/Library/Application Support/MacRig/handback\" 2>/dev/null")
+        .out.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let hts = Double(hb),
+          handbackIsFresh(ts: hts, hold: cfg.handbackHoldSeconds ?? 600) else {
+        handbackNoticed.remove(t.id); return false
+    }
+    if !handbackNoticed.contains(t.id) {
+        log("skipping \(t.id): walked up (fresh handback)")
+        handbackNoticed.insert(t.id)
+    }
+    return true
 }
 
 func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Tier) -> Tier {
@@ -492,6 +779,7 @@ func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Ti
                            home: home, docked: docked)
     }
     for t in macPassengers(cfg: cfg, me: me) {
+        if targetWalkedUp(t, cfg: cfg) { continue }
         _ = placeRide(on: t, canvas: canvas, hidpi: tierWantsHiDPI(tier), driver: me.id)
     }
     return tier
@@ -538,6 +826,7 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
 
 func runDaemon(cfg: Config) -> Never {
     let rec = Reconciler(cfg: cfg)
+    rec.startWatchers()
     log("mira2 daemon started on \(rec.me.id) (driver+passenger roles: \(rec.me.roles))")
     var tier: Tier = .standard
     var beat = 0.0
@@ -555,16 +844,65 @@ func runDaemon(cfg: Config) -> Never {
     }
 }
 
+// MARK: - Scroll reversal (MenuApp only — it holds Accessibility)
+
+// Negate classic wheel-mouse deltas; leave continuous (trackpad/Magic Mouse)
+// gestures untouched. Re-enables the tap if the system disables it.
+func scrollTapCallback(proxy: CGEventTapProxy, type: CGEventType,
+                       event: CGEvent, userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        if let userInfo = userInfo,
+           let tap = Unmanaged<MenuApp>.fromOpaque(userInfo).takeUnretainedValue().scrollTap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+        return Unmanaged.passUnretained(event)
+    }
+    guard type == .scrollWheel,
+          event.getIntegerValueField(.scrollWheelEventIsContinuous) == 0 else {
+        return Unmanaged.passUnretained(event)
+    }
+    // Line/point deltas are exact integers.
+    for f in [CGEventField.scrollWheelEventDeltaAxis1, .scrollWheelEventDeltaAxis2,
+              .scrollWheelEventPointDeltaAxis1, .scrollWheelEventPointDeltaAxis2] {
+        event.setIntegerValueField(f, value: -event.getIntegerValueField(f))
+    }
+    // Fixed-point (Q16.16) deltas carry a fractional part — negate as doubles so
+    // sub-integer/accelerated magnitudes survive the reversal.
+    for f in [CGEventField.scrollWheelEventFixedPtDeltaAxis1, .scrollWheelEventFixedPtDeltaAxis2] {
+        event.setDoubleValueField(f, value: -event.getDoubleValueField(f))
+    }
+    return Unmanaged.passUnretained(event)
+}
+
 // MARK: - Menu bar
 
 final class MenuApp: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
     let cfg = loadConfig()
     lazy var me = selfMachine(cfg)
+    var scrollTap: CFMachPort?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         rebuild()
+        installScrollTap()
+    }
+
+    func installScrollTap() {
+        guard cfg.reverseScroll ?? true else { return }
+        let mask = CGEventMask(1 << CGEventType.scrollWheel.rawValue)
+        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                                          options: .defaultTap, eventsOfInterest: mask,
+                                          callback: scrollTapCallback,
+                                          userInfo: Unmanaged.passUnretained(self).toOpaque()) else {
+            log("scroll tap creation failed (grant Accessibility)")
+            return
+        }
+        scrollTap = tap
+        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        log("scroll tap active")
     }
     var driving: Bool { FileManager.default.fileExists(atPath: drivingFlag.path) }
     func setIcon() {
@@ -635,12 +973,14 @@ final class MenuApp: NSObject, NSApplicationDelegate {
 
     @objc func drive() {
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: handbackFile)   // explicit drive overrides walk-up
         FileManager.default.createFile(atPath: drivingFlag.path, contents: nil)
         let engine = DisplayEngine()
         let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
         DispatchQueue.global().async { [self] in
             var opened = 0
             for t in macPassengers(cfg: cfg, me: me) {
+                clearRemoteHandback(on: t)   // override any walk-up on the target
                 _ = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
                 if openJumpSession(t.jumpName) { opened += 1 }
                 else if openJumpSession(t.jumpName) { opened += 1 }   // one retry
@@ -654,6 +994,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     @objc func stop() {
         try? FileManager.default.removeItem(at: drivingFlag)
         for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
+        sh("pkill -x 'Jump Desktop' 2>/dev/null")   // close the viewer locally
         notify("Stopped driving — passengers return to console")
         rebuild()
     }
@@ -716,6 +1057,32 @@ func selftest() -> Never {
            "passenger audio -> jump devices")
     let ca = pickAudioNames(passenger: false, deviceNames: names)
     expect(ca.output == nil && ca.input == nil, "console audio -> builtin fallback")
+    // handback logic
+    let hnow = 2_000_000.0
+    expect(handbackIsFresh(ts: hnow - 100, hold: 600, now: hnow), "handback fresh within hold")
+    expect(!handbackIsFresh(ts: hnow - 700, hold: 600, now: hnow), "handback stale past hold")
+    expect(shouldHandback(prevClamshell: true, nowClamshell: false, inputBurst: false,
+                          passengerConverged: true), "lid open while passenger -> handback")
+    expect(!shouldHandback(prevClamshell: true, nowClamshell: false, inputBurst: false,
+                           passengerConverged: false), "lid open while console -> no handback")
+    expect(shouldHandback(prevClamshell: false, nowClamshell: false, inputBurst: true,
+                          passengerConverged: true), "input burst while passenger -> handback")
+    expect(!shouldHandback(prevClamshell: false, nowClamshell: true, inputBurst: false,
+                           passengerConverged: true), "lid closing -> no handback")
+    expect(!shouldHandback(prevClamshell: true, nowClamshell: true, inputBurst: false,
+                           passengerConverged: true), "lid still closed -> no handback")
+    // SavedDisplay mirror-topology round-trip
+    let enc = JSONEncoder(); let dec = JSONDecoder()
+    let sdPlain = SavedDisplay(id: 7, x: 100, y: -20, main: true, mirrorOf: nil)
+    let sdMirror = SavedDisplay(id: 8, x: 0, y: 0, main: false, mirrorOf: 7)
+    if let r = try? dec.decode(SavedDisplay.self, from: (try? enc.encode(sdPlain)) ?? Data()) {
+        expect(r.id == 7 && r.x == 100 && r.y == -20 && r.main && r.mirrorOf == nil,
+               "SavedDisplay round-trip (no mirror)")
+    } else { expect(false, "SavedDisplay round-trip (no mirror)") }
+    if let r = try? dec.decode(SavedDisplay.self, from: (try? enc.encode(sdMirror)) ?? Data()) {
+        expect(r.id == 8 && !r.main && r.mirrorOf == 7,
+               "SavedDisplay round-trip (mirror)")
+    } else { expect(false, "SavedDisplay round-trip (mirror)") }
     // config sanity
     let cfg = loadConfig()
     expect(cfg.machines.count >= 3, "config has machines")
@@ -747,6 +1114,7 @@ case "drive":
     let engine = DisplayEngine()
     let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
     for t in macPassengers(cfg: cfg, me: me) {
+        clearRemoteHandback(on: t)   // explicit drive overrides target walk-up
         let ok = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
         print("\(t.id): \(ok ? "riding (\(canvas))" : "RIDE FAILED")")
     }
@@ -754,6 +1122,7 @@ case "stop":
     let cfg = loadConfig(); let me = selfMachine(cfg)
     try? FileManager.default.removeItem(at: drivingFlag)
     for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
+    sh("pkill -x 'Jump Desktop' 2>/dev/null")   // close the viewer locally
     print("stopped — passengers return to console")
 case "console":
     let cfg = loadConfig()
@@ -761,6 +1130,12 @@ case "console":
     let rec = Reconciler(cfg: cfg); rec.lastMode = .passenger(canvas: "", hidpi: false)
     rec.tick()
     print("console mode")
+case "handback":
+    let cfg = loadConfig()
+    writeHandback()
+    let rec = Reconciler(cfg: cfg); rec.lastMode = .passenger(canvas: "", hidpi: false)
+    rec.tick()   // fresh handback -> immediate console converge
+    print("handback — returned to console")
 case "doctor":
     let cfg = loadConfig()
     let (report, failures) = doctor(cfg: cfg, me: selfMachine(cfg))

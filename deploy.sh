@@ -127,7 +127,7 @@ REMOTE_SIGN
   <key>KeepAlive</key><true/>
 </dict></plist>
 PL
-    # Load into the user Aqua/GUI domain (gui/<uid>), NOT the SSH session's
+    # Load into the user Aqua/GUI domain (gui/<uid>), NOT the SSH session
     # bootstrap context — the daemon needs a WindowServer connection for every
     # CGVirtualDisplay / mirror / setMain call, which the SSH context lacks.
     uid=$(id -u)

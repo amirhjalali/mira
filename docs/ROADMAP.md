@@ -19,9 +19,14 @@ Settings menu (scroll reversal, walk-up, HiDPI), fleet deploy.sh.
 - Menu polish: per-passenger status glyphs (riding / walked-up / unreachable),
   live tier indicator.
 
-## The big one: MIRA transport (replace Jump Desktop)
-Goal: MIRA's own Mac-to-Mac screen protocol, so the whole experience is one
-codebase end to end.
+## Experiment: MIRA transport (complement Jump, not replace it)
+Decision 2026-07-21: Jump/Fluid stays the transport backbone indefinitely —
+its input feel (client-side cursor, gestures, keyboard long-tail) and
+lossy-network resilience represent years of tuning we should not re-fight,
+and it covers RDP + iOS clients besides. MIRA transport is a curiosity spike
+targeting the one niche we could win: Mac-to-Mac on the home LAN/tailnet,
+exact-canvas capture + hardware HEVC at 2x HiDPI. Per-machine
+`transport: "jump" | "mira"` keeps Jump as permanent fallback.
 
 Architecture sketch:
 - Capture: ScreenCaptureKit on the passenger's MIRA virtual display

@@ -39,6 +39,7 @@ struct Machine: Codable {
     let roles: [String]
     let laptopCanvas: String?     // canvas key when this machine drives undocked
     let type: String?             // "mac" (default) | "windows"
+    let jumpAliases: [String]?    // other names this machine has in a viewer's Jump list
 }
 struct Config: Codable {
     let rideTTLSeconds: Double, heartbeatSeconds: Double, reconcileSeconds: Double
@@ -247,6 +248,22 @@ func pickAudioNames(passenger: Bool, deviceNames: [String]) -> (output: String?,
                 deviceNames.first { $0 == "Jump Desktop Microphone" })
     }
     return (nil, nil)  // console: caller falls back to built-in transport
+}
+
+func currentDefaultOutputName() -> String? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var dev: AudioDeviceID = 0
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                     &addr, 0, nil, &size, &dev) == noErr, dev != 0 else { return nil }
+    return listAudioDevices().first { $0.id == dev }?.name
+}
+
+func currentDefaultOutputIsJump() -> Bool {
+    currentDefaultOutputName()?.hasPrefix("Jump Desktop") == true
 }
 
 func routeAudio(passenger: Bool) {
@@ -644,6 +661,10 @@ final class Reconciler {
     func convergeConsole() {
         if lastMode == .console || (lastMode == nil && engine.virtualID == 0
             && !FileManager.default.fileExists(atPath: arrangementFile.path)) {
+            // A fresh daemon can inherit a stale Jump audio route from a
+            // predecessor that died mid-passenger: repair audio only, touch
+            // nothing else (the user may have picked AirPods etc. at console).
+            if lastMode == nil && currentDefaultOutputIsJump() { routeAudio(passenger: false) }
             lastMode = .console; return
         }
         log("converge -> console")
@@ -982,8 +1003,9 @@ final class MenuApp: NSObject, NSApplicationDelegate {
             for t in macPassengers(cfg: cfg, me: me) {
                 clearRemoteHandback(on: t)   // override any walk-up on the target
                 _ = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
-                if openJumpSession(t.jumpName) { opened += 1 }
-                else if openJumpSession(t.jumpName) { opened += 1 }   // one retry
+                let names = [t.jumpName] + (t.jumpAliases ?? [])
+                if names.contains(where: { openJumpSession($0) }) { opened += 1 }
+                else if names.contains(where: { openJumpSession($0) }) { opened += 1 }   // one retry
             }
             DispatchQueue.main.async {
                 self.notify("Driving: \(opened)/\(macPassengers(cfg: cfg, me: me).count) sessions open (\(canvas))")

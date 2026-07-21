@@ -42,7 +42,10 @@
         "target"
       ],
       "laptopCanvas": "laptop-pro",
-      "type": "mac"
+      "type": "mac",
+      "jumpAliases": [
+        "MacBook Pro"
+      ]
     },
     {
       "id": "air",
@@ -55,7 +58,10 @@
         "target"
       ],
       "laptopCanvas": "laptop-air",
-      "type": "mac"
+      "type": "mac",
+      "jumpAliases": [
+        "MacBook Air"
+      ]
     },
     {
       "id": "mini",
@@ -66,7 +72,10 @@
       "roles": [
         "target"
       ],
-      "type": "mac"
+      "type": "mac",
+      "jumpAliases": [
+        "Mac Mini"
+      ]
     }
   ]
 }

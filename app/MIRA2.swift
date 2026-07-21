@@ -300,11 +300,12 @@ final class DisplayEngine {
         guard virtualID != 0 else { return false }
         let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
         guard let modes = CGDisplayCopyAllDisplayModes(virtualID, opts) as? [CGDisplayMode] else { return false }
-        let want = modes.first { m in
-            m.width == canvas.width && m.height == canvas.height &&
-            (hidpi ? m.pixelWidth == canvas.width * 2 : m.pixelWidth == canvas.width)
+        let uiMatches = modes.filter { $0.width == canvas.width && $0.height == canvas.height }
+        let exact = uiMatches.first {
+            hidpi ? $0.pixelWidth == canvas.width * 2 : $0.pixelWidth == canvas.width
         }
-        guard let mode = want else { return false }
+        guard let mode = exact ?? uiMatches.first else { return false }
+        if exact == nil { log("mode fallback: UI \(canvas.width)x\(canvas.height) with backing \(uiMatches.first!.pixelWidth)px") }
         var cfg: CGDisplayConfigRef?
         CGBeginDisplayConfiguration(&cfg)
         CGConfigureDisplayWithDisplayMode(cfg, virtualID, mode, nil)
@@ -402,7 +403,7 @@ final class Reconciler {
             let wantHi = hidpi && canvas.hidpi
             // A passenger never streams outward — enforce every tick, not just
             // on transition (the viewer can be relaunched under us).
-            sh("pkill -x 'Jump Desktop' 2>/dev/null")
+            sh("pkill -x 'Jump Desktop' 2>/dev/null; pkill -f 'MacOS/Jump Desktop$' 2>/dev/null")
             if engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi),
                lastMode == mode { return }
             log("converge -> passenger(\(canvasKey), hidpi=\(wantHi))")
@@ -410,8 +411,10 @@ final class Reconciler {
             sh("pkill -x 'Jump Desktop' 2>/dev/null")          // never stream outward
             sh("caffeinate -u -t 15 >/dev/null 2>&1 &")        // wake display stack
             guard engine.ensureVirtual(canvas: canvas) else { log("virtual create FAILED"); return }
+            engine.unmirrorAll()
             _ = engine.setVirtualMode(canvas: canvas, hidpi: wantHi)
             _ = engine.mirrorPhysicalsOntoVirtual()
+            engine.setMain(engine.virtualID)
             routeAudio(passenger: true)
             let ok = engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi)
             log("passenger converged=\(ok)")

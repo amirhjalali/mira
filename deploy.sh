@@ -15,14 +15,21 @@ air_user="amirjalali";  air_host="100.118.137.45"
 mini_user="gabooja";    mini_host="100.105.19.90"
 
 # ---- resolve target list ----------------------------------------------------
+# "--to <id> <user> <host>" deploys to an arbitrary machine (used by
+# add-machine.sh for onboarding); otherwise named targets from the table.
 TARGETS=()
-if [ "$#" -eq 0 ]; then
+if [ "${1:-}" = "--to" ]; then
+  [ -n "${2:-}" ] && [ -n "${3:-}" ] && [ -n "${4:-}" ] || {
+    echo "deploy.sh: --to <id> <user> <host>" >&2; exit 2; }
+  eval "${2}_user=\"$3\""; eval "${2}_host=\"$4\""
+  TARGETS=("$2")
+elif [ "$#" -eq 0 ]; then
   TARGETS=(air mini)
 else
   for t in "$@"; do
     case "$t" in
       air|mini) TARGETS+=("$t") ;;
-      *) echo "deploy.sh: unknown target '$t' (want: air, mini)" >&2; exit 2 ;;
+      *) echo "deploy.sh: unknown target '$t' (want: air, mini, or --to)" >&2; exit 2 ;;
     esac
   done
 fi
@@ -146,6 +153,10 @@ PL
       rm -rf "/Applications/MIRA.app"
     fi
     rm -f "$HOME/ensure-ultrawide.sh" "$HOME/mira-set-display.sh"           "$HOME/collapse-displays.sh" "$HOME/restore-displays.sh"
+    # retire the pre-rename state dir and stray v1 leftovers
+    rm -rf "$HOME/Library/Application Support/MacRig"
+    rm -f "$HOME/.mira-display-v1" "$HOME/.mira-display-v2" "$HOME/.macrig-display-v3" \
+          "$HOME/ensure-ultrawide.log" "$HOME/Jump_Desktop_Mac_License.jdlicense" 2>/dev/null || true
     # remove legacy raw binary if present
     rm -f "$HOME/bin/mira"
   '

@@ -54,8 +54,10 @@ struct Config: Codable {
 }
 
 func repoRoot() -> URL {
-    if let env = ProcessInfo.processInfo.environment["MACRIG_DIR"], !env.isEmpty {
-        return URL(fileURLWithPath: env, isDirectory: true)
+    for name in ["MIRA_DIR", "MACRIG_DIR"] {   // MACRIG_DIR: pre-rename agents
+        if let env = ProcessInfo.processInfo.environment[name], !env.isEmpty {
+            return URL(fileURLWithPath: env, isDirectory: true)
+        }
     }
     return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("mira", isDirectory: true)
 }
@@ -81,7 +83,7 @@ func selfMachine(_ cfg: Config) -> Machine {
 // MARK: - State
 
 let stateDir = URL(fileURLWithPath: NSHomeDirectory())
-    .appendingPathComponent("Library/Application Support/MacRig", isDirectory: true)
+    .appendingPathComponent("Library/Application Support/MIRA", isDirectory: true)
 let rideFile = stateDir.appendingPathComponent("ride.json")
 let drivingFlag = stateDir.appendingPathComponent("driving")
 let arrangementFile = stateDir.appendingPathComponent("arrangement.json")
@@ -793,19 +795,19 @@ func placeRide(on target: Machine, canvas: String, hidpi: Bool, driver: String) 
                     ts: Date().timeIntervalSince1970)
     guard let d = try? JSONEncoder().encode(ride),
           let json = String(data: d, encoding: .utf8) else { return false }
-    let dir = "$HOME/Library/Application Support/MacRig"
+    let dir = "$HOME/Library/Application Support/MIRA"
     return peerRun(target, "mkdir -p \"\(dir)\" && printf %s '\(json)' > \"\(dir)/ride.json\"").code == 0
 }
 
 func endRide(on target: Machine) {
-    _ = peerRun(target, "rm -f \"$HOME/Library/Application Support/MacRig/ride.json\"")
+    _ = peerRun(target, "rm -f \"$HOME/Library/Application Support/MIRA/ride.json\"")
 }
 
 // An explicit Drive is a deliberate override: clear the target's own walk-up
 // handback so its daemon stops forcing console, and forget any noticed state so
 // the driver stops skipping it.
 func clearRemoteHandback(on target: Machine) {
-    _ = peerRun(target, "rm -f \"$HOME/Library/Application Support/MacRig/handback\"")
+    _ = peerRun(target, "rm -f \"$HOME/Library/Application Support/MIRA/handback\"")
     handbackNoticed.remove(target.id)
 }
 
@@ -818,7 +820,7 @@ var handbackNoticed: Set<String> = []
 
 // A target that has walked itself up (fresh handback) is left alone this beat.
 func targetWalkedUp(_ t: Machine, cfg: Config) -> Bool {
-    let hb = peerRun(t, "cat \"$HOME/Library/Application Support/MacRig/handback\" 2>/dev/null")
+    let hb = peerRun(t, "cat \"$HOME/Library/Application Support/MIRA/handback\" 2>/dev/null")
         .out.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let hts = Double(hb),
           handbackIsFresh(ts: hts, hold: cfg.handbackHoldSeconds ?? 600) else {
@@ -862,7 +864,7 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
             let probe = peerRun(t, """
             echo user=$(whoami); \
             pgrep -f 'MIRA.app/Contents/MacOS/MIRA --daemon' >/dev/null && echo daemon=ok || echo daemon=missing; \
-            cat "$HOME/Library/Application Support/MacRig/ride.json" 2>/dev/null || echo no-ride
+            cat "$HOME/Library/Application Support/MIRA/ride.json" 2>/dev/null || echo no-ride
             """, timeout: 15)
             if probe.code != 0 { l.append("✗ \(t.id) unreachable"); lock.lock(); failures += 1; lock.unlock() }
             else {

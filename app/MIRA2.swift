@@ -586,25 +586,67 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         m.addItem(withTitle: "Quit MIRA 2", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = m
     }
+    // Jump populates submenus lazily: the parent must be clicked open and given
+    // time before its items exist; Escape (consumed by the open menu) cleans up.
+    func openJumpSession(_ name: String) -> Bool {
+        let esc = name.replacingOccurrences(of: "\"", with: "\\\"")
+        let script = """
+        tell application "Jump Desktop" to activate
+        delay 0.7
+        tell application "System Events" to tell process "Jump Desktop"
+          try
+            click menu bar item "File" of menu bar 1
+            delay 0.4
+            click menu item "Open Recent" of menu 1 of menu bar item "File" of menu bar 1
+            delay 0.6
+            set recentMenu to menu 1 of menu item "Open Recent" of menu 1 of menu bar item "File" of menu bar 1
+            if not (exists menu item "\(esc)" of recentMenu) then
+              delay 0.8
+            end if
+            if exists menu item "\(esc)" of recentMenu then
+              click menu item "\(esc)" of recentMenu
+              return "ok"
+            else
+              key code 53
+              key code 53
+              return "missing"
+            end if
+          on error errMsg
+            try
+              key code 53
+              key code 53
+            end try
+            return "error: " & errMsg
+          end try
+        end tell
+        """
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mira-open-\(UUID().uuidString).scpt")
+        try? script.write(to: tmp, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let r = sh("osascript '\(tmp.path)'", timeout: 20)
+        let ok = r.out.contains("ok")
+        if !ok { log("openJumpSession(\(name)) -> \(r.out.trimmingCharacters(in: .whitespacesAndNewlines))") }
+        return ok
+    }
+
     @objc func drive() {
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: drivingFlag.path, contents: nil)
         let engine = DisplayEngine()
         let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
-        for t in macPassengers(cfg: cfg, me: me) {
-            _ = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
-            sh("""
-            osascript -e 'tell application "Jump Desktop" to activate' \
-              -e 'delay 0.6' \
-              -e 'tell application "System Events" to tell process "Jump Desktop" to click menu bar item "File" of menu bar 1' \
-              -e 'delay 0.4' \
-              -e 'tell application "System Events" to tell process "Jump Desktop" to click menu item "Open Recent" of menu 1 of menu bar item "File" of menu bar 1' \
-              -e 'delay 0.4' \
-              -e 'tell application "System Events" to tell process "Jump Desktop" to click menu item "\(t.jumpName)" of menu 1 of menu item "Open Recent" of menu 1 of menu bar item "File" of menu bar 1' 2>/dev/null
-            """)
+        DispatchQueue.global().async { [self] in
+            var opened = 0
+            for t in macPassengers(cfg: cfg, me: me) {
+                _ = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
+                if openJumpSession(t.jumpName) { opened += 1 }
+                else if openJumpSession(t.jumpName) { opened += 1 }   // one retry
+            }
+            DispatchQueue.main.async {
+                self.notify("Driving: \(opened)/\(macPassengers(cfg: cfg, me: me).count) sessions open (\(canvas))")
+                self.rebuild()
+            }
         }
-        notify("Driving \(macPassengers(cfg: cfg, me: me).count) passengers (\(canvas))")
-        rebuild()
     }
     @objc func stop() {
         try? FileManager.default.removeItem(at: drivingFlag)

@@ -182,6 +182,28 @@ func computeMode(ride: Ride?, ttl: Double, now: Double) -> Mode {
     return .console
 }
 
+// System-wide seconds since the last HID event (IORegistry, no TCC). Injected
+// events from an active remote session MAY also reset it, so presence detection
+// is gated on no fleet peer actively streaming (inboundSessionActive).
+func hidIdleSeconds() -> Double? {
+    let entry = IORegistryEntryFromPath(kIOMainPortDefault, "IOService:/IOResources/IOHIDSystem")
+    guard entry != 0 else { return nil }
+    defer { IOObjectRelease(entry) }
+    guard let raw = IORegistryEntryCreateCFProperty(entry, "HIDIdleTime" as CFString,
+                                                    kCFAllocatorDefault, 0)?.takeRetainedValue(),
+          let ns = (raw as? NSNumber)?.doubleValue else { return nil }
+    return ns / 1_000_000_000
+}
+
+// True when Jump Connect holds a connection to a fleet/LAN address — i.e.
+// someone is (or was seconds ago) actively streaming this machine. Cloud
+// signaling to public IPs doesn't count. Used to keep injected input from
+// looking like a human at the console.
+func inboundSessionActive() -> Bool {
+    let out = sh("lsof -nP -i -a -c JumpConnect 2>/dev/null | grep -cE '\\->(100\\.|192\\.168\\.)'").out
+    return (Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) > 0
+}
+
 // MARK: - Handback (pure, selftested)
 
 // Fresh handback: within the hold window. Used both to force console locally
@@ -190,13 +212,21 @@ func handbackIsFresh(ts: Double, hold: Double, now: Double = Date().timeInterval
     now - ts < hold
 }
 
-// Clamshell convention: true = lid closed. A closed->open transition or a burst
-// of real local input, while this machine is a converged passenger, hands back.
+// Clamshell convention: true = lid closed. A closed->open transition, a burst
+// of real local input, or sustained console presence (system idle repeatedly
+// under threshold across ticks) hands back while a converged passenger.
 func shouldHandback(prevClamshell: Bool, nowClamshell: Bool,
                     inputBurst: Bool, passengerConverged: Bool) -> Bool {
     guard passengerConverged else { return false }
     let lidOpened = prevClamshell && !nowClamshell
     return lidOpened || inputBurst
+}
+
+// Presence via idle-time: two consecutive ticks with fresh local input.
+// One tick can be a brushed key; two ticks of activity is a person.
+func consolePresent(idleNow: Double?, idlePrev: Double?, threshold: Double) -> Bool {
+    guard let a = idleNow, let b = idlePrev else { return false }
+    return a < threshold && b < threshold
 }
 
 // MARK: - Tier engine (pure, selftested)
@@ -726,8 +756,22 @@ final class Reconciler {
 
     // Laptops only, while converged: lid-open transition or a real-input burst
     // writes the handback file (acted on next tick).
+    var prevIdle: Double?
     func checkWalkupTriggers() {
-        guard isLaptop, loadSettings().walkupHandback else { return }
+        guard loadSettings().walkupHandback else { return }
+        // Presence detection works on any machine with local input (laptop
+        // keyboard or a desktop's own mouse), needs no TCC, and keeps firing
+        // while the person stays — so an expiring hold cannot re-claim them.
+        let idle = hidIdleSeconds()
+        defer { prevIdle = idle }
+        if consolePresent(idleNow: idle, idlePrev: prevIdle,
+                          threshold: cfg.reconcileSeconds + 5),
+           !inboundSessionActive() {
+            log("walk-up: sustained local input (idle \(idle.map { String(format: "%.0f", $0) } ?? "?")s) — handing back")
+            writeHandback()
+            return
+        }
+        guard isLaptop else { return }
         let converged = passengerConverged
         let burst = walkup.consumeBurst()
         let nowClam = readClamshellState()
@@ -864,6 +908,7 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
             let probe = peerRun(t, """
             echo user=$(whoami); \
             pgrep -f 'MIRA.app/Contents/MacOS/MIRA --daemon' >/dev/null && echo daemon=ok || echo daemon=missing; \
+            "/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect" --dumpmacperm 2>/dev/null | tr -d ' \\n' ; echo; \
             cat "$HOME/Library/Application Support/MIRA/ride.json" 2>/dev/null || echo no-ride
             """, timeout: 15)
             if probe.code != 0 { l.append("✗ \(t.id) unreachable"); lock.lock(); failures += 1; lock.unlock() }
@@ -873,6 +918,12 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
                 if o.contains("daemon=missing") {
                     l.append("✗ \(t.id) daemon not running"); lock.lock(); failures += 1; lock.unlock()
                 } else { l.append("✓ \(t.id) daemon running") }
+                if o.contains("hasAccessiblity\":false") || o.contains("hasScreenRecording\":false") {
+                    l.append("✗ \(t.id) Jump Connect lost Accessibility/Screen Recording (macOS update?) — re-grant on that machine")
+                    lock.lock(); failures += 1; lock.unlock()
+                } else if o.contains("hasAccessiblity\":true") {
+                    l.append("✓ \(t.id) Jump Connect permissions intact")
+                }
                 l.append(o.contains("no-ride") ? "  \(t.id): parked" : "  \(t.id): being driven")
             }
             lock.lock(); peerLines.append(contentsOf: l); lock.unlock()
@@ -1207,6 +1258,11 @@ func selftest() -> Never {
                       laptopCanvas: "laptop-air") == "laptop-air", "builtin only -> laptop canvas")
     expect(pickCanvas(physicalWidths: [], dockedCanvas: "ultrawide",
                       laptopCanvas: "laptop-air") == "laptop-air", "headless -> laptop canvas")
+    // console presence via idle-time
+    expect(consolePresent(idleNow: 2, idlePrev: 5, threshold: 20), "sustained input -> present")
+    expect(!consolePresent(idleNow: 2, idlePrev: 300, threshold: 20), "single blip -> not present")
+    expect(!consolePresent(idleNow: 300, idlePrev: 2, threshold: 20), "gone idle -> not present")
+    expect(!consolePresent(idleNow: nil, idlePrev: 2, threshold: 20), "unreadable -> not present")
     // scroll discrimination: wheels reversed, gesture devices untouched
     expect(shouldReverseScroll(phase: 0, momentum: 0), "classic wheel reversed")
     expect(!shouldReverseScroll(phase: 2, momentum: 0), "trackpad live gesture untouched")

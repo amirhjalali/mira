@@ -110,6 +110,10 @@ struct Settings: Codable {
     var reverseScroll: Bool = true
     var walkupHandback: Bool = true
     var hidpiRides: Bool = true
+    // Idle-time presence detection false-fired on injected input 2026-07-22
+    // and kicked a live session. OFF until proven under the live-fire
+    // protocol (docs/STABILITY.md); lid-transition walk-up remains on.
+    var walkupPresence: Bool = false
 }
 
 func loadSettings() -> Settings {
@@ -765,7 +769,8 @@ final class Reconciler {
         // while the person stays — so an expiring hold cannot re-claim them.
         let idle = hidIdleSeconds()
         defer { prevIdle = idle }
-        if consolePresent(idleNow: idle, idlePrev: prevIdle,
+        if loadSettings().walkupPresence,
+           consolePresent(idleNow: idle, idlePrev: prevIdle,
                           threshold: cfg.reconcileSeconds + 5),
            readClamshellState() != true,
            !inboundSessionActive() {
@@ -846,6 +851,7 @@ func placeRide(on target: Machine, canvas: String, hidpi: Bool, driver: String) 
 }
 
 func endRide(on target: Machine) {
+    liveRideHiDPI.removeValue(forKey: target.id)
     _ = peerRun(target, "rm -f \"$HOME/Library/Application Support/MIRA/ride.json\"")
 }
 
@@ -878,6 +884,8 @@ func targetWalkedUp(_ t: Machine, cfg: Config) -> Bool {
     }
     return true
 }
+
+var liveRideHiDPI: [String: Bool] = [:]
 
 func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Tier) -> Tier {
     let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)

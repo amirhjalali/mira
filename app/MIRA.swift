@@ -195,13 +195,14 @@ func hidIdleSeconds() -> Double? {
     return ns / 1_000_000_000
 }
 
-// True when Jump Connect holds a connection to a fleet/LAN address — i.e.
-// someone is (or was seconds ago) actively streaming this machine. Cloud
-// signaling to public IPs doesn't count. Used to keep injected input from
-// looking like a human at the console.
+// True when Jump Connect is actively encoding a session. Fluid rides UDP, so
+// lsof shows no connected peers (learned 2026-07-22 the hard way: a false
+// walk-up kicked a live session). Streaming provably burns encoder CPU, and
+// interaction — the only source of injected input — always streams. Lid-closed
+// machines also can't have a walk-up human at all.
 func inboundSessionActive() -> Bool {
-    let out = sh("lsof -nP -i -a -c JumpConnect 2>/dev/null | grep -cE '\\->(100\\.|192\\.168\\.)'").out
-    return (Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) > 0
+    let out = sh("ps -Aco pcpu,comm | awk '/JumpConnect/ {s+=$1} END {print s+0}'").out
+    return (Double(out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) >= 5.0
 }
 
 // MARK: - Handback (pure, selftested)
@@ -766,6 +767,7 @@ final class Reconciler {
         defer { prevIdle = idle }
         if consolePresent(idleNow: idle, idlePrev: prevIdle,
                           threshold: cfg.reconcileSeconds + 5),
+           readClamshellState() != true,
            !inboundSessionActive() {
             log("walk-up: sustained local input (idle \(idle.map { String(format: "%.0f", $0) } ?? "?")s) — handing back")
             writeHandback()

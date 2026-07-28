@@ -11,6 +11,7 @@ import Foundation
 import IOKit
 import IOKit.hid
 import IOKit.pwr_mgt
+import ServiceManagement
 
 // MARK: - Shell (small residue: ssh, ping, osascript)
 
@@ -90,6 +91,9 @@ let arrangementFile = stateDir.appendingPathComponent("arrangement.json")
 let handbackFile = stateDir.appendingPathComponent("handback")
 let hygieneFile = stateDir.appendingPathComponent("hygiene.json")
 let excludedFile = stateDir.appendingPathComponent("excluded.json")
+let healthFile = stateDir.appendingPathComponent("health.json")
+// Boot epoch at the time session windows were last opened; gates boot-resume.
+let sessionMarkerFile = stateDir.appendingPathComponent("sessions-opened")
 
 func loadExcluded() -> Set<String> {
     guard let d = try? Data(contentsOf: excludedFile),
@@ -127,7 +131,20 @@ func saveSettings(_ s: Settings) {
         at: settingsFile.deletingLastPathComponent(), withIntermediateDirectories: true)
     if let d = try? JSONEncoder().encode(s) { try? d.write(to: settingsFile) }
 }
-let logFile = repoRoot().appendingPathComponent("logs/mira.log")
+// Log beside the repo on a dev checkout; standalone installs (passengers, or a
+// viewer without the repo) log to ~/Library/Logs/MIRA instead.
+let logFile: URL = {
+    var isDir: ObjCBool = false
+    let dir: URL
+    if FileManager.default.fileExists(atPath: repoRoot().path, isDirectory: &isDir), isDir.boolValue {
+        dir = repoRoot().appendingPathComponent("logs", isDirectory: true)
+    } else {
+        dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Logs/MIRA", isDirectory: true)
+    }
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("mira.log")
+}()
 
 // Walk-up handback: a laptop that its owner physically returns to writes this
 // file (unix ts) so the reconciler hands control back to the local console.
@@ -232,6 +249,105 @@ func shouldHandback(prevClamshell: Bool, nowClamshell: Bool,
 func consolePresent(idleNow: Double?, idlePrev: Double?, threshold: Double) -> Bool {
     guard let a = idleNow, let b = idlePrev else { return false }
     return a < threshold && b < threshold
+}
+
+// MARK: - Boot-resume gate (pure, selftested)
+
+// Seconds since epoch at boot; 0 when unreadable (never matches a marker, so
+// an unreadable boot time fails open toward resuming).
+func bootEpoch() -> Int {
+    var tv = timeval()
+    var size = MemoryLayout<timeval>.stride
+    guard sysctlbyname("kern.boottime", &tv, &size, nil, 0) == 0 else { return 0 }
+    return tv.tv_sec
+}
+
+// Re-open session windows only when this login follows a reboot that happened
+// after the last time windows were opened: driving flag set, viewer role, and
+// the recorded marker is from a different boot (or absent).
+func shouldResumeSessions(driving: Bool, viewer: Bool, markerBoot: Int?, currentBoot: Int) -> Bool {
+    driving && viewer && markerBoot != currentBoot
+}
+
+func readSessionMarker() -> Int? {
+    guard let s = try? String(contentsOf: sessionMarkerFile, encoding: .utf8) else { return nil }
+    return Int(s.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+func writeSessionMarker() {
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    try? String(bootEpoch()).write(to: sessionMarkerFile, atomically: true, encoding: .utf8)
+}
+
+// MARK: - Jump permission health (probe truthful only in the gui domain)
+
+// `JumpConnect --dumpmacperm` reports every permission false when run from an
+// SSH session regardless of the real grants (the 2026-07-22 "stripped TCC"
+// incident was this artifact). Each daemon therefore probes locally — its
+// LaunchAgent lives in gui/<uid>, where the probe is truthful — and publishes
+// health.json for doctor to read over SSH.
+struct Health: Codable { let accessibility: Bool; let screenRecording: Bool; let ts: Double }
+
+// Tolerates the QApplication warning line and the vendor's "hasAccessiblity"
+// typo. Pure, selftested.
+func parsePermReport(_ out: String) -> (accessibility: Bool, screenRecording: Bool)? {
+    guard let a = out.firstIndex(of: "{"), let b = out.lastIndex(of: "}"), a < b,
+          let obj = try? JSONSerialization.jsonObject(with: Data(out[a...b].utf8)) as? [String: Any],
+          let ax = obj["hasAccessiblity"] as? Bool,
+          let sr = obj["hasScreenRecording"] as? Bool else { return nil }
+    return (ax, sr)
+}
+
+// Spawn a binary disclaimed — as its own TCC "responsible process" (the same
+// long-stable private attribute sshd and Terminal use). A child spawned the
+// normal way inherits OUR responsibility, so TCC answers for com.amir.mira
+// instead of the probed app and the report is false for every permission
+// (measured 2026-07-28: identical probe true as a launchd job, false as our
+// child). Returns captured stdout+stderr, or nil on spawn failure/timeout.
+func runDisclaimed(_ path: String, _ args: [String], timeout: TimeInterval = 10) -> String? {
+    typealias SetDisclaim = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>?, Int32) -> Int32
+    guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2) /* RTLD_DEFAULT */,
+                          "responsibility_spawnattrs_setdisclaim") else { return nil }
+    let setDisclaim = unsafeBitCast(sym, to: SetDisclaim.self)
+    var attr: posix_spawnattr_t?
+    posix_spawnattr_init(&attr)
+    defer { posix_spawnattr_destroy(&attr) }
+    _ = setDisclaim(&attr, 1)
+    var fds: [Int32] = [0, 0]
+    guard pipe(&fds) == 0 else { return nil }
+    var actions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&actions)
+    defer { posix_spawn_file_actions_destroy(&actions) }
+    posix_spawn_file_actions_adddup2(&actions, fds[1], 1)
+    posix_spawn_file_actions_adddup2(&actions, fds[1], 2)
+    posix_spawn_file_actions_addclose(&actions, fds[0])
+    var pid: pid_t = 0
+    var argv: [UnsafeMutablePointer<CChar>?] = ([path] + args).map { strdup($0) }
+    argv.append(nil)
+    defer { argv.forEach { if let p = $0 { free(p) } } }
+    let rc = posix_spawn(&pid, path, &actions, &attr, argv, environ)
+    close(fds[1])
+    guard rc == 0 else { close(fds[0]); return nil }
+    var status: Int32 = 0
+    let deadline = Date().addingTimeInterval(timeout)
+    while waitpid(pid, &status, WNOHANG) == 0 {
+        if Date() >= deadline { kill(pid, SIGKILL); _ = waitpid(pid, &status, 0); break }
+        usleep(50_000)
+    }
+    // Output is tiny (a few lines of JSON), far below the pipe buffer, so
+    // reading after exit cannot deadlock.
+    let data = FileHandle(fileDescriptor: fds[0], closeOnDealloc: true).readDataToEndOfFile()
+    return String(data: data, encoding: .utf8)
+}
+
+func writeHealth() {
+    guard let out = runDisclaimed("/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect",
+                                  ["--dumpmacperm"]),
+          let p = parsePermReport(out) else { return }
+    let h = Health(accessibility: p.accessibility, screenRecording: p.screenRecording,
+                   ts: Date().timeIntervalSince1970)
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    if let d = try? JSONEncoder().encode(h) { try? d.write(to: healthFile) }
 }
 
 // MARK: - Tier engine (pure, selftested)
@@ -915,10 +1031,13 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
         group.enter()
         DispatchQueue.global().async {
             var l: [String] = []
+            // No dumpmacperm over SSH here — that probe reports false for every
+            // permission outside the gui domain (2026-07-28 finding). The
+            // passenger's own daemon publishes health.json from a truthful context.
             let probe = peerRun(t, """
             echo user=$(whoami); \
             pgrep -f 'MIRA.app/Contents/MacOS/MIRA --daemon' >/dev/null && echo daemon=ok || echo daemon=missing; \
-            "/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect" --dumpmacperm 2>/dev/null | tr -d ' \\n' ; echo; \
+            echo "HEALTH=$(cat "$HOME/Library/Application Support/MIRA/health.json" 2>/dev/null | tr -d ' \\n')"; \
             cat "$HOME/Library/Application Support/MIRA/ride.json" 2>/dev/null || echo no-ride
             """, timeout: 15)
             if probe.code != 0 { l.append("✗ \(t.id) unreachable"); lock.lock(); failures += 1; lock.unlock() }
@@ -928,11 +1047,18 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
                 if o.contains("daemon=missing") {
                     l.append("✗ \(t.id) daemon not running"); lock.lock(); failures += 1; lock.unlock()
                 } else { l.append("✓ \(t.id) daemon running") }
-                if o.contains("hasAccessiblity\":false") || o.contains("hasScreenRecording\":false") {
-                    l.append("✗ \(t.id) Jump Connect lost Accessibility/Screen Recording (macOS update?) — re-grant on that machine")
-                    lock.lock(); failures += 1; lock.unlock()
-                } else if o.contains("hasAccessiblity\":true") {
-                    l.append("✓ \(t.id) Jump Connect permissions intact")
+                let health = o.components(separatedBy: "\n")
+                    .first(where: { $0.hasPrefix("HEALTH=") })
+                    .flatMap { try? JSONDecoder().decode(Health.self, from: Data($0.dropFirst(7).utf8)) }
+                if let h = health, Date().timeIntervalSince1970 - h.ts < 900 {
+                    if h.accessibility && h.screenRecording {
+                        l.append("✓ \(t.id) Jump Connect permissions intact")
+                    } else {
+                        l.append("✗ \(t.id) Jump Connect lost \(h.accessibility ? "" : "Accessibility ")\(h.screenRecording ? "" : "Screen Recording")— re-grant on that machine")
+                        lock.lock(); failures += 1; lock.unlock()
+                    }
+                } else {
+                    l.append("! \(t.id) no fresh permission report (daemon old or probe failing) — not counted as failure")
                 }
                 l.append(o.contains("no-ride") ? "  \(t.id): parked" : "  \(t.id): being driven")
             }
@@ -958,6 +1084,7 @@ func runDaemon(cfg: Config) -> Never {
     log("mira daemon started on \(rec.me.id) (driver+passenger roles: \(rec.me.roles))")
     var tier: Tier = .standard
     var beat = 0.0
+    var healthBeat = 0.0
     while true {
         rec.tick()
         if rec.me.roles.contains("viewer"),
@@ -968,6 +1095,8 @@ func runDaemon(cfg: Config) -> Never {
                 beat = cfg.heartbeatSeconds
             }
         }
+        healthBeat -= cfg.reconcileSeconds
+        if healthBeat <= 0 { writeHealth(); healthBeat = 300 }
         Thread.sleep(forTimeInterval: cfg.reconcileSeconds)
     }
 }
@@ -1031,6 +1160,13 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         rebuild()
         installScrollTap()
+        // Standalone app: present at every login (scroll reversal + boot-resume
+        // depend on the menu app running, not on the user remembering to launch it).
+        if SMAppService.mainApp.status != .enabled {
+            do { try SMAppService.mainApp.register(); log("registered as login item") }
+            catch { log("login item registration failed: \(error.localizedDescription)") }
+        }
+        maybeResumeSessions()
     }
 
     func installScrollTap() {
@@ -1069,6 +1205,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         m.addItem(.separator())
         if driving {
             m.addItem(withTitle: "Stop Driving", action: #selector(stop), keyEquivalent: "d").target = self
+            m.addItem(withTitle: "Reopen Session Windows", action: #selector(reopenWindows), keyEquivalent: "r").target = self
         } else {
             m.addItem(withTitle: "Drive from Here", action: #selector(drive), keyEquivalent: "d").target = self
         }
@@ -1143,9 +1280,13 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         var s = loadSettings(); s.hidpiRides.toggle(); saveSettings(s); rebuild()
     }
     @objc func viewLog() { sh("open -a Console '\(logFile.path)'") }
-    // Jump populates submenus lazily: the parent must be clicked open and given
-    // time before its items exist; Escape (consumed by the open menu) cleans up.
-    func openJumpSession(_ name: String) -> Bool {
+}
+
+// MARK: - Session windows (Jump viewer UI scripting)
+
+// Jump populates submenus lazily: the parent must be clicked open and given
+// time before its items exist; Escape (consumed by the open menu) cleans up.
+func openJumpSession(_ name: String) -> Bool {
         let esc = name.replacingOccurrences(of: "\"", with: "\\\"")
         let script = """
         tell application "Jump Desktop" to activate
@@ -1177,16 +1318,34 @@ final class MenuApp: NSObject, NSApplicationDelegate {
           end try
         end tell
         """
-        let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mira-open-\(UUID().uuidString).scpt")
-        try? script.write(to: tmp, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: tmp) }
-        let r = sh("osascript '\(tmp.path)'", timeout: 20)
-        let ok = r.out.contains("ok")
-        if !ok { log("openJumpSession(\(name)) -> \(r.out.trimmingCharacters(in: .whitespacesAndNewlines))") }
-        return ok
-    }
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mira-open-\(UUID().uuidString).scpt")
+    try? script.write(to: tmp, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let r = sh("osascript '\(tmp.path)'", timeout: 20)
+    let ok = r.out.contains("ok")
+    if !ok { log("openJumpSession(\(name)) -> \(r.out.trimmingCharacters(in: .whitespacesAndNewlines))") }
+    return ok
+}
 
+// Open a Jump window for every included, not-walked-up passenger. Records the
+// boot marker when at least one opened, so boot-resume runs once per boot.
+// Callers need Accessibility for the UI scripting (menu app has it; a terminal
+// running the CLI may not — failures log and count as not-opened).
+func openSessionWindows(cfg: Config, me: Machine) -> Int {
+    var opened = 0
+    let excluded = loadExcluded()
+    for t in macPassengers(cfg: cfg, me: me) where !excluded.contains(t.id) {
+        if targetWalkedUp(t, cfg: cfg) { continue }
+        let names = [t.jumpName] + (t.jumpAliases ?? [])
+        if names.contains(where: { openJumpSession($0) }) { opened += 1 }
+        else if names.contains(where: { openJumpSession($0) }) { opened += 1 }   // one retry
+    }
+    if opened > 0 { writeSessionMarker() }
+    return opened
+}
+
+extension MenuApp {
     @objc func drive() {
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: handbackFile)   // explicit drive overrides walk-up
@@ -1194,19 +1353,24 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         let engine = DisplayEngine()
         let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
         DispatchQueue.global().async { [self] in
-            var opened = 0
             let excluded = loadExcluded()
             for t in macPassengers(cfg: cfg, me: me) where !excluded.contains(t.id) {
                 clearRemoteHandback(on: t)   // override any walk-up on the target
                 _ = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
-                let names = [t.jumpName] + (t.jumpAliases ?? [])
-                if names.contains(where: { openJumpSession($0) }) { opened += 1 }
-                else if names.contains(where: { openJumpSession($0) }) { opened += 1 }   // one retry
             }
+            let opened = openSessionWindows(cfg: cfg, me: me)
             DispatchQueue.main.async {
                 self.notify("Driving: \(opened)/\(macPassengers(cfg: cfg, me: me).count) sessions open (\(canvas))")
                 self.rebuild()
             }
+        }
+    }
+    // Re-open viewer windows without touching rides/handbacks — for a closed
+    // window mid-session or a boot-resume triggered manually.
+    @objc func reopenWindows() {
+        DispatchQueue.global().async { [self] in
+            let opened = openSessionWindows(cfg: cfg, me: me)
+            DispatchQueue.main.async { self.notify("Reopened \(opened) session window\(opened == 1 ? "" : "s")") }
         }
     }
     @objc func stop() {
@@ -1226,6 +1390,25 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     func notify(_ text: String) {
         let esc = text.replacingOccurrences(of: "\"", with: "\\\"")
         sh("osascript -e 'display notification \"\(esc)\" with title \"MIRA\"'")
+    }
+
+    // After a reboot the driving flag survives and the daemon re-places rides,
+    // but only the menu app can re-open the viewer windows. Once per boot.
+    func maybeResumeSessions() {
+        guard shouldResumeSessions(driving: driving,
+                                   viewer: me.roles.contains("viewer"),
+                                   markerBoot: readSessionMarker(),
+                                   currentBoot: bootEpoch()) else { return }
+        log("boot resume: driving flag set and no windows opened this boot")
+        // Settle delay: Tailscale, Jump Desktop, and the menu bar all come up
+        // around login; UI scripting too early hits half-built menus.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 12) { [self] in
+            let opened = openSessionWindows(cfg: cfg, me: me)
+            log("boot resume: opened \(opened) session window(s)")
+            DispatchQueue.main.async {
+                self.notify("Resumed driving: \(opened) session window\(opened == 1 ? "" : "s") reopened")
+            }
+        }
     }
 }
 
@@ -1310,6 +1493,38 @@ func selftest() -> Never {
         expect(r.id == 8 && !r.main && r.mirrorOf == 7,
                "SavedDisplay round-trip (mirror)")
     } else { expect(false, "SavedDisplay round-trip (mirror)") }
+    // boot-resume gate
+    expect(shouldResumeSessions(driving: true, viewer: true, markerBoot: nil, currentBoot: 111),
+           "no marker -> resume")
+    expect(shouldResumeSessions(driving: true, viewer: true, markerBoot: 100, currentBoot: 111),
+           "marker from previous boot -> resume")
+    expect(!shouldResumeSessions(driving: true, viewer: true, markerBoot: 111, currentBoot: 111),
+           "already opened this boot -> no resume")
+    expect(!shouldResumeSessions(driving: false, viewer: true, markerBoot: nil, currentBoot: 111),
+           "not driving -> no resume")
+    expect(!shouldResumeSessions(driving: true, viewer: false, markerBoot: nil, currentBoot: 111),
+           "not a viewer -> no resume")
+    // dumpmacperm parse (vendor typo + warning noise tolerated)
+    let permOut = """
+    WARNING: QApplication was not created in the main() thread.
+    {
+       "hasAccessiblity" : true,
+       "hasMicrophone" : false,
+       "hasScreenRecording" : true
+    }
+    """
+    if let p = parsePermReport(permOut) {
+        expect(p.accessibility && p.screenRecording, "perm report parsed through noise")
+    } else { expect(false, "perm report parsed through noise") }
+    if let p = parsePermReport("{\"hasAccessiblity\":false,\"hasScreenRecording\":true}") {
+        expect(!p.accessibility && p.screenRecording, "perm report false accessibility")
+    } else { expect(false, "perm report false accessibility") }
+    expect(parsePermReport("no json here") == nil, "garbage perm report -> nil")
+    // health round-trip (what doctor decodes from the HEALTH= line)
+    let hEnc = try? JSONEncoder().encode(Health(accessibility: true, screenRecording: false, ts: 5))
+    if let d = hEnc, let h = try? JSONDecoder().decode(Health.self, from: d) {
+        expect(h.accessibility && !h.screenRecording && h.ts == 5, "health round-trip")
+    } else { expect(false, "health round-trip") }
     // config sanity
     let cfg = loadConfig()
     expect(cfg.machines.count >= 3, "config has machines")
@@ -1333,7 +1548,13 @@ case "status":
     let mode = computeMode(ride: readRide(), ttl: cfg.rideTTLSeconds,
                            now: Date().timeIntervalSince1970)
     let driving = FileManager.default.fileExists(atPath: drivingFlag.path)
-    print("machine: \(me.id)  mode: \(mode)  driving: \(driving)")
+    var line = "machine: \(me.id)  mode: \(mode)  driving: \(driving)"
+    if driving {
+        line += readSessionMarker() == bootEpoch()
+            ? "  windows: opened this boot"
+            : "  windows: NOT opened this boot (menu: Reopen Session Windows)"
+    }
+    print(line)
 case "drive":
     let cfg = loadConfig(); let me = selfMachine(cfg)
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
@@ -1345,6 +1566,11 @@ case "drive":
         let ok = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
         print("\(t.id): \(ok ? "riding (\(canvas))" : "RIDE FAILED")")
     }
+    // Best effort from a terminal (needs the terminal's Accessibility grant);
+    // the menu app path is the reliable opener.
+    let opened = openSessionWindows(cfg: cfg, me: me)
+    print(opened > 0 ? "opened \(opened) session window(s)"
+                     : "no windows opened — use the MIRA menu (Drive from Here / Reopen Session Windows)")
 case "stop":
     let cfg = loadConfig(); let me = selfMachine(cfg)
     try? FileManager.default.removeItem(at: drivingFlag)

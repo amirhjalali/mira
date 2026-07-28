@@ -22,6 +22,9 @@ inside the app.
   transitions converge instead of stranding.
 - **Walk-up handback**: open a driven laptop's lid (or type on it) and it
   hands itself back to you — console restored, driver notified.
+- **Reboot-proof**: the menu app is a login item; when a driving viewer
+  reboots, it reopens the Jump session windows once per boot automatically
+  (menu also has "Reopen Session Windows" for a mid-session mishap).
 - **Network-adaptive**: ping-based tiers with hysteresis pick quality and
   HiDPI; dock/undock is a debounced canvas change, never a yank.
 - **Settings menu**: reverse mouse scrolling (wheel only — trackpad stays
@@ -41,7 +44,8 @@ docs/                 design, fleet proposal, roadmap, test reports
 ## Install
 
 Existing fleet: `bash deploy.sh` from any repo checkout (normally the Pro) —
-builds, selftests, signs, ships to every machine, restarts daemons.
+builds, selftests, signs, installs locally AND ships to every remote machine,
+restarts daemons. (`bash deploy.sh local` for just this machine.)
 
 New machine:
 

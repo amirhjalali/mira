@@ -17,6 +17,7 @@ mini_user="gabooja";    mini_host="100.105.19.90"
 # ---- resolve target list ----------------------------------------------------
 # "--to <id> <user> <host>" deploys to an arbitrary machine (used by
 # add-machine.sh for onboarding); otherwise named targets from the table.
+# "local" (re)installs on this machine; the no-arg run covers the whole fleet.
 TARGETS=()
 if [ "${1:-}" = "--to" ]; then
   [ -n "${2:-}" ] && [ -n "${3:-}" ] && [ -n "${4:-}" ] || {
@@ -24,12 +25,12 @@ if [ "${1:-}" = "--to" ]; then
   eval "${2}_user=\"$3\""; eval "${2}_host=\"$4\""
   TARGETS=("$2")
 elif [ "$#" -eq 0 ]; then
-  TARGETS=(air mini)
+  TARGETS=(local air mini)
 else
   for t in "$@"; do
     case "$t" in
-      air|mini) TARGETS+=("$t") ;;
-      *) echo "deploy.sh: unknown target '$t' (want: air, mini, or --to)" >&2; exit 2 ;;
+      local|air|mini) TARGETS+=("$t") ;;
+      *) echo "deploy.sh: unknown target '$t' (want: local, air, mini, or --to)" >&2; exit 2 ;;
     esac
   done
 fi
@@ -51,12 +52,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleIdentifier</key><string>com.amir.mira</string>
-  <key>CFBundleName</key><string>MIRA 2</string>
+  <key>CFBundleName</key><string>MIRA</string>
   <key>CFBundleExecutable</key><string>MIRA</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleShortVersionString</key><string>2.0</string>
+  <key>CFBundleShortVersionString</key><string>2.1</string>
 </dict></plist>
 PLIST
 if security find-identity -p codesigning 2>/dev/null | grep -q "MIRA Signing"; then
@@ -67,7 +68,60 @@ else
   codesign --force --sign - "$APP"
 fi
 
-# ---- 3) per-target push -----------------------------------------------------
+# ---- 3) local install (the machine running the deploy) ----------------------
+# The Pro used to run whatever build was copied by hand — deploy now installs
+# here too so the driver is never behind the passengers.
+deploy_local() {
+  echo "=== local ($(hostname -s)) ==="
+  local dst="/Applications/MIRA.app"
+
+  # menu app restarts after the swap; daemon restarts via launchctl below
+  pkill -f "$dst/Contents/MacOS/MIRA$" 2>/dev/null || true
+  rm -rf "$dst"
+  cp -R "$APP" "$dst"
+  if security find-identity -p codesigning 2>/dev/null | grep -q "MIRA Signing"; then
+    codesign --force --sign "MIRA Signing" "$dst"
+  else
+    echo "   ERROR: MIRA Signing identity missing locally — refusing ad-hoc (would drop TCC grants)" >&2
+    return 1
+  fi
+
+  # standalone config fallback (repo checkout still wins when present)
+  mkdir -p "$HOME/.config/mira"
+  cp config/machines.json "$HOME/.config/mira/machines.json"
+
+  # daemon LaunchAgent: keep an existing plist (it may pin MIRA_DIR on the dev
+  # box); write the standalone default only when absent
+  local plist="$HOME/Library/LaunchAgents/com.amir.mira.plist"
+  if [ ! -f "$plist" ]; then
+    cat > "$plist" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.amir.mira</string>
+  <key>ProgramArguments</key>
+  <array><string>$dst/Contents/MacOS/MIRA</string><string>--daemon</string></array>
+  <key>StandardOutPath</key><string>/tmp/mira-daemon.log</string>
+  <key>StandardErrorPath</key><string>/tmp/mira-daemon.log</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+PL
+  fi
+  local uid; uid=$(id -u)
+  launchctl bootout "gui/$uid" "$plist" 2>/dev/null || true
+  launchctl bootstrap "gui/$uid" "$plist"
+  open -a "$dst"
+
+  for i in 1 2 3 4 5; do
+    pgrep -f "MIRA --daemon" >/dev/null && { echo "local: OK"; return 0; }
+    sleep 1
+  done
+  echo "local: FAILED — daemon not running (see /tmp/mira-daemon.log)" >&2
+  return 1
+}
+
+# ---- 4) per-target push -----------------------------------------------------
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
 
 # sign_mode: "identity" => must sign with the stable "MIRA Signing" identity
@@ -78,35 +132,54 @@ deploy_one() {
   local tgt="$user@$host"
   echo "=== $name ($tgt) ==="
 
+  # NOTE: set -e is suppressed inside a function invoked under `|| fail=1`
+  # (bash semantics) — every critical step needs explicit `|| return`.
+
   # connectivity check (harmless)
-  ssh $SSH_OPTS "$tgt" 'echo ok' >/dev/null
+  ssh $SSH_OPTS "$tgt" 'echo ok' >/dev/null || { echo "$name: unreachable" >&2; return 1; }
 
   # stage bundle to a scratch path in the target home, then swap into place
-  ssh $SSH_OPTS "$tgt" 'rm -rf "$HOME/.mira-stage" && mkdir -p "$HOME/.mira-stage"'
-  scp -O -r "$APP" "$tgt:.mira-stage/MIRA.app"
+  ssh $SSH_OPTS "$tgt" 'rm -rf "$HOME/.mira-stage" && mkdir -p "$HOME/.mira-stage"' || return 1
+  scp -O -r "$APP" "$tgt:.mira-stage/MIRA.app" || return 1
   ssh $SSH_OPTS "$tgt" '
     set -e
     mkdir -p "$HOME/Applications"
     rm -rf "$HOME/Applications/MIRA.app"
     mv "$HOME/.mira-stage/MIRA.app" "$HOME/Applications/MIRA.app"
     rmdir "$HOME/.mira-stage" 2>/dev/null || true
-  '
+  ' || return 1
 
   # remote re-sign. For an identity target, a stable "MIRA Signing" signature is
   # required — never silently degrade to ad-hoc (that changes the designated
   # requirement and revokes the Accessibility grant). Ad-hoc only where intended.
-  ssh $SSH_OPTS "$tgt" "SIGN_MODE='$sign_mode' bash -s" <<'REMOTE_SIGN'
+  # Leaf-cert fingerprint of the local MIRA Signing identity: the remote check
+  # pins the shipped signature to this exact cert (codesign prints no
+  # Authority= line for a self-signed cert, so grep the requirement instead).
+  local leaf
+  leaf=$(security find-certificate -c "MIRA Signing" -Z 2>/dev/null | awk '/SHA-1 hash:/{print $3}')
+
+  ssh $SSH_OPTS "$tgt" "SIGN_MODE='$sign_mode' LEAF='$leaf' bash -s" <<'REMOTE_SIGN' || return 1
     set -e
     APP="$HOME/Applications/MIRA.app"
     if [ "$SIGN_MODE" = "identity" ]; then
-      # Unlock login keychain if a GUI session hasn't already (harmless if locked
-      # non-interactively — the failure is caught below, not silently ad-hoc'd).
-      security unlock-keychain "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
-      if codesign --force --sign "MIRA Signing" "$APP"; then
-        echo "   signed with MIRA Signing identity"
+      # The fleet shares one "MIRA Signing" cert, so the signature made on the
+      # build machine is already the right designated requirement here. Accept
+      # it when it verifies; re-sign only a broken/foreign signature (scp can
+      # not corrupt it, but belt and braces).
+      if codesign --verify "$APP" 2>/dev/null && [ -n "$LEAF" ] && \
+         codesign -d -r- "$APP" 2>&1 | grep -qi "certificate leaf = H\"$LEAF\""; then
+        echo "   shipped MIRA Signing signature verified — no re-sign needed"
       else
-        echo "   ERROR: MIRA Signing unavailable — refusing ad-hoc (would drop Accessibility grant)" >&2
-        exit 3
+        # Re-sign needs the login keychain; over SSH this only works when the
+        # console session has it unlocked. Never silently degrade to ad-hoc
+        # (that changes the designated requirement and drops the TCC grants).
+        security unlock-keychain "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
+        if codesign --force --sign "MIRA Signing" "$APP"; then
+          echo "   re-signed with MIRA Signing identity"
+        else
+          echo "   ERROR: shipped signature invalid and MIRA Signing unavailable — aborting this target" >&2
+          exit 3
+        fi
       fi
     else
       echo "   signing ad-hoc (intentional for this target)"
@@ -115,8 +188,8 @@ deploy_one() {
 REMOTE_SIGN
 
   # push config to ~/.config/mira/machines.json
-  ssh $SSH_OPTS "$tgt" 'mkdir -p "$HOME/.config/mira"'
-  scp -O config/machines.json "$tgt:.config/mira/machines.json"
+  ssh $SSH_OPTS "$tgt" 'mkdir -p "$HOME/.config/mira"' || return 1
+  scp -O config/machines.json "$tgt:.config/mira/machines.json" || return 1
 
   # write the daemon LaunchAgent with an absolute home path, then (re)load it
   ssh $SSH_OPTS "$tgt" '
@@ -146,7 +219,8 @@ PL
 
     # retire the transitional MIRA2 generation and v1 leftovers
     launchctl bootout "gui/$uid" "$HOME/Library/LaunchAgents/com.amir.mira2.plist" 2>/dev/null || true
-    rm -f "$HOME/Library/LaunchAgents/com.amir.mira2.plist"           "$HOME/Library/LaunchAgents/com.amir.mira-display.plist"           "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist"
+    launchctl bootout "gui/$uid" "$HOME/Library/LaunchAgents/com.gabooja.ultrawide.plist" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/com.amir.mira2.plist"           "$HOME/Library/LaunchAgents/com.amir.mira-display.plist"           "$HOME/Library/LaunchAgents/com.amir.dockwatch.plist"           "$HOME/Library/LaunchAgents/com.gabooja.ultrawide.plist"
     rm -rf "$HOME/Applications/MIRA2.app" "/Applications/MIRA2.app" 2>/dev/null || true
     # v1 shell-era app (bundle id com.amir.macrig) lived in /Applications on viewers
     if plutil -p "/Applications/MIRA.app/Contents/Info.plist" 2>/dev/null | grep -q com.amir.macrig; then
@@ -159,7 +233,7 @@ PL
           "$HOME/ensure-ultrawide.log" "$HOME/Jump_Desktop_Mac_License.jdlicense" 2>/dev/null || true
     # remove legacy raw binary if present
     rm -f "$HOME/bin/mira"
-  '
+  ' || return 1
 
   # verify the daemon is up — RunAtLoad exec can lag, so retry a few times
   # before declaring failure.
@@ -182,8 +256,12 @@ PL
 fail=0
 for name in "${TARGETS[@]}"; do
   case "$name" in
+    local) deploy_local || fail=1 ;;
     air)  deploy_one air  "$air_user"  "$air_host" identity || fail=1 ;;
     mini) deploy_one mini "$mini_user" "$mini_host" adhoc    || fail=1 ;;
+    *)    # --to onboarding target: user/host were eval'd into <id>_user/<id>_host
+          u="${name}_user"; h="${name}_host"
+          deploy_one "$name" "${!u}" "${!h}" adhoc || fail=1 ;;
   esac
 done
 

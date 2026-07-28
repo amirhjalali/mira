@@ -46,8 +46,12 @@ Every automatic behavior must fail toward *doing nothing*:
 - JumpConnect encoder CPU ≥5% during interaction: plausible, NOT yet proven
   under the live-fire protocol — presence detection stays default-off.
 - Clamshell sleep overrides power assertions (proven 2026-07-22, Air).
-- macOS updates strip Jump Connect TCC grants (proven 2026-07-22, both
-  passengers) — doctor checks this every run.
+- ~~macOS updates strip Jump Connect TCC grants~~ DISPROVEN 2026-07-28: the
+  grants were intact in TCC.db the whole time. `JumpConnect --dumpmacperm`
+  reports every permission false when run from an SSH session, and true from
+  the gui/<uid> domain (measured both ways on the Air). Any TCC probe must run
+  inside the target's GUI session — the daemon's health.json does; never trust
+  dumpmacperm over SSH.
 
 ## Incident log
 
@@ -55,6 +59,17 @@ Every automatic behavior must fail toward *doing nothing*:
   Root cause: unconditional display mutation. Led to v2 reconciler design.
 - 2026-07-22 AM: macOS 26.5.2 stripped TCC on both passengers; no signal
   anywhere pointed at the cause. Fix: doctor probes dumpmacperm.
+  [CORRECTED 2026-07-28: no strip ever happened — the probe itself lies over
+  SSH. See known-fragile assumptions.]
 - 2026-07-22 AM: presence-based handback false-fired on injected input mid-
   session (guard blind to UDP). Fix: encoder-CPU guard + lid gate + feature
   now default-off pending live-fire proof. Process fix: this document.
+- 2026-07-28: after a Pro reboot, MIRA reported driving with zero session
+  windows — the driving flag survives reboot and rides re-place, but only the
+  menu app's Drive action opened windows, and the menu app wasn't even a login
+  item. Doctor simultaneously cried TCC-strip (the SSH probe artifact above),
+  sending recovery down a re-granting goose chase. Fixes: menu app registers
+  as a login item and boot-resumes session windows once per boot
+  (kern.boottime marker); doctor now reads each daemon's gui-domain
+  health.json instead of probing dumpmacperm over SSH; deploy.sh installs on
+  the driver too so the Pro never runs a stale build.

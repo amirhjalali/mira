@@ -1254,7 +1254,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
                 DispatchQueue.global().async { [self] in
                     clearRemoteHandback(on: t)
                     _ = placeRide(on: t, canvas: canvas, hidpi: loadSettings().hidpiRides, driver: me.id)
-                    let names = [t.jumpName] + (t.jumpAliases ?? [])
+                    let names = (t.jumpAliases ?? []) + [t.jumpName]   // recents use the short alias names
                     _ = names.contains(where: { openJumpSession($0) })
                 }
             }
@@ -1337,7 +1337,7 @@ func openSessionWindows(cfg: Config, me: Machine) -> Int {
     let excluded = loadExcluded()
     for t in macPassengers(cfg: cfg, me: me) where !excluded.contains(t.id) {
         if targetWalkedUp(t, cfg: cfg) { continue }
-        let names = [t.jumpName] + (t.jumpAliases ?? [])
+        let names = (t.jumpAliases ?? []) + [t.jumpName]   // recents use the short alias names
         if names.contains(where: { openJumpSession($0) }) { opened += 1 }
         else if names.contains(where: { openJumpSession($0) }) { opened += 1 }   // one retry
     }

@@ -92,8 +92,15 @@ let handbackFile = stateDir.appendingPathComponent("handback")
 let hygieneFile = stateDir.appendingPathComponent("hygiene.json")
 let excludedFile = stateDir.appendingPathComponent("excluded.json")
 let healthFile = stateDir.appendingPathComponent("health.json")
+let viewerHealthFile = stateDir.appendingPathComponent("viewer-health.json")
 // Boot epoch at the time session windows were last opened; gates boot-resume.
 let sessionMarkerFile = stateDir.appendingPathComponent("sessions-opened")
+// Per-passenger Jump connection documents (File > Export in Jump Desktop,
+// one <machine-id>.jump each). `open`ing one launches that saved session with
+// no UI scripting and no Accessibility requirement. Machine-local state — the
+// files carry MAC addresses and account ids, so they are never committed.
+let aliasesDir = stateDir.appendingPathComponent("aliases", isDirectory: true)
+func sessionAlias(for id: String) -> URL { aliasesDir.appendingPathComponent("\(id).jump") }
 
 func loadExcluded() -> Set<String> {
     guard let d = try? Data(contentsOf: excludedFile),
@@ -287,6 +294,11 @@ func writeSessionMarker() {
 // LaunchAgent lives in gui/<uid>, where the probe is truthful — and publishes
 // health.json for doctor to read over SSH.
 struct Health: Codable { let accessibility: Bool; let screenRecording: Bool; let ts: Double }
+
+// The menu app's own vitals: without its Accessibility grant the scroll tap
+// and the menu-scripting fallback die silently; without the menu app running
+// at all, boot-resume never fires. Written by the menu app, read by doctor.
+struct ViewerHealth: Codable { let axTrusted: Bool; let scrollTap: Bool; let ts: Double }
 
 // Tolerates the QApplication warning line and the vendor's "hasAccessiblity"
 // typo. Pure, selftested.
@@ -1068,6 +1080,27 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
     }
     group.wait()
     lines.append(contentsOf: peerLines.sorted())
+    // Viewer-side vitals: menu app alive with its Accessibility grant, and a
+    // session alias per passenger so opening never depends on UI scripting.
+    if me.roles.contains("viewer") {
+        let vh = (try? Data(contentsOf: viewerHealthFile))
+            .flatMap { try? JSONDecoder().decode(ViewerHealth.self, from: $0) }
+        if let h = vh, Date().timeIntervalSince1970 - h.ts < 900 {
+            if h.axTrusted { lines.append("✓ menu app running with Accessibility") }
+            else {
+                lines.append("✗ menu app lost Accessibility — scroll reversal and menu fallback dead (re-grant for MIRA)")
+                failures += 1
+            }
+            if !h.scrollTap { lines.append("! scroll tap not installed (grant made after launch? toggle Reverse Mouse Scrolling)") }
+        } else {
+            lines.append("✗ menu app not running (no fresh viewer health) — boot-resume will not fire; open MIRA.app")
+            failures += 1
+        }
+        for t in macPassengers(cfg: cfg, me: me)
+        where !FileManager.default.fileExists(atPath: sessionAlias(for: t.id).path) {
+            lines.append("! no session alias for \(t.id) — File > Export in Jump Desktop, put \(t.id).jump in \(aliasesDir.path)")
+        }
+    }
     let vnc = sh("ps -Aro pcpu,comm | awk '$2 ~ /screensharingd/ && $1+0 > 5'").out
     if !vnc.trimmingCharacters(in: .whitespaces).isEmpty {
         lines.append("✗ inbound session is VNC — use the Fluid entry"); failures += 1
@@ -1166,7 +1199,18 @@ final class MenuApp: NSObject, NSApplicationDelegate {
             do { try SMAppService.mainApp.register(); log("registered as login item") }
             catch { log("login item registration failed: \(error.localizedDescription)") }
         }
+        writeViewerHealth()
+        Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            self?.writeViewerHealth()
+        }
         maybeResumeSessions()
+    }
+
+    func writeViewerHealth() {
+        let h = ViewerHealth(axTrusted: AXIsProcessTrusted(), scrollTap: scrollTap != nil,
+                             ts: Date().timeIntervalSince1970)
+        try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        if let d = try? JSONEncoder().encode(h) { try? d.write(to: viewerHealthFile) }
     }
 
     func installScrollTap() {
@@ -1328,18 +1372,28 @@ func openJumpSession(_ name: String) -> Bool {
     return ok
 }
 
+// Open one passenger's session: the exported .jump connection document first
+// (plain `open`, no UI scripting, no Accessibility), menu scripting of the
+// viewer's Open Recent as fallback for a machine without an alias file.
+func openJumpTarget(_ t: Machine) -> Bool {
+    let alias = sessionAlias(for: t.id)
+    if FileManager.default.fileExists(atPath: alias.path) {
+        if sh("open '\(alias.path)'").code == 0 { return true }
+        log("alias open failed for \(t.id) — falling back to menu scripting")
+    }
+    let names = (t.jumpAliases ?? []) + [t.jumpName]   // recents use the short alias names
+    return names.contains(where: { openJumpSession($0) })
+}
+
 // Open a Jump window for every included, not-walked-up passenger. Records the
 // boot marker when at least one opened, so boot-resume runs once per boot.
-// Callers need Accessibility for the UI scripting (menu app has it; a terminal
-// running the CLI may not — failures log and count as not-opened).
 func openSessionWindows(cfg: Config, me: Machine) -> Int {
     var opened = 0
     let excluded = loadExcluded()
     for t in macPassengers(cfg: cfg, me: me) where !excluded.contains(t.id) {
         if targetWalkedUp(t, cfg: cfg) { continue }
-        let names = (t.jumpAliases ?? []) + [t.jumpName]   // recents use the short alias names
-        if names.contains(where: { openJumpSession($0) }) { opened += 1 }
-        else if names.contains(where: { openJumpSession($0) }) { opened += 1 }   // one retry
+        if openJumpTarget(t) { opened += 1 }
+        else if openJumpTarget(t) { opened += 1 }   // one retry
     }
     if opened > 0 { writeSessionMarker() }
     return opened
@@ -1525,6 +1579,12 @@ func selftest() -> Never {
     if let d = hEnc, let h = try? JSONDecoder().decode(Health.self, from: d) {
         expect(h.accessibility && !h.screenRecording && h.ts == 5, "health round-trip")
     } else { expect(false, "health round-trip") }
+    let vhEnc = try? JSONEncoder().encode(ViewerHealth(axTrusted: true, scrollTap: false, ts: 7))
+    if let d = vhEnc, let h = try? JSONDecoder().decode(ViewerHealth.self, from: d) {
+        expect(h.axTrusted && !h.scrollTap && h.ts == 7, "viewer health round-trip")
+    } else { expect(false, "viewer health round-trip") }
+    // session alias path shape
+    expect(sessionAlias(for: "air").lastPathComponent == "air.jump", "session alias filename")
     // config sanity
     let cfg = loadConfig()
     expect(cfg.machines.count >= 3, "config has machines")
@@ -1566,8 +1626,8 @@ case "drive":
         let ok = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
         print("\(t.id): \(ok ? "riding (\(canvas))" : "RIDE FAILED")")
     }
-    // Best effort from a terminal (needs the terminal's Accessibility grant);
-    // the menu app path is the reliable opener.
+    // Alias documents open from any context; only the menu-scripting fallback
+    // would need the terminal's Accessibility grant.
     let opened = openSessionWindows(cfg: cfg, me: me)
     print(opened > 0 ? "opened \(opened) session window(s)"
                      : "no windows opened — use the MIRA menu (Drive from Here / Reopen Session Windows)")

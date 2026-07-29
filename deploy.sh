@@ -108,6 +108,10 @@ deploy_local() {
 </dict></plist>
 PL
   fi
+  # CLI on PATH (~/.local/bin is in the user's PATH; no sudo territory)
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$dst/Contents/MacOS/MIRA" "$HOME/.local/bin/mira"
+
   local uid; uid=$(id -u)
   launchctl bootout "gui/$uid" "$plist" 2>/dev/null || true
   launchctl bootstrap "gui/$uid" "$plist"

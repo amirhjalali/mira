@@ -61,8 +61,19 @@ that will drive — the Accessibility grant.
 ## CLI
 
 `mira status | drive | stop | handback | console | doctor | report | selftest`
-(binary at `MIRA.app/Contents/MacOS/MIRA`). `doctor` checks the fleet in
-parallel; `report` summarizes daemon health from the logs.
+(`mira` is symlinked into `~/.local/bin` by the local deploy; binary at
+`MIRA.app/Contents/MacOS/MIRA`). `doctor` checks the fleet in parallel;
+`report` summarizes daemon health from the logs.
+
+## Session aliases
+
+Session windows open via exported Jump connection documents in
+`~/Library/Application Support/MIRA/aliases/<machine-id>.jump` — plain `open`,
+no UI scripting, works from any context including a fresh boot. Regenerate
+after adding/renaming a connection: Jump Desktop → File → Export…, unzip the
+.jdz, drop each file in as `<machine-id>.jump`. `mira doctor` flags a missing
+alias. (Machine-local state — never committed; the files embed MAC addresses
+and account ids.)
 
 ## Requirements
 

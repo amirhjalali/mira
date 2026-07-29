@@ -46,6 +46,13 @@ Every automatic behavior must fail toward *doing nothing*:
 - JumpConnect encoder CPU ≥5% during interaction: plausible, NOT yet proven
   under the live-fire protocol — presence detection stays default-off.
 - Clamshell sleep overrides power assertions (proven 2026-07-22, Air).
+- The mini has FileVault on and no auto-login: ANY reboot (power cut, forced
+  update, remote command) strands it at the unlock screen, unreachable until
+  someone physically unlocks it. Never reboot the mini remotely. Decide
+  deliberately: keep FileVault (secure, fragile fleet) or disable it / enable
+  auto-login on the headless canary (available fleet, weaker at-rest story).
+- `caffeinate -u` does NOT reset HIDIdleTime (measured 2026-07-28) — it is not
+  a synthetic-presence vector and not a usable exercise for the presence guard.
 - ~~macOS updates strip Jump Connect TCC grants~~ DISPROVEN 2026-07-28: the
   grants were intact in TCC.db the whole time. `JumpConnect --dumpmacperm`
   reports every permission false when run from an SSH session, and true from
@@ -64,6 +71,19 @@ Every automatic behavior must fail toward *doing nothing*:
 - 2026-07-22 AM: presence-based handback false-fired on injected input mid-
   session (guard blind to UDP). Fix: encoder-CPU guard + lid gate + feature
   now default-off pending live-fire proof. Process fix: this document.
+- 2026-07-28 PM live-fire (endpoint death): killed the mini's user-session
+  JumpConnect mid-drive. launchd respawned it and the Fluid session
+  auto-reconnected in ~12 s; the viewer window survived untouched. Transient
+  Connect crashes on a passenger are self-healing — no MIRA action needed.
+- 2026-07-28 PM: session opening moved off UI scripting. Exported .jump
+  connection documents (machine-local, `aliases/<id>.jump` in the MIRA state
+  dir) open saved sessions via plain `open` from any context — cold start
+  proven, no Accessibility, no Open Recent dependency. Menu scripting remains
+  only as fallback for a machine without an alias file.
+- 2026-07-28 PM: presence-based walk-up entered the live-fire protocol —
+  enabled on the mini canary only. Failure signature: an unwanted mini
+  handback while its session streams (watch `walk-up: sustained` in its
+  daemon log). Soak ≥1 day of normal use before any fleet enable.
 - 2026-07-28: after a Pro reboot, MIRA reported driving with zero session
   windows — the driving flag survives reboot and rides re-place, but only the
   menu app's Drive action opened windows, and the menu app wasn't even a login

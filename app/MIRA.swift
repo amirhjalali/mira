@@ -54,6 +54,9 @@ struct Config: Codable {
     let handbackHoldSeconds: Double?
     let walkupInputEvents: Double?
     let reverseScroll: Bool?
+    // Starlink's router also defaults to 192.168.1.0/24, so the home subnet alone
+    // is not proof of being home. When set, the default gateway's MAC must match.
+    let homeGatewayMAC: String?
 }
 
 func repoRoot() -> URL {
@@ -1020,9 +1023,23 @@ func peerRun(_ m: Machine, _ cmd: String, timeout: TimeInterval = 20) -> (out: S
 
 // MARK: - Driver side
 
+// Pure so it can be selftested. `expected` nil/empty => subnet alone decides.
+// An empty observed MAC is inconclusive (transient arp miss) and must NOT demote
+// a machine that really is at home — only a positively different MAC does.
+func homeVerdict(onHomeSubnet: Bool, gatewayMAC: String, expected: String?) -> Bool {
+    guard onHomeSubnet else { return false }
+    guard let want = expected?.lowercased(), !want.isEmpty else { return true }
+    let seen = gatewayMAC.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if seen.isEmpty { return true }
+    return seen == want
+}
+
 func atHome(cfg: Config) -> Bool {
-    sh("ifconfig 2>/dev/null | awk '/inet /{print $2}'").out
+    let onSubnet = sh("ifconfig 2>/dev/null | awk '/inet /{print $2}'").out
         .contains(cfg.homeSubnetPrefix)
+    let mac = sh("route -n get default 2>/dev/null | awk '/gateway/{print $2}'"
+               + " | xargs -I{} arp -n {} 2>/dev/null | awk '{print $4}'").out
+    return homeVerdict(onHomeSubnet: onSubnet, gatewayMAC: mac, expected: cfg.homeGatewayMAC)
 }
 
 func measureNet(to m: Machine) -> (avg: Double, jitter: Double)? {
@@ -1036,6 +1053,30 @@ func driverCanvasKey(cfg: Config, me: Machine, engine: DisplayEngine) -> String 
     pickCanvas(physicalWidths: engine.physicalWidths(),
                dockedCanvas: me.dockedCanvas ?? cfg.dockedCanvas,
                laptopCanvas: me.laptopCanvas ?? "laptop-pro")
+}
+
+// MARK: - One driver at a time
+
+// Two machines driving at once is not a tie — it oscillates. Each places a ride
+// on the other; the reconciler clears its own driving flag when it sees a ride
+// (see "driving flag cleared: now a passenger"), so both demote themselves and
+// then re-claim on the next tick, fighting over the canvas every reconcileSeconds.
+// Observed 2026-08-16: pro and air13 both driving left passengers at double the
+// intended logical size and reconverging endlessly.
+// Claiming is therefore explicit — stop every other viewer BEFORE placing rides.
+@discardableResult
+func stopOtherDrivers(cfg: Config, me: Machine) -> [String] {
+    var stopped: [String] = []
+    for other in cfg.machines where other.id != me.id && other.roles.contains("viewer") {
+        let r = peerRun(other, "rm -f \"$HOME/Library/Application Support/MIRA/driving\"", timeout: 10)
+        if r.code == 0 {
+            stopped.append(other.id)
+            log("stopped driving on \(other.id) — taking over as driver")
+        } else {
+            log("could not reach \(other.id) to stop its driving flag")
+        }
+    }
+    return stopped
 }
 
 func placeRide(on target: Machine, canvas: String, hidpi: Bool, driver: String) -> Bool {
@@ -1476,6 +1517,7 @@ extension MenuApp {
         let engine = DisplayEngine()
         let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
         DispatchQueue.global().async { [self] in
+            stopOtherDrivers(cfg: cfg, me: me)
             let excluded = loadExcluded()
             for t in macPassengers(cfg: cfg, me: me) where !excluded.contains(t.id) {
                 clearRemoteHandback(on: t)   // override any walk-up on the target
@@ -1687,6 +1729,17 @@ func selftest() -> Never {
     let cfg = loadConfig()
     expect(cfg.machines.count >= 3, "config has machines")
     expect(cfg.canvases[cfg.dockedCanvas] != nil, "docked canvas defined")
+    // Starlink's LAN is 192.168.1.0/24 too — subnet alone must not mean "home"
+    expect(homeVerdict(onHomeSubnet: true, gatewayMAC: "80:82:fe:34:40:dd",
+                       expected: "80:82:FE:34:40:DD"), "home: subnet + right gateway")
+    expect(!homeVerdict(onHomeSubnet: true, gatewayMAC: "aa:bb:cc:dd:ee:ff",
+                        expected: "80:82:fe:34:40:dd"), "starlink LAN is not home")
+    expect(homeVerdict(onHomeSubnet: true, gatewayMAC: "",
+                       expected: "80:82:fe:34:40:dd"), "unknown gateway MAC stays home")
+    expect(!homeVerdict(onHomeSubnet: false, gatewayMAC: "80:82:fe:34:40:dd",
+                        expected: "80:82:fe:34:40:dd"), "off-subnet is never home")
+    expect(homeVerdict(onHomeSubnet: true, gatewayMAC: "x", expected: nil),
+           "no expected MAC => subnet decides")
     for m in cfg.machines where m.roles.contains("viewer") {
         expect(m.laptopCanvas != nil && cfg.canvases[m.laptopCanvas!] != nil,
                "viewer \(m.id) has laptop canvas")
@@ -1723,6 +1776,7 @@ case "drive":
     let cfg = loadConfig(); let me = selfMachine(cfg)
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
     FileManager.default.createFile(atPath: drivingFlag.path, contents: nil)
+    for id in stopOtherDrivers(cfg: cfg, me: me) { print("\(id): stopped driving") }
     let engine = DisplayEngine()
     let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
     for t in macPassengers(cfg: cfg, me: me) {

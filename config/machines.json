@@ -4,6 +4,7 @@
   "heartbeatSeconds": 30,
   "reconcileSeconds": 15,
   "homeSubnetPrefix": "192.168.1.",
+  "homeGatewayMAC": "80:82:fe:34:40:dd",
   "dockedCanvas": "ultrawide",
   "handbackHoldSeconds": 600,
   "walkupInputEvents": 20,

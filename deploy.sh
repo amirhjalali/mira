@@ -3,7 +3,7 @@
 # MIRA.app bundle, then pushes it (plus config + daemon LaunchAgent) to the
 # peer Macs over SSH and (re)starts the daemon there.
 #
-# Usage:  bash deploy.sh [air] [mini]     (no args => both)
+# Usage:  bash deploy.sh [air15] [air13] [mini]   (no args => whole fleet)
 #
 # Idempotent: safe to re-run. Each target ends "<target>: OK" or fails loudly.
 set -e
@@ -11,8 +11,9 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$PWD"
 
 # ---- target table -----------------------------------------------------------
-air_user="amirjalali";  air_host="100.118.137.45"
-mini_user="gabooja";    mini_host="100.105.19.90"
+air15_user="amirjalali";  air15_host="100.118.137.45"
+air13_user="amirhjalali"; air13_host="100.112.227.24"
+mini_user="gabooja";      mini_host="100.105.19.90"
 
 # ---- resolve target list ----------------------------------------------------
 # "--to <id> <user> <host>" deploys to an arbitrary machine (used by
@@ -25,12 +26,12 @@ if [ "${1:-}" = "--to" ]; then
   eval "${2}_user=\"$3\""; eval "${2}_host=\"$4\""
   TARGETS=("$2")
 elif [ "$#" -eq 0 ]; then
-  TARGETS=(local air mini)
+  TARGETS=(local air15 air13 mini)
 else
   for t in "$@"; do
     case "$t" in
-      local|air|mini) TARGETS+=("$t") ;;
-      *) echo "deploy.sh: unknown target '$t' (want: local, air, mini, or --to)" >&2; exit 2 ;;
+      local|air15|air13|mini) TARGETS+=("$t") ;;
+      *) echo "deploy.sh: unknown target '$t' (want: local, air15, air13, mini, or --to)" >&2; exit 2 ;;
     esac
   done
 fi
@@ -115,6 +116,9 @@ PL
   local uid; uid=$(id -u)
   launchctl bootout "gui/$uid" "$plist" 2>/dev/null || true
   launchctl bootstrap "gui/$uid" "$plist"
+  # RunAtLoad is a hint, not a guarantee — launchd left the air daemon
+  # unspawned after bootstrap (2026-08-13); kickstart forces the start.
+  launchctl kickstart "gui/$uid/com.amir.mira" 2>/dev/null || true
   open -a "$dst"
 
   for i in 1 2 3 4 5; do
@@ -220,6 +224,9 @@ PL
     uid=$(id -u)
     launchctl bootout "gui/$uid" "$PLIST" 2>/dev/null || true
     launchctl bootstrap "gui/$uid" "$PLIST"
+    # RunAtLoad is a hint, not a guarantee — launchd left the air daemon
+    # unspawned after bootstrap (2026-08-13); kickstart forces the start.
+    launchctl kickstart "gui/$uid/com.amir.mira" 2>/dev/null || true
 
     # retire the transitional MIRA2 generation and v1 leftovers
     launchctl bootout "gui/$uid" "$HOME/Library/LaunchAgents/com.amir.mira2.plist" 2>/dev/null || true
@@ -261,8 +268,9 @@ fail=0
 for name in "${TARGETS[@]}"; do
   case "$name" in
     local) deploy_local || fail=1 ;;
-    air)  deploy_one air  "$air_user"  "$air_host" identity || fail=1 ;;
-    mini) deploy_one mini "$mini_user" "$mini_host" adhoc    || fail=1 ;;
+    air15) deploy_one air15 "$air15_user" "$air15_host" identity || fail=1 ;;
+    air13) deploy_one air13 "$air13_user" "$air13_host" identity || fail=1 ;;
+    mini)  deploy_one mini  "$mini_user"  "$mini_host"  adhoc    || fail=1 ;;
     *)    # --to onboarding target: user/host were eval'd into <id>_user/<id>_host
           u="${name}_user"; h="${name}_host"
           deploy_one "$name" "${!u}" "${!h}" adhoc || fail=1 ;;

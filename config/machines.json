@@ -11,17 +11,17 @@
   "canvases": {
     "laptop-pro": {
       "width": 1728,
-      "height": 1080,
+      "height": 1117,
       "hidpi": true
     },
     "laptop-air": {
-      "width": 1470,
-      "height": 956,
+      "width": 1440,
+      "height": 932,
       "hidpi": true
     },
     "laptop-air13": {
-      "width": 1440,
-      "height": 900,
+      "width": 1280,
+      "height": 800,
       "hidpi": true
     },
     "ultrawide": {
@@ -42,15 +42,16 @@
         "target"
       ],
       "laptopCanvas": "laptop-pro",
+      "dockedCanvas": "ultrawide",
       "type": "mac",
       "jumpAliases": [
         "MacBook Pro"
       ]
     },
     {
-      "id": "air",
-      "jumpName": "Amir’s MacBook Air",
-      "host": "MacBook-Air-3.local",
+      "id": "air15",
+      "jumpName": "Amir’s MacBook Air 15",
+      "host": "Amirs-MacBook-Air-15.local",
       "tailscale": "100.118.137.45",
       "user": "amirjalali",
       "roles": [
@@ -60,7 +61,9 @@
       "laptopCanvas": "laptop-air",
       "type": "mac",
       "jumpAliases": [
-        "MacBook Air"
+        "MacBook Air",
+        "MacBook Air (4)",
+        "Amir’s MacBook Air"
       ]
     },
     {
@@ -75,6 +78,22 @@
       "type": "mac",
       "jumpAliases": [
         "Mac Mini"
+      ]
+    },
+    {
+      "id": "air13",
+      "jumpName": "Amir’s MacBook Air 13",
+      "host": "Amirs-MacBook-Air-13.local",
+      "tailscale": "100.112.227.24",
+      "user": "amirhjalali",
+      "roles": [
+        "viewer",
+        "target"
+      ],
+      "laptopCanvas": "laptop-air13",
+      "type": "mac",
+      "jumpAliases": [
+        "MacBook Air 13"
       ]
     }
   ]

@@ -84,6 +84,49 @@ Every automatic behavior must fail toward *doing nothing*:
   enabled on the mini canary only. Failure signature: an unwanted mini
   handback while its session streams (watch `walk-up: sustained` in its
   daemon log). Soak ≥1 day of normal use before any fleet enable.
+- 2026-08-13: morning fleet check from the Pro found both peers unreachable
+  over SSH. Cause: Tailscale was stopped on the Pro; `tailscale up` restored
+  it. Rides were unaffected — Jump's path is independent — but doctor,
+  deploy, and permission reports all ride the tailnet. Compounding: the
+  peers were still on Jul 28 builds and the Pro on the Aug 12 midday build,
+  so none of the 08-12 fixes were live (the Air's 21:21 ride still phantom
+  handed back). Fix: full-fleet `deploy.sh`. During it the Air agent
+  bootstrapped but launchd never spawned the daemon (state = not running,
+  never exited) until an explicit kickstart — deploy.sh now kickstarts after
+  bootstrap. Lesson: a fix isn't live until deployed; check binary mtimes
+  against source when behavior contradicts the code.
+- 2026-08-12: Mac rides on the Air looked fuzzy while the Windows RDP session
+  was crisp. Cause: both Air-side session aliases had `UseHIDPIResolution:
+  false` — the viewer streamed the 1470x956 canvas at 1x and upscaled 2x onto
+  the Retina panel. The Pro alias was also a fresh export under Jump's default
+  filename, not `pro.jump`, so MIRA's alias-open path never used it. Fix:
+  `plutil -replace UseHIDPIResolution -bool true` on both aliases + copied the
+  export to `pro.jump`. Alias export checklist is now THREE flags:
+  `StartInFullscreen: true`, `UseHIDPIResolution: true`, correct `<id>.jump`
+  filename. Sessions must be closed and reopened from the alias to pick this
+  up. Note: HiDPI quadruples streamed pixels — on thin links the codec may
+  soften motion, but static text renders 1:1.
+- 2026-08-12: the day's first remote ride was handed back 3 s after converge
+  ("walk-up detected"). Cause: the walk-up burst latch is only consumed while
+  a passenger, so a burst of real local input from the console period (owner
+  using the Pro hours earlier) survived until the ride's first tick and fired
+  as a phantom walk-up. The handback hold then blocked re-rides for 10 min
+  (drive-from-Air degraded to a console-canvas session). Fix: converge now
+  discards anything latched before/while it ran — only input that arrives
+  during an established ride can hand back. A real walk-up still fires: a
+  person present keeps typing and re-latches within the next 15 s tick.
+- 2026-08-02: all rides rendered scaled/soft, never 1:1. Two stacked causes:
+  the 07-28 alias export captured `StartInFullscreen: false` (sessions reopen
+  windowed), and the global `AppleMenuBarVisibleInFullscreen = 1` capped even
+  fullscreen viewers at 3440x1410 vs the 3440x1440 canvas. Fix: `plutil
+  -replace StartInFullscreen -bool true` on both aliases + reverted the menu
+  bar default. Re-exported aliases must keep StartInFullscreen true.
+- 2026-08-02: walk-up presence canary FAILED live-fire on the mini: a viewer
+  restart (Jump reconnect) reset HIDIdleTime and fired "walk-up: sustained
+  local input" twice in a row — the relay/reconnect window bypasses the
+  inboundSessionActive() gate exactly as the known-fragile note predicted.
+  walkupPresence disabled on the canary; do not fleet-enable. Any future
+  presence trigger must survive a viewer restart without firing.
 - 2026-07-28: after a Pro reboot, MIRA reported driving with zero session
   windows — the driving flag survives reboot and rides re-place, but only the
   menu app's Drive action opened windows, and the menu app wasn't even a login

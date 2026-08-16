@@ -39,6 +39,8 @@ struct Machine: Codable {
     let id: String, jumpName: String, host: String, tailscale: String, user: String
     let roles: [String]
     let laptopCanvas: String?     // canvas key when this machine drives undocked
+    let dockedCanvas: String?     // canvas key when this machine drives docked;
+                                  // falls back to cfg.dockedCanvas when absent
     let type: String?             // "mac" (default) | "windows"
     let jumpAliases: [String]?    // other names this machine has in a viewer's Jump list
 }
@@ -77,7 +79,20 @@ func loadConfig() -> Config {
 
 func selfMachine(_ cfg: Config) -> Machine {
     let me = NSUserName()
-    if let m = cfg.machines.first(where: { $0.user == me }) { return m }
+    let cands = cfg.machines.filter { $0.user == me }
+    // A unix account is not an identity: two machines can share one (pro and
+    // air13 are both "amirhjalali"), and first-match silently made air13
+    // believe it was the pro. Disambiguate on ComputerName, which the fleet
+    // naming convention keeps unique and equal to jumpName.
+    if cands.count > 1 {
+        let host = Host.current().localizedName ?? ""
+        if let m = cands.first(where: { $0.jumpName == host }) { return m }
+        if let m = cands.first(where: { ($0.jumpAliases ?? []).contains(host) }) { return m }
+        FileHandle.standardError.write(
+            "MIRA: \(cands.count) machines share user \(me); ComputerName \"\(host)\" matched none — using \(cands[0].id)\n"
+                .data(using: .utf8)!)
+    }
+    if let m = cands.first { return m }
     fatalError("no machine in machines.json with user \(me)")
 }
 
@@ -621,16 +636,59 @@ final class DisplayEngine {
 // MARK: - Arrangement capture / restore (origins of physical displays)
 
 // mirrorOf: nil = independent display; else the master display it mirrors.
-struct SavedDisplay: Codable { let id: UInt32; let x: Int; let y: Int; let main: Bool; let mirrorOf: UInt32? }
+// w/h/hz/px capture the display mode at capture time: re-establishing a mirror
+// (or unmirroring) without an explicit mode lets CG pick the highest mode the
+// panels share exactly — 1024x768 on the BenQ/built-in pair.
+struct SavedDisplay: Codable {
+    let id: UInt32; let x: Int; let y: Int; let main: Bool; let mirrorOf: UInt32?
+    var w: Int? = nil       // UI width
+    var h: Int? = nil       // UI height
+    var hz: Double? = nil
+    var px: Int? = nil      // backing pixel width (w*2 when hidpi)
+}
+
+// What restore must do to one display. Pure, selftested: the mode/mirror
+// decision is the part that regressed twice, so it is testable headless.
+struct RestoreStep: Equatable {
+    let id: UInt32
+    let setMode: Bool        // reapply the captured mode
+    let mirrorOf: UInt32?    // nil = independent: set origin instead
+}
+
+// EVERY display gets its captured mode back — mirror members included. A
+// member holds its own mode; the set runs at a mode all members hold, so a
+// member left at 1024x768 by the torn-down virtual-display mirror drags the
+// master down with it no matter what mode the master is asked for. Restoring
+// only the master is the 1024x768 bug.
+func restoreStep(_ s: SavedDisplay, online: Set<UInt32>) -> RestoreStep {
+    RestoreStep(id: s.id,
+                setMode: s.w != nil && s.h != nil,
+                mirrorOf: s.mirrorOf.flatMap { online.contains($0) ? $0 : nil })
+}
+
+// Best available mode for UI w×h: prefer the saved backing-pixel width
+// (hidpi vs 1x), then the closest refresh rate.
+func matchMode(display: CGDirectDisplayID, w: Int, h: Int, hz: Double?, px: Int?) -> CGDisplayMode? {
+    let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+    guard let modes = CGDisplayCopyAllDisplayModes(display, opts) as? [CGDisplayMode] else { return nil }
+    let ui = modes.filter { $0.width == w && $0.height == h }
+    var pool = ui
+    if let px = px { let exact = ui.filter { $0.pixelWidth == px }; if !exact.isEmpty { pool = exact } }
+    guard let hz = hz else { return pool.first }
+    return pool.min { abs($0.refreshRate - hz) < abs($1.refreshRate - hz) }
+}
 
 func captureArrangement(engine: DisplayEngine) {
     guard !FileManager.default.fileExists(atPath: arrangementFile.path) else { return }
     let saved = engine.physicalDisplays().map { d -> SavedDisplay in
         let b = CGDisplayBounds(d)
         let master = CGDisplayMirrorsDisplay(d)
+        let m = CGDisplayCopyDisplayMode(d)
         return SavedDisplay(id: d, x: Int(b.origin.x), y: Int(b.origin.y),
                             main: CGDisplayIsMain(d) != 0,
-                            mirrorOf: master == kCGNullDirectDisplay ? nil : master)
+                            mirrorOf: master == kCGNullDirectDisplay ? nil : master,
+                            w: m.map { $0.width }, h: m.map { $0.height },
+                            hz: m.map { $0.refreshRate }, px: m.map { $0.pixelWidth })
     }
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
     if let d = try? JSONEncoder().encode(saved) { try? d.write(to: arrangementFile) }
@@ -652,7 +710,12 @@ func restoreArrangement(engine: DisplayEngine) -> Bool {
     var cfg: CGDisplayConfigRef?
     CGBeginDisplayConfiguration(&cfg)
     for s in saved where online.contains(s.id) {
-        if let master = s.mirrorOf, online.contains(master) {
+        let step = restoreStep(s, online: online)
+        if step.setMode, let w = s.w, let h = s.h,
+           let mode = matchMode(display: s.id, w: w, h: h, hz: s.hz, px: s.px) {
+            CGConfigureDisplayWithDisplayMode(cfg, s.id, mode, nil)
+        }
+        if let master = step.mirrorOf {
             CGConfigureDisplayMirrorOfDisplay(cfg, s.id, master)   // restore mirror topology
         } else {
             CGConfigureDisplayOrigin(cfg, s.id, Int32(s.x), Int32(s.y))
@@ -857,6 +920,12 @@ final class Reconciler {
             routeAudio(passenger: true)
             let ok = engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi)
             log("passenger converged=\(ok) in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+            // The latch is only consumed while a passenger, so console-era
+            // input (the owner using this machine hours ago) survives until
+            // the first tick of the next ride and hands back a just-started
+            // session (2026-08-12 incident). A ride start means the driver is
+            // remote: discard anything latched before/while we converged.
+            _ = walkup.consumeBurst()
             lastMode = mode
             checkWalkupTriggers()
         case .console:
@@ -965,7 +1034,7 @@ func measureNet(to m: Machine) -> (avg: Double, jitter: Double)? {
 
 func driverCanvasKey(cfg: Config, me: Machine, engine: DisplayEngine) -> String {
     pickCanvas(physicalWidths: engine.physicalWidths(),
-               dockedCanvas: cfg.dockedCanvas,
+               dockedCanvas: me.dockedCanvas ?? cfg.dockedCanvas,
                laptopCanvas: me.laptopCanvas ?? "laptop-pro")
 }
 
@@ -1018,7 +1087,7 @@ var liveRideHiDPI: [String: Bool] = [:]
 func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Tier) -> Tier {
     let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
     let home = atHome(cfg: cfg)
-    let docked = canvas == cfg.dockedCanvas
+    let docked = canvas == (me.dockedCanvas ?? cfg.dockedCanvas)
     var tier = previousTier
     if let net = macPassengers(cfg: cfg, me: me).lazy.compactMap({ measureNet(to: $0) }).first {
         tier = computeTier(previous: previousTier, avgMs: net.avg, jitterMs: net.jitter,
@@ -1547,6 +1616,35 @@ func selftest() -> Never {
         expect(r.id == 8 && !r.main && r.mirrorOf == 7,
                "SavedDisplay round-trip (mirror)")
     } else { expect(false, "SavedDisplay round-trip (mirror)") }
+    let sdMode = SavedDisplay(id: 9, x: 0, y: 0, main: true, mirrorOf: nil,
+                              w: 3440, h: 1440, hz: 99, px: 3440)
+    if let r = try? dec.decode(SavedDisplay.self, from: (try? enc.encode(sdMode)) ?? Data()) {
+        expect(r.w == 3440 && r.h == 1440 && r.hz == 99 && r.px == 3440,
+               "SavedDisplay round-trip (mode)")
+    } else { expect(false, "SavedDisplay round-trip (mode)") }
+    let legacy = #"[{"id":7,"x":0,"y":0,"main":true}]"#.data(using: .utf8)!
+    if let r = try? dec.decode([SavedDisplay].self, from: legacy) {
+        expect(r.count == 1 && r[0].w == nil && r[0].hz == nil,
+               "SavedDisplay legacy decode (no mode fields)")
+    } else { expect(false, "SavedDisplay legacy decode (no mode fields)") }
+    // Restore plan: the docked pair — BenQ master + built-in mirroring it.
+    // The member MUST get its mode reapplied or the set collapses to the
+    // largest mode both happen to be sitting at (1024x768).
+    let benq = SavedDisplay(id: 1, x: 0, y: 0, main: true, mirrorOf: nil,
+                            w: 3440, h: 1440, hz: 99, px: 3440)
+    let builtin = SavedDisplay(id: 2, x: 0, y: 0, main: false, mirrorOf: 1,
+                               w: 3440, h: 1440, hz: 120, px: 3440)
+    expect(restoreStep(benq, online: [1, 2]) == RestoreStep(id: 1, setMode: true, mirrorOf: nil),
+           "restoreStep master reapplies mode")
+    expect(restoreStep(builtin, online: [1, 2]) == RestoreStep(id: 2, setMode: true, mirrorOf: 1),
+           "restoreStep mirror member reapplies mode (1024x768 regression)")
+    // Master gone (undocked): member becomes independent, still gets its mode.
+    expect(restoreStep(builtin, online: [2]) == RestoreStep(id: 2, setMode: true, mirrorOf: nil),
+           "restoreStep offline master -> independent")
+    // Legacy capture with no mode data: topology only, never a bogus mode.
+    let old = SavedDisplay(id: 3, x: 0, y: 0, main: false, mirrorOf: 1)
+    expect(restoreStep(old, online: [1, 3]) == RestoreStep(id: 3, setMode: false, mirrorOf: 1),
+           "restoreStep legacy capture sets no mode")
     // boot-resume gate
     expect(shouldResumeSessions(driving: true, viewer: true, markerBoot: nil, currentBoot: 111),
            "no marker -> resume")
@@ -1592,7 +1690,13 @@ func selftest() -> Never {
     for m in cfg.machines where m.roles.contains("viewer") {
         expect(m.laptopCanvas != nil && cfg.canvases[m.laptopCanvas!] != nil,
                "viewer \(m.id) has laptop canvas")
+        if let dc = m.dockedCanvas {
+            expect(cfg.canvases[dc] != nil, "viewer \(m.id) docked canvas defined")
+        }
     }
+    expect(pickCanvas(physicalWidths: [3440], dockedCanvas: "per-machine",
+                      laptopCanvas: "laptop-air13") == "per-machine",
+           "docked pick honours per-machine canvas")
     print(failures == 0 ? "MIRA selftest: OK" : "MIRA selftest: \(failures) FAILURES")
     exit(failures == 0 ? 0 : 1)
 }

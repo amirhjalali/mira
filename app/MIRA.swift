@@ -26,7 +26,18 @@ func sh(_ cmd: String, timeout: TimeInterval = 30) -> (out: String, code: Int32)
     do { try p.run() } catch { return ("", 127) }
     let deadline = Date().addingTimeInterval(timeout)
     while p.isRunning && Date() < deadline { usleep(50_000) }
-    if p.isRunning { p.terminate() }
+    if p.isRunning {
+        // Timed out. This path used to be terminate() + readDataToEndOfFile(),
+        // and that made the timeout a lie: SIGTERM kills bash but *reparents*
+        // its children rather than killing them, and an orphaned ssh still
+        // holding the pipe's write end means the read to EOF never returns.
+        // That is how a 20 s timeout became a multi-minute stall of the whole
+        // daemon (2026-08-16). Kill hard and abandon the pipe — letting the
+        // Pipe deallocate closes our read end, so any orphan writing into it
+        // takes EPIPE and dies too.
+        kill(p.processIdentifier, SIGKILL)
+        return ("", 124)
+    }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
     return (String(data: data, encoding: .utf8) ?? "", p.terminationStatus)
@@ -54,6 +65,10 @@ struct Config: Codable {
     let handbackHoldSeconds: Double?
     let walkupInputEvents: Double?
     let reverseScroll: Bool?
+    // How recent local input must be, on two consecutive ticks, to count as a
+    // person at the console. Independent of reconcileSeconds on purpose — see
+    // presenceThreshold().
+    let presenceThresholdSeconds: Double?
     // Starlink's router also defaults to 192.168.1.0/24, so the home subnet alone
     // is not proof of being home. When set, the default gateway's MAC must match.
     let homeGatewayMAC: String?
@@ -105,6 +120,25 @@ let stateDir = URL(fileURLWithPath: NSHomeDirectory())
     .appendingPathComponent("Library/Application Support/MIRA", isDirectory: true)
 let rideFile = stateDir.appendingPathComponent("ride.json")
 let drivingFlag = stateDir.appendingPathComponent("driving")
+
+// The driving flag carries the moment we claimed the wheel, so a peer's ride can
+// be compared against it. An empty flag (older build, or a file we failed to
+// read) reads as nil, which driverYields() treats as "we never really claimed".
+func readDriverClaim() -> Double? {
+    guard let s = try? String(contentsOf: drivingFlag, encoding: .utf8) else { return nil }
+    return Double(s.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+// Claiming the wheel is one act: stamp the claim AND drop any ride another
+// driver left on us. Without the second half our own next tick reads that ride,
+// concludes we are a passenger, and deletes the flag we just wrote.
+func claimDriver() {
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    let now = Date().timeIntervalSince1970
+    try? String(now).write(to: drivingFlag, atomically: true, encoding: .utf8)
+    emit("claim")
+    try? FileManager.default.removeItem(at: rideFile)
+}
 let arrangementFile = stateDir.appendingPathComponent("arrangement.json")
 let handbackFile = stateDir.appendingPathComponent("handback")
 let hygieneFile = stateDir.appendingPathComponent("hygiene.json")
@@ -183,7 +217,12 @@ func readHandbackTS() -> Double? {
     return Double(s.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
+// Serialised: the drive path fans out over passengers concurrently now, and
+// seek-to-end + write from several threads interleaves half-written lines.
+let logLock = NSLock()
+
 func log(_ msg: String) {
+    logLock.lock(); defer { logLock.unlock() }
     if let sz = try? FileManager.default.attributesOfItem(atPath: logFile.path)[.size] as? Int,
        sz > 1_000_000 {
         let old = logFile.deletingPathExtension().appendingPathExtension("old.log")
@@ -200,6 +239,87 @@ func log(_ msg: String) {
     FileHandle.standardOutput.write(line.data(using: .utf8)!)
 }
 
+
+// MARK: - Event log
+
+// A structured, transition-only record of what the fleet actually did, kept
+// beside the human log. The human log answers "what happened just now"; this
+// answers "is it getting better or worse", which string-grepping a prose log
+// cannot. Written ONLY on transitions — never sampled on a timer — so a healthy
+// idle fleet writes essentially nothing and the file stays small on its own.
+// Lives in Application Support (not /tmp) so it survives reboots.
+let eventsFile = stateDir.appendingPathComponent("events.jsonl")
+let eventsCapBytes = 256 * 1024        // rotate at 256 KB, keep one old file
+let eventsLock = NSLock()
+
+enum EV { case s(String), n(Double), b(Bool) }
+
+func evJSON(_ v: EV) -> String {
+    switch v {
+    case .b(let x): return x ? "true" : "false"
+    case .n(let x):
+        if x == x.rounded() && abs(x) < 1e15 { return String(Int(x)) }
+        // 2dp is plenty for ms and seconds; trailing zeros trimmed to keep
+        // lines short (12.50 -> 12.5).
+        var t = String(format: "%.2f", x)
+        while t.hasSuffix("0") { t.removeLast() }
+        return t
+    case .s(let x):
+        var out = "\""
+        for c in x {
+            switch c {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\t": out += "\\t"
+            default: out.append(c)
+            }
+        }
+        return out + "\""
+    }
+}
+
+// Field order is preserved so lines are stable and diffable, and so the
+// selftest can assert on an exact string.
+func eventLine(ts: Double, machine: String, event: String,
+               fields: [(String, EV)]) -> String {
+    var s = "{\"ts\":\(evJSON(.n(ts))),\"m\":\(evJSON(.s(machine))),\"e\":\(evJSON(.s(event)))"
+    for (k, v) in fields { s += ",\(evJSON(.s(k))):\(evJSON(v))" }
+    return s + "}"
+}
+
+// Nearest-rank percentile: no interpolation, so a p95 is always a value that
+// really occurred. p of 0.5 on [1,2,3,4] is 3 by design.
+func percentile(_ xs: [Double], _ p: Double) -> Double {
+    guard !xs.isEmpty else { return 0 }
+    let sorted = xs.sorted()
+    let rank = Int((p * Double(sorted.count)).rounded(.up))
+    return sorted[min(max(rank, 1), sorted.count) - 1]
+}
+
+// The machine id is resolved once; emit() is called from hot paths and must not
+// re-read config on every event.
+var eventMachineID = "?"
+
+func emit(_ event: String, _ fields: [(String, EV)] = []) {
+    eventsLock.lock(); defer { eventsLock.unlock() }
+    if let sz = try? FileManager.default.attributesOfItem(atPath: eventsFile.path)[.size] as? Int,
+       sz > eventsCapBytes {
+        let old = stateDir.appendingPathComponent("events.1.jsonl")
+        try? FileManager.default.removeItem(at: old)
+        try? FileManager.default.moveItem(at: eventsFile, to: old)
+    }
+    let line = eventLine(ts: Date().timeIntervalSince1970, machine: eventMachineID,
+                         event: event, fields: fields) + "\n"
+    guard let d = line.data(using: .utf8) else { return }
+    if let h = try? FileHandle(forWritingTo: eventsFile) {
+        h.seekToEndOfFile(); h.write(d); try? h.close()
+    } else {
+        try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        try? d.write(to: eventsFile)
+    }
+}
+
 // MARK: - Ride (a driver's claim on this passenger)
 
 struct Ride: Codable {
@@ -207,6 +327,10 @@ struct Ride: Codable {
     let canvas: String
     let hidpi: Bool
     let ts: Double
+    // When the driver claimed the wheel (not when this ride was written). Lets a
+    // receiver decide whether this ride outranks its own claim. Optional so a
+    // ride from an older build still decodes — it simply never unseats anyone.
+    let claimedAt: Double?
     func isLive(ttl: Double, now: Double = Date().timeIntervalSince1970) -> Bool {
         now - ts < ttl
     }
@@ -274,6 +398,28 @@ func shouldHandback(prevClamshell: Bool, nowClamshell: Bool,
 func consolePresent(idleNow: Double?, idlePrev: Double?, threshold: Double) -> Bool {
     guard let a = idleNow, let b = idlePrev else { return false }
     return a < threshold && b < threshold
+}
+
+// Who drives, when two machines both think they do. Clicking Drive is the most
+// explicit statement of intent in the system, so a ride must never silently
+// override a newer one — that is what let a stale lease delete a driving flag
+// the user had just created. Deciding by claim age rather than by "a ride
+// exists" also makes handoff self-healing: stopOtherDrivers is a best-effort
+// push, and when it fails to land the older claimant still yields on its own.
+func driverYields(myClaim: Double?, theirClaim: Double?) -> Bool {
+    guard let theirs = theirClaim else { return false }   // no claim can't unseat one
+    guard let mine = myClaim else { return true }         // we never claimed; they did
+    return theirs > mine
+}
+
+// Presence means "input seen on two consecutive ticks", which only implies a
+// person actually sitting there if the threshold spans more than one tick.
+// This used to be `reconcileSeconds + 5`, so re-tuning the tick rate silently
+// re-tuned handback sensitivity: at a 2 s tick that window became 7 s and a
+// single touch would hand the fleet back. It is its own knob now, floored at
+// the value the 15 s tick produced so a faster loop can never be twitchier.
+func presenceThreshold(configured: Double?, reconcile: Double) -> Double {
+    max(configured ?? 20, reconcile + 5)
 }
 
 // MARK: - Boot-resume gate (pure, selftested)
@@ -627,12 +773,26 @@ final class DisplayEngine {
 
     // Invariant: virtual exists at canvas/hidpi, is main, every physical mirrors it.
     func passengerInvariantHolds(canvas: Canvas, hidpi: Bool) -> Bool {
-        guard virtualID != 0, CGDisplayIsMain(virtualID) != 0 else { return false }
-        guard Int(CGDisplayPixelsWide(virtualID)) == canvas.width else { return false }
-        let m = CGDisplayCopyDisplayMode(virtualID)
-        if hidpi, let m = m, m.pixelWidth != canvas.width * 2 { return false }
-        for p in physicalDisplays() where CGDisplayMirrorsDisplay(p) != virtualID { return false }
-        return true
+        passengerInvariantFailure(canvas: canvas, hidpi: hidpi) == nil
+    }
+
+    // Which check failed, for the log. "converged=false" on its own says a ride
+    // could not be satisfied but not why, and a passenger that can never satisfy
+    // it reconverges on every tick — a hot loop of display reconfiguration
+    // (observed on the pro, 2026-08-17). Naming the failing guard makes that
+    // diagnosable instead of guesswork.
+    func passengerInvariantFailure(canvas: Canvas, hidpi: Bool) -> String? {
+        if virtualID == 0 { return "no virtual display" }
+        if CGDisplayIsMain(virtualID) == 0 { return "virtual is not main" }
+        let w = Int(CGDisplayPixelsWide(virtualID))
+        if w != canvas.width { return "virtual width \(w) != canvas \(canvas.width)" }
+        if hidpi, let m = CGDisplayCopyDisplayMode(virtualID), m.pixelWidth != canvas.width * 2 {
+            return "hidpi mode pixelWidth \(m.pixelWidth) != \(canvas.width * 2)"
+        }
+        for p in physicalDisplays() where CGDisplayMirrorsDisplay(p) != virtualID {
+            return "display \(p) (\(CGDisplayPixelsWide(p))x\(CGDisplayPixelsHigh(p))) not mirroring virtual"
+        }
+        return nil
     }
 }
 
@@ -871,6 +1031,9 @@ final class Reconciler {
     lazy var walkup = WalkupWatcher(threshold: Int(cfg.walkupInputEvents ?? 20))
     var prevClamshell: Bool?
     var displaySleepAssertion: IOPMAssertionID = 0
+    var nextStreamGuard = Date.distantPast
+    var loggedStaleRideFrom: String?
+    var lastLeaseTS: Double?
 
     init(cfg: Config) { self.cfg = cfg; self.me = selfMachine(cfg) }
 
@@ -892,21 +1055,52 @@ final class Reconciler {
             try? FileManager.default.removeItem(at: handbackFile)   // stale
         }
 
-        let mode = computeMode(ride: readRide(), ttl: cfg.rideTTLSeconds,
+        let ride = readRide()
+        let mode = computeMode(ride: ride, ttl: cfg.rideTTLSeconds,
                                now: Date().timeIntervalSince1970)
         switch mode {
         case .passenger(let canvasKey, let hidpi):
-            // Two simultaneous drivers is a bug; a machine being driven is never
-            // itself a driver — drop the flag if it lingered.
+            // Two drivers at once is a bug, but *which* one yields has to be
+            // decided by claim age rather than by "a ride showed up" — a lease
+            // still in flight from the previous driver must not unseat the
+            // driver the user just picked (2026-08-17).
             if FileManager.default.fileExists(atPath: drivingFlag.path) {
-                try? FileManager.default.removeItem(at: drivingFlag)
-                log("driving flag cleared: now a passenger")
+                if driverYields(myClaim: readDriverClaim(), theirClaim: ride?.claimedAt) {
+                    try? FileManager.default.removeItem(at: drivingFlag)
+                    log("yielding the wheel to \(ride?.driver ?? "?") (newer claim)")
+                    emit("yield", [("to", .s(ride?.driver ?? "?"))])
+                } else {
+                    // Our claim is the newer one, so this ride is stale. Drop it
+                    // and stay a driver; the sender yields as soon as it sees
+                    // our claim on the ride we place on it.
+                    try? FileManager.default.removeItem(at: rideFile)
+                    if loggedStaleRideFrom != ride?.driver {
+                        loggedStaleRideFrom = ride?.driver
+                        log("ignoring stale ride from \(ride?.driver ?? "?") — we hold the newer claim")
+                    }
+                    convergeConsole()
+                    return
+                }
+            }
+            loggedStaleRideFrom = nil
+            if let r = ride, r.ts != lastLeaseTS {
+                lastLeaseTS = r.ts
+                // Age on arrival: a lease that lands most-expired is the signal
+                // that the driver stamped it before a slow network op.
+                emit("lease_recv", [("drv", .s(r.driver)), ("canvas", .s(r.canvas)),
+                                    ("age", .n(Date().timeIntervalSince1970 - r.ts))])
             }
             guard let canvas = cfg.canvases[canvasKey] else { return }
             let wantHi = hidpi && canvas.hidpi
-            // A passenger never streams outward — enforce every tick, not just
-            // on transition (the viewer can be relaunched under us).
-            sh("pkill -x 'Jump Desktop' 2>/dev/null; pkill -f 'MacOS/Jump Desktop$' 2>/dev/null")
+            // A passenger never streams outward — enforce repeatedly, not just
+            // on transition (the viewer can be relaunched under us). Held at
+            // its original ~15 s cadence rather than the tick rate: the tick is
+            // fast now so rides converge instantly, and three process spawns a
+            // second on a laptop is a battery cost with no benefit.
+            if Date() >= nextStreamGuard {
+                sh("pkill -x 'Jump Desktop' 2>/dev/null; pkill -f 'MacOS/Jump Desktop$' 2>/dev/null")
+                nextStreamGuard = Date().addingTimeInterval(15)
+            }
             if engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi),
                lastMode == mode { checkWalkupTriggers(); return }
             let t0 = Date()
@@ -921,8 +1115,13 @@ final class Reconciler {
             _ = engine.mirrorPhysicalsOntoVirtual()
             engine.setMain(engine.virtualID)
             routeAudio(passenger: true)
-            let ok = engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi)
-            log("passenger converged=\(ok) in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+            let why = engine.passengerInvariantFailure(canvas: canvas, hidpi: wantHi)
+            let ok = why == nil
+            log("passenger converged=\(ok) in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s"
+              + (why.map { " — \($0)" } ?? ""))
+            emit("converge", [("canvas", .s(canvasKey)), ("hidpi", .b(wantHi)),
+                              ("ms", .n(Date().timeIntervalSince(t0) * 1000)),
+                              ("ok", .b(ok))] + (why.map { [("why", EV.s($0))] } ?? []))
             // The latch is only consumed while a passenger, so console-era
             // input (the owner using this machine hours ago) survives until
             // the first tick of the next ride and hands back a just-started
@@ -932,6 +1131,11 @@ final class Reconciler {
             lastMode = mode
             checkWalkupTriggers()
         case .console:
+            if let r = ride, lastLeaseTS == r.ts {   // the lease we were riding lapsed
+                lastLeaseTS = nil
+                emit("lease_expire", [("drv", .s(r.driver)),
+                                      ("age", .n(Date().timeIntervalSince1970 - r.ts))])
+            }
             convergeConsole()
         }
     }
@@ -971,7 +1175,9 @@ final class Reconciler {
         defer { prevIdle = idle }
         if loadSettings().walkupPresence,
            consolePresent(idleNow: idle, idlePrev: prevIdle,
-                          threshold: cfg.reconcileSeconds + 5),
+                          threshold: presenceThreshold(
+                              configured: cfg.presenceThresholdSeconds,
+                              reconcile: cfg.reconcileSeconds)),
            readClamshellState() != true,
            !inboundSessionActive() {
             log("walk-up: sustained local input (idle \(idle.map { String(format: "%.0f", $0) } ?? "?")s) — handing back")
@@ -1012,13 +1218,71 @@ final class Reconciler {
 // MARK: - SSH to peers (multiplexed; sockets live in ~/.ssh — no spaces)
 
 func sshArgs() -> String {
+    // ServerAlive*: a peer that sleeps mid-session leaves its TCP connection
+    // ESTABLISHED, and the ControlMaster parked on it then wedges every later
+    // call — ConnectTimeout bounds the TCP connect, not the handoff to an
+    // existing mux, so calls through it block forever. Measured 2026-08-16:
+    // fresh connect to a sleeping air13 failed in 5.0 s, the same call through
+    // its wedged mux was still blocked at 60 s, which stalled the driver's
+    // heartbeat for minutes and dropped every passenger at its ride TTL.
+    // Keepalives make the master notice in ~6 s and exit, so no wedge forms.
     "-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new " +
+    "-o ServerAliveInterval=3 -o ServerAliveCountMax=2 " +
     "-o ControlMaster=auto -o ControlPath=~/.ssh/mira-%C -o ControlPersist=120"
 }
 
-func peerRun(_ m: Machine, _ cmd: String, timeout: TimeInterval = 20) -> (out: String, code: Int32) {
+// How long to leave a peer alone after consecutive failures. A machine that is
+// simply asleep — the normal state of a grab-and-go laptop — must not cost the
+// driver a connection attempt on every beat. Pure, so it is selftested.
+func backoffSeconds(consecutiveFailures: Int) -> Double {
+    guard consecutiveFailures > 0 else { return 0 }
+    return min(60, 15 * pow(2, Double(consecutiveFailures - 1)))
+}
+
+// Per-peer reachability memory behind backoffSeconds().
+final class PeerHealth {
+    private let lock = NSLock()
+    private var fails: [String: Int] = [:]
+    private var nextTry: [String: Date] = [:]
+
+    func shouldSkip(_ id: String, now: Date = Date()) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if let t = nextTry[id] { return now < t }
+        return false
+    }
+
+    func record(_ id: String, ok: Bool, now: Date = Date()) {
+        lock.lock(); defer { lock.unlock() }
+        if ok {
+            if (fails[id] ?? 0) > 0 {
+                log("peer \(id) reachable again"); emit("peer", [("id", .s(id)), ("up", .b(true))])
+            }
+            fails[id] = 0; nextTry[id] = nil
+        } else {
+            let n = (fails[id] ?? 0) + 1
+            let wait = backoffSeconds(consecutiveFailures: n)
+            fails[id] = n
+            nextTry[id] = now.addingTimeInterval(wait)
+            if n == 1 {
+                log("peer \(id) unreachable — backing off \(Int(wait))s")
+                emit("peer", [("id", .s(id)), ("up", .b(false))])
+            }
+        }
+    }
+}
+let peerHealth = PeerHealth()
+
+// `force` bypasses the backoff for on-demand commands (doctor, an explicit
+// drive) where a truthful answer matters more than a fast one.
+func peerRun(_ m: Machine, _ cmd: String, timeout: TimeInterval = 20,
+             force: Bool = false) -> (out: String, code: Int32) {
+    if !force && peerHealth.shouldSkip(m.id) { return ("", 125) }   // 125: skipped, not tried
     let q = cmd.replacingOccurrences(of: "'", with: "'\\''")
-    return sh("ssh \(sshArgs()) \(m.user)@\(m.tailscale) '\(q)'", timeout: timeout)
+    let r = sh("ssh \(sshArgs()) \(m.user)@\(m.tailscale) '\(q)'", timeout: timeout)
+    // 255 is ssh's own transport failure; 124 is our timeout kill. Anything the
+    // remote command itself returns means the peer answered, so it is healthy.
+    peerHealth.record(m.id, ok: r.code != 255 && r.code != 124)
+    return r
 }
 
 // MARK: - Driver side
@@ -1066,10 +1330,14 @@ func driverCanvasKey(cfg: Config, me: Machine, engine: DisplayEngine) -> String 
 // Claiming is therefore explicit — stop every other viewer BEFORE placing rides.
 @discardableResult
 func stopOtherDrivers(cfg: Config, me: Machine) -> [String] {
+    let others = cfg.machines.filter { $0.id != me.id && $0.roles.contains("viewer") }
+    let results = forEachPeer(others) { other -> Bool in
+        peerRun(other, "rm -f \"$HOME/Library/Application Support/MIRA/driving\"", timeout: 10).code == 0
+    }
+    // Report in config order, not completion order, so the output is stable.
     var stopped: [String] = []
-    for other in cfg.machines where other.id != me.id && other.roles.contains("viewer") {
-        let r = peerRun(other, "rm -f \"$HOME/Library/Application Support/MIRA/driving\"", timeout: 10)
-        if r.code == 0 {
+    for other in others {
+        if results[other.id] == true {
             stopped.append(other.id)
             log("stopped driving on \(other.id) — taking over as driver")
         } else {
@@ -1081,11 +1349,16 @@ func stopOtherDrivers(cfg: Config, me: Machine) -> [String] {
 
 func placeRide(on target: Machine, canvas: String, hidpi: Bool, driver: String) -> Bool {
     let ride = Ride(driver: driver, canvas: canvas, hidpi: hidpi,
-                    ts: Date().timeIntervalSince1970)
+                    ts: Date().timeIntervalSince1970, claimedAt: readDriverClaim())
     guard let d = try? JSONEncoder().encode(ride),
           let json = String(data: d, encoding: .utf8) else { return false }
     let dir = "$HOME/Library/Application Support/MIRA"
-    return peerRun(target, "mkdir -p \"\(dir)\" && printf %s '\(json)' > \"\(dir)/ride.json\"").code == 0
+    // Write-then-rename, not `> ride.json`: an in-place rewrite can be read
+    // half-written by a passenger that is now watching for changes rather than
+    // polling on a slow timer, and a rename is the event its directory watcher
+    // sees for both a new ride and a changed one.
+    return peerRun(target, "mkdir -p \"\(dir)\" && printf %s '\(json)' > \"\(dir)/ride.json.tmp\" "
+                 + "&& mv -f \"\(dir)/ride.json.tmp\" \"\(dir)/ride.json\"").code == 0
 }
 
 func endRide(on target: Machine) {
@@ -1098,20 +1371,53 @@ func endRide(on target: Machine) {
 // the driver stops skipping it.
 func clearRemoteHandback(on target: Machine) {
     _ = peerRun(target, "rm -f \"$HOME/Library/Application Support/MIRA/handback\"")
-    handbackNoticed.remove(target.id)
+    handbackNoticedLock.lock(); handbackNoticed.remove(target.id); handbackNoticedLock.unlock()
 }
 
 func macPassengers(cfg: Config, me: Machine) -> [Machine] {
     cfg.machines.filter { $0.id != me.id && $0.roles.contains("target") && ($0.type ?? "mac") == "mac" }
 }
 
+// Fan out over machines concurrently, collecting results by machine id.
+// doctor() has always probed its peers this way; the drive path had not, so
+// every passenger paid its own serial SSH round trip (two of them) before the
+// next one even started — N passengers cost N times one passenger.
+// `deadline` is a hard cap on how long one peer can hold up the rest: a
+// straggler's work continues in the background and its result is discarded.
+// Without this the driver's heartbeat was only as fast as its slowest machine,
+// so one sleeping laptop delayed every ride the fleet placed.
+func forEachPeer<T>(_ ms: [Machine], deadline: TimeInterval = 8,
+                    _ body: @escaping (Machine) -> T) -> [String: T] {
+    if ms.isEmpty { return [:] }
+    let group = DispatchGroup(), lock = NSLock()
+    var out: [String: T] = [:]
+    for m in ms {
+        group.enter()
+        DispatchQueue.global().async {
+            let r = body(m)
+            lock.lock(); out[m.id] = r; lock.unlock()
+            group.leave()
+        }
+    }
+    if group.wait(timeout: .now() + deadline) == .timedOut {
+        lock.lock(); let answered = Set(out.keys); lock.unlock()
+        let late = ms.map { $0.id }.filter { !answered.contains($0) }
+        log("peer fan-out: \(late.joined(separator: ", ")) did not answer in \(Int(deadline))s — continuing without them")
+    }
+    lock.lock(); defer { lock.unlock() }
+    return out
+}
+
 // Targets whose fresh handback we've already logged this walk-up (log once each).
+// Guarded: the drive path now probes passengers concurrently.
 var handbackNoticed: Set<String> = []
+let handbackNoticedLock = NSLock()
 
 // A target that has walked itself up (fresh handback) is left alone this beat.
 func targetWalkedUp(_ t: Machine, cfg: Config) -> Bool {
     let hb = peerRun(t, "cat \"$HOME/Library/Application Support/MIRA/handback\" 2>/dev/null")
         .out.trimmingCharacters(in: .whitespacesAndNewlines)
+    handbackNoticedLock.lock(); defer { handbackNoticedLock.unlock() }
     guard let hts = Double(hb),
           handbackIsFresh(ts: hts, hold: cfg.handbackHoldSeconds ?? 600) else {
         handbackNoticed.remove(t.id); return false
@@ -1137,9 +1443,10 @@ func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Ti
             log("tier \(previousTier.rawValue) -> \(tier.rawValue) (avg=\(String(format: "%.0f", net.avg))ms jitter=\(String(format: "%.0f", net.jitter))ms home=\(home) canvas=\(canvas))")
         }
     }
-    for t in macPassengers(cfg: cfg, me: me) {
-        if targetWalkedUp(t, cfg: cfg) { continue }
-        _ = placeRide(on: t, canvas: canvas, hidpi: tierWantsHiDPI(tier) && loadSettings().hidpiRides, driver: me.id)
+    let hidpi = tierWantsHiDPI(tier) && loadSettings().hidpiRides
+    _ = forEachPeer(macPassengers(cfg: cfg, me: me)) { t in
+        targetWalkedUp(t, cfg: cfg) ? false
+            : placeRide(on: t, canvas: canvas, hidpi: hidpi, driver: me.id)
     }
     return tier
 }
@@ -1161,7 +1468,7 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
             pgrep -f 'MIRA.app/Contents/MacOS/MIRA --daemon' >/dev/null && echo daemon=ok || echo daemon=missing; \
             echo "HEALTH=$(cat "$HOME/Library/Application Support/MIRA/health.json" 2>/dev/null | tr -d ' \\n')"; \
             cat "$HOME/Library/Application Support/MIRA/ride.json" 2>/dev/null || echo no-ride
-            """, timeout: 15)
+            """, timeout: 15, force: true)   // doctor must probe, not read a cached verdict
             if probe.code != 0 { l.append("✗ \(t.id) unreachable"); lock.lock(); failures += 1; lock.unlock() }
             else {
                 let o = probe.out
@@ -1219,28 +1526,116 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
     return (lines.joined(separator: "\n"), failures)
 }
 
+// MARK: - Wakeups
+
+// Watches ride state and wakes the loop the moment it changes. Two sources are
+// needed: placing a ride with `mv` changes the *directory*, while an in-place
+// rewrite (`> ride.json`, which is what drivers older than this build do)
+// changes only the *file*. Watching one alone misses half the transitions.
+final class StateWatcher {
+    private let wake: DispatchSemaphore
+    private let queue = DispatchQueue(label: "com.amir.mira.statewatch")
+    private var dirSource: DispatchSourceFileSystemObject?
+    private var fileSource: DispatchSourceFileSystemObject?
+
+    init(wake: DispatchSemaphore) { self.wake = wake }
+
+    func start() {
+        try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        queue.async { [self] in
+            dirSource = makeSource(stateDir, mask: [.write])
+            armFile()
+        }
+    }
+
+    // Always called on `queue`. The ride file is created and deleted over and
+    // over, and a source outlives its inode without delivering, so re-arm on
+    // every event rather than trusting the first one.
+    private func armFile() {
+        fileSource?.cancel()
+        fileSource = nil
+        guard FileManager.default.fileExists(atPath: rideFile.path) else { return }
+        fileSource = makeSource(rideFile, mask: [.write, .extend, .delete, .rename])
+    }
+
+    private func makeSource(_ url: URL, mask: DispatchSource.FileSystemEvent)
+        -> DispatchSourceFileSystemObject? {
+        let fd = open(url.path, O_EVTONLY)
+        guard fd >= 0 else { return nil }
+        let s = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: mask, queue: queue)
+        s.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            self.armFile()
+            self.wake.signal()
+        }
+        s.setCancelHandler { close(fd) }
+        s.resume()
+        return s
+    }
+}
+
 // MARK: - Daemon
 
 func runDaemon(cfg: Config) -> Never {
     let rec = Reconciler(cfg: cfg)
     rec.startWatchers()
+    eventMachineID = rec.me.id
     log("mira daemon started on \(rec.me.id) (driver+passenger roles: \(rec.me.roles))")
+    emit("start", [("roles", .s(rec.me.roles.joined(separator: "+")))])
     var tier: Tier = .standard
-    var beat = 0.0
-    var healthBeat = 0.0
+    // Cuts a poll interval short. The daemon used to learn about a new ride
+    // only on its next tick, so a ride landing just after one waited out the
+    // whole of reconcileSeconds before any display moved — measured as the
+    // single largest cost in "grab a laptop and drive" (avg ~7.5 s of ~15 s).
+    let wake = DispatchSemaphore(value: 0)
+    let stateWatcher = StateWatcher(wake: wake)   // held for the process lifetime
+    stateWatcher.start()
+    // Wall-clock deadlines rather than per-iteration decrements: the loop is
+    // woken early now, so counting iterations would fire the heartbeat far
+    // more often than heartbeatSeconds. distantPast = due immediately, which
+    // also fixes a latent stall — the old counter kept its value across a
+    // stop/resume, so resuming a drive could wait two full intervals.
+    var nextDrive = Date.distantPast
+    var nextHealth = Date.distantPast
+    // Undock/dock changes the driver's canvas. Waiting for the next heartbeat
+    // to notice left passengers on the stale canvas for up to heartbeatSeconds;
+    // driverCanvasKey is local CoreGraphics only, so it is cheap to check every
+    // tick and re-assert the moment it moves.
+    var lastCanvas: String?
     while true {
         rec.tick()
         if rec.me.roles.contains("viewer"),
            FileManager.default.fileExists(atPath: drivingFlag.path) {
-            beat -= cfg.reconcileSeconds
-            if beat <= 0 {
+            let canvas = driverCanvasKey(cfg: cfg, me: rec.me, engine: rec.engine)
+            let canvasChanged = lastCanvas != nil && lastCanvas != canvas
+            if canvasChanged { log("driver canvas \(lastCanvas!) -> \(canvas); re-asserting now") }
+            lastCanvas = canvas
+            if Date() >= nextDrive || canvasChanged {
+                // Scheduled from the START of the beat, not the end. Measuring
+                // from the end makes the real period heartbeat + however long
+                // the beat took, which quietly ate the margin against
+                // rideTTLSeconds — the thing that drops passengers to console.
+                nextDrive = Date().addingTimeInterval(cfg.heartbeatSeconds)
+                let beatT0 = Date()
                 tier = driveTick(cfg: cfg, me: rec.me, engine: rec.engine, previousTier: tier)
-                beat = cfg.heartbeatSeconds
+                let spent = Date().timeIntervalSince(beatT0)
+                emit("beat", [("ms", .n(spent * 1000))])
+                // Loud when a beat eats enough of the TTL to threaten a drop.
+                if spent > cfg.heartbeatSeconds {
+                    log("drive beat took \(String(format: "%.1f", spent))s "
+                      + "(> heartbeat \(Int(cfg.heartbeatSeconds))s, TTL \(Int(cfg.rideTTLSeconds))s)")
+                }
             }
+        } else {
+            lastCanvas = nil   // not driving: re-baseline so resuming is not a "change"
         }
-        healthBeat -= cfg.reconcileSeconds
-        if healthBeat <= 0 { writeHealth(); healthBeat = 300 }
-        Thread.sleep(forTimeInterval: cfg.reconcileSeconds)
+        if Date() >= nextHealth {
+            writeHealth(); nextHealth = Date().addingTimeInterval(300)
+        }
+        // Sleep, but return the instant ride state changes on disk.
+        _ = wake.wait(timeout: .now() + cfg.reconcileSeconds)
+        while wake.wait(timeout: .now()) == .success {}   // collapse a burst
     }
 }
 
@@ -1497,35 +1892,49 @@ func openJumpTarget(_ t: Machine) -> Bool {
 
 // Open a Jump window for every included, not-walked-up passenger. Records the
 // boot marker when at least one opened, so boot-resume runs once per boot.
-func openSessionWindows(cfg: Config, me: Machine) -> Int {
+func openSessionWindows(cfg: Config, me: Machine, targets: [Machine]? = nil) -> Int {
+    // A caller that just placed rides already knows who is rideable; re-probing
+    // every passenger over SSH here doubled the round trips on the drive path.
+    let list = targets ?? rideablePassengers(cfg: cfg, me: me)
     var opened = 0
-    let excluded = loadExcluded()
-    for t in macPassengers(cfg: cfg, me: me) where !excluded.contains(t.id) {
-        if targetWalkedUp(t, cfg: cfg) { continue }
-        if openJumpTarget(t) { opened += 1 }
-        else if openJumpTarget(t) { opened += 1 }   // one retry
+    for t in list {
+        // Sequential on purpose. The alias path is a cheap `open`, but the
+        // menu-scripting fallback drives the viewer's UI, and two of those at
+        // once fight over the front window.
+        if openJumpTarget(t) || openJumpTarget(t) { opened += 1 }   // one retry
     }
     if opened > 0 { writeSessionMarker() }
     return opened
 }
 
+// Included passengers that are not currently walked up, probed in parallel.
+func rideablePassengers(cfg: Config, me: Machine) -> [Machine] {
+    let excluded = loadExcluded()
+    let candidates = macPassengers(cfg: cfg, me: me).filter { !excluded.contains($0.id) }
+    let walked = forEachPeer(candidates) { targetWalkedUp($0, cfg: cfg) }
+    return candidates.filter { walked[$0.id] != true }
+}
+
 extension MenuApp {
     @objc func drive() {
-        try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: handbackFile)   // explicit drive overrides walk-up
-        FileManager.default.createFile(atPath: drivingFlag.path, contents: nil)
+        claimDriver()
         let engine = DisplayEngine()
         let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
+        let cfg = self.cfg, me = self.me
         DispatchQueue.global().async { [self] in
-            stopOtherDrivers(cfg: cfg, me: me)
+            _ = stopOtherDrivers(cfg: cfg, me: me)
             let excluded = loadExcluded()
-            for t in macPassengers(cfg: cfg, me: me) where !excluded.contains(t.id) {
-                clearRemoteHandback(on: t)   // override any walk-up on the target
-                _ = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
+            let targets = macPassengers(cfg: cfg, me: me).filter { !excluded.contains($0.id) }
+            // An explicit drive overrides any walk-up, so there is nothing to
+            // probe: clear the handback and claim every passenger at once.
+            _ = forEachPeer(targets) { t -> Bool in
+                clearRemoteHandback(on: t)
+                return placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
             }
-            let opened = openSessionWindows(cfg: cfg, me: me)
+            let opened = openSessionWindows(cfg: cfg, me: me, targets: targets)
             DispatchQueue.main.async {
-                self.notify("Driving: \(opened)/\(macPassengers(cfg: cfg, me: me).count) sessions open (\(canvas))")
+                self.notify("Driving: \(opened)/\(targets.count) sessions open (\(canvas))")
                 self.rebuild()
             }
         }
@@ -1586,8 +1995,8 @@ func selftest() -> Never {
     }
     let now = 1_000_000.0
     // ride TTL
-    let live = Ride(driver: "air", canvas: "laptop-air", hidpi: true, ts: now - 10)
-    let stale = Ride(driver: "air", canvas: "laptop-air", hidpi: true, ts: now - 120)
+    let live = Ride(driver: "air", canvas: "laptop-air", hidpi: true, ts: now - 10, claimedAt: nil)
+    let stale = Ride(driver: "air", canvas: "laptop-air", hidpi: true, ts: now - 120, claimedAt: nil)
     expect(computeMode(ride: live, ttl: 90, now: now) == .passenger(canvas: "laptop-air", hidpi: true),
            "live ride -> passenger")
     expect(computeMode(ride: stale, ttl: 90, now: now) == .console, "stale ride -> console")
@@ -1621,6 +2030,70 @@ func selftest() -> Never {
     expect(!consolePresent(idleNow: 2, idlePrev: 300, threshold: 20), "single blip -> not present")
     expect(!consolePresent(idleNow: 300, idlePrev: 2, threshold: 20), "gone idle -> not present")
     expect(!consolePresent(idleNow: nil, idlePrev: 2, threshold: 20), "unreadable -> not present")
+    // sh() must honour its timeout even when the child will not die on SIGTERM
+    // and keeps the pipe open. This is the 2026-08-16 outage in miniature: an
+    // ssh ControlMaster daemonises to PPID 1 and inherits stdout, so killing
+    // the bash that spawned it freed nothing, readDataToEndOfFile() waited on
+    // the master, and a 20 s timeout stalled the driver for minutes. Verified
+    // to fail against the pre-fix implementation (8.1 s for a 1 s timeout).
+    let shT0 = Date()
+    let shR = sh("trap '' TERM; sleep 8", timeout: 1)
+    let shElapsed = Date().timeIntervalSince(shT0)
+    expect(shElapsed < 4, "sh() timeout is enforced despite an orphan holding the pipe "
+                        + "(took \(String(format: "%.1f", shElapsed))s)")
+    expect(shR.code == 124, "sh() reports 124 on timeout")
+    // ---- event log (JSONL, transition-only, size-capped) ----
+    // Every bug chased on 2026-08-16/17 was invisible in the human log: we could
+    // see "converged=false" but not why, and nothing recorded that a lease
+    // arrived 77 s into its 90 s life. These are the primitives for that.
+    expect(evJSON(.n(2)) == "2", "whole numbers stay integers (no 2.000 noise)")
+    expect(evJSON(.n(2.45)) == "2.45", "fractions keep 2dp")
+    expect(evJSON(.b(true)) == "true", "bools are bare")
+    expect(evJSON(.s("ok")) == "\"ok\"", "strings are quoted")
+    expect(evJSON(.s("a\"b\\c")) == "\"a\\\"b\\\\c\"", "quotes and backslashes escaped")
+    expect(eventLine(ts: 100, machine: "pro", event: "beat",
+                     fields: [("ms", .n(12.5)), ("late", .s("air13"))])
+           == "{\"ts\":100,\"m\":\"pro\",\"e\":\"beat\",\"ms\":12.5,\"late\":\"air13\"}",
+           "event line is compact, ordered, parseable")
+    expect(eventLine(ts: 1, machine: "m", event: "e", fields: [])
+           == "{\"ts\":1,\"m\":\"m\",\"e\":\"e\"}", "no trailing comma with no fields")
+    // percentiles drive the "is it getting better over time" question
+    expect(percentile([1, 2, 3, 4, 5], 0.5) == 3, "p50 of odd sample")
+    expect(percentile([1, 2, 3, 4], 0.5) == 2,
+           "nearest-rank p50 on an even sample is a value that really occurred")
+    expect(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.95) == 10, "p95 reaches the tail")
+    expect(percentile([], 0.5) == 0, "empty sample is 0, not a crash")
+    expect(percentile([5], 0.99) == 5, "single sample")
+    // driver handoff: the newest explicit claim wins, and it must not depend on
+    // the stop-push landing. 2026-08-17: clicking Drive on air15 while the pro's
+    // ride was still live made air15 delete the driving flag it had just created,
+    // leaving nobody driving and the pro reconverging every 2 s until the lease
+    // expired.
+    expect(driverYields(myClaim: 100, theirClaim: 200), "older claim yields to newer")
+    expect(!driverYields(myClaim: 200, theirClaim: 100), "newer claim keeps driving")
+    expect(!driverYields(myClaim: 200, theirClaim: 200), "equal claims: incumbent keeps driving")
+    expect(!driverYields(myClaim: 100, theirClaim: nil),
+           "a ride with no claim stamp (older build) never unseats a real claim")
+    expect(driverYields(myClaim: nil, theirClaim: 100),
+           "no claim of our own: any explicit claim wins")
+    expect(!driverYields(myClaim: nil, theirClaim: nil), "no claims at all: nothing to yield to")
+    // peer backoff: a sleeping machine must not cost a connection attempt every beat
+    expect(backoffSeconds(consecutiveFailures: 0) == 0, "healthy peer is never skipped")
+    expect(backoffSeconds(consecutiveFailures: 1) == 15, "first failure backs off 15s")
+    expect(backoffSeconds(consecutiveFailures: 2) == 30, "backoff doubles")
+    expect(backoffSeconds(consecutiveFailures: 3) == 60, "backoff keeps doubling")
+    expect(backoffSeconds(consecutiveFailures: 99) == 60,
+           "backoff caps at 60s so a machine that wakes rejoins promptly")
+    // presence threshold is its own knob, floored so a faster tick cannot make
+    // walk-up handback more trigger-happy than the 15 s-tick default was
+    expect(presenceThreshold(configured: nil, reconcile: 15) == 20,
+           "presence threshold: legacy 15 s tick keeps 20 s")
+    expect(presenceThreshold(configured: nil, reconcile: 2) == 20,
+           "presence threshold: fast tick does not shrink the window")
+    expect(presenceThreshold(configured: 45, reconcile: 2) == 45,
+           "presence threshold: explicit config honoured")
+    expect(presenceThreshold(configured: 5, reconcile: 15) == 20,
+           "presence threshold: floor beats a too-small config")
     // scroll discrimination: wheels reversed, gesture devices untouched
     expect(shouldReverseScroll(phase: 0, momentum: 0), "classic wheel reversed")
     expect(!shouldReverseScroll(phase: 2, momentum: 0), "trackpad live gesture untouched")
@@ -1750,6 +2223,16 @@ func selftest() -> Never {
     expect(pickCanvas(physicalWidths: [3440], dockedCanvas: "per-machine",
                       laptopCanvas: "laptop-air13") == "per-machine",
            "docked pick honours per-machine canvas")
+    // Loop cadence: the tick must stay well inside the heartbeat (it is what
+    // subdivides it) and the ride TTL (a passenger that cannot re-check before
+    // its ride expires drops to console mid-session).
+    expect(cfg.reconcileSeconds > 0 && cfg.reconcileSeconds < cfg.heartbeatSeconds,
+           "reconcile tick subdivides the heartbeat")
+    expect(cfg.heartbeatSeconds < cfg.rideTTLSeconds,
+           "heartbeat re-asserts before the ride TTL expires")
+    expect(presenceThreshold(configured: cfg.presenceThresholdSeconds,
+                             reconcile: cfg.reconcileSeconds) >= 20,
+           "configured presence threshold is not trigger-happy")
     print(failures == 0 ? "MIRA selftest: OK" : "MIRA selftest: \(failures) FAILURES")
     exit(failures == 0 ? 0 : 1)
 }
@@ -1774,19 +2257,21 @@ case "status":
     print(line)
 case "drive":
     let cfg = loadConfig(); let me = selfMachine(cfg)
-    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
-    FileManager.default.createFile(atPath: drivingFlag.path, contents: nil)
+    claimDriver()
     for id in stopOtherDrivers(cfg: cfg, me: me) { print("\(id): stopped driving") }
     let engine = DisplayEngine()
     let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
-    for t in macPassengers(cfg: cfg, me: me) {
+    let targets = macPassengers(cfg: cfg, me: me)
+    let placed = forEachPeer(targets) { t -> Bool in
         clearRemoteHandback(on: t)   // explicit drive overrides target walk-up
-        let ok = placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
-        print("\(t.id): \(ok ? "riding (\(canvas))" : "RIDE FAILED")")
+        return placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
+    }
+    for t in targets {   // report in config order, not completion order
+        print("\(t.id): \(placed[t.id] == true ? "riding (\(canvas))" : "RIDE FAILED")")
     }
     // Alias documents open from any context; only the menu-scripting fallback
     // would need the terminal's Accessibility grant.
-    let opened = openSessionWindows(cfg: cfg, me: me)
+    let opened = openSessionWindows(cfg: cfg, me: me, targets: targets)
     print(opened > 0 ? "opened \(opened) session window(s)"
                      : "no windows opened — use the MIRA menu (Drive from Here / Reopen Session Windows)")
 case "stop":
@@ -1807,6 +2292,85 @@ case "handback":
     let rec = Reconciler(cfg: cfg); rec.lastMode = .passenger(canvas: "", hidpi: false)
     rec.tick()   // fresh handback -> immediate console converge
     print("handback — returned to console")
+case "perf":
+    // Reads the structured event log and answers "is this getting better or
+    // worse". Deliberately percentile-based: an average hides exactly the tail
+    // that ruins a session (one 3-minute beat matters more than fifty fast ones).
+    var events: [[String: Any]] = []
+    for f in [stateDir.appendingPathComponent("events.1.jsonl"), eventsFile] {
+        guard let text = try? String(contentsOf: f, encoding: .utf8) else { continue }
+        for line in text.split(separator: "\n") {
+            if let d = line.data(using: .utf8),
+               let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+                events.append(o)
+            }
+        }
+    }
+    guard !events.isEmpty else {
+        print("no events yet — \(eventsFile.path)"); exit(0)
+    }
+    func of(_ e: String) -> [[String: Any]] { events.filter { $0["e"] as? String == e } }
+    func nums(_ rows: [[String: Any]], _ k: String) -> [Double] {
+        rows.compactMap { ($0[k] as? NSNumber)?.doubleValue }
+    }
+    func line(_ label: String, _ xs: [Double], _ unit: String) -> String {
+        xs.isEmpty ? "  \(label): none"
+        : "  \(label): n=\(xs.count)  p50=\(String(format: "%.0f", percentile(xs, 0.5)))\(unit)"
+          + "  p95=\(String(format: "%.0f", percentile(xs, 0.95)))\(unit)"
+          + "  max=\(String(format: "%.0f", xs.max() ?? 0))\(unit)"
+    }
+    let ts = events.compactMap { ($0["ts"] as? NSNumber)?.doubleValue }
+    let span = (ts.max() ?? 0) - (ts.min() ?? 0)
+    let df = DateFormatter(); df.dateFormat = "MM-dd HH:mm"
+    print("MIRA perf — \(events.count) events over \(String(format: "%.1f", span / 3600))h "
+        + "(since \(df.string(from: Date(timeIntervalSince1970: ts.min() ?? 0))))")
+
+    let conv = of("converge")
+    let convOK = conv.filter { $0["ok"] as? Bool == true }
+    print("convergence")
+    print(line("duration", nums(convOK, "ms"), "ms"))
+    let fails = conv.filter { $0["ok"] as? Bool == false }
+    if fails.isEmpty { print("  failures: none") } else {
+        var byReason: [String: Int] = [:]
+        for f in fails { byReason[(f["why"] as? String) ?? "?", default: 0] += 1 }
+        print("  failures: \(fails.count) of \(conv.count)")
+        for (why, c) in byReason.sorted(by: { $0.value > $1.value }).prefix(3) {
+            print("    \(c)x  \(why)")
+        }
+    }
+
+    // The lease numbers are the ones that matter: a lease that arrives already
+    // most-expired, or that lapses at all, is a passenger about to flap to
+    // console and tear its displays down.
+    let recv = of("lease_recv"), ages = nums(recv, "age")
+    print("leases")
+    print(line("age on arrival", ages, "s"))
+    let born = ages.filter { $0 > 45 }.count
+    if !ages.isEmpty && born > 0 {
+        print("  arrived >50% expired: \(born)/\(ages.count) — driver stamps before a slow send")
+    }
+    let exp = of("lease_expire")
+    print("  lapsed (passenger dropped to console): \(exp.count)")
+    if !exp.isEmpty { print(line("  age at lapse", nums(exp, "age"), "s")) }
+
+    print("driver")
+    print(line("beat duration", nums(of("beat"), "ms"), "ms"))
+    print("  claims: \(of("claim").count)   yields: \(of("yield").count)")
+
+    let peers = of("peer")
+    if !peers.isEmpty {
+        var flaps: [String: Int] = [:]
+        for p in peers where p["up"] as? Bool == false {
+            flaps[(p["id"] as? String) ?? "?", default: 0] += 1
+        }
+        print("peers")
+        for (id, c) in flaps.sorted(by: { $0.value > $1.value }) {
+            print("  \(id): \(c) unreachable transitions")
+        }
+    }
+    let sz = (try? FileManager.default.attributesOfItem(atPath: eventsFile.path)[.size] as? Int) ?? 0
+    print("log: \(eventsFile.path) (\((sz ?? 0) / 1024) KB, caps at \(eventsCapBytes / 1024) KB + 1 rotation)")
+
 case "report":
     let text = ((try? String(contentsOf: logFile, encoding: .utf8)) ?? "")
         + ((try? String(contentsOf: logFile.deletingPathExtension().appendingPathExtension("old.log"), encoding: .utf8)) ?? "")

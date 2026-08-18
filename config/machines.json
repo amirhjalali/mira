@@ -2,7 +2,8 @@
   "comment": "The whole rig in one tracked file. A machine finds itself by unix user name.",
   "rideTTLSeconds": 90,
   "heartbeatSeconds": 30,
-  "reconcileSeconds": 15,
+  "reconcileSeconds": 2,
+  "presenceThresholdSeconds": 20,
   "homeSubnetPrefix": "192.168.1.",
   "homeGatewayMAC": "80:82:fe:34:40:dd",
   "dockedCanvas": "ultrawide",
@@ -16,8 +17,8 @@
       "hidpi": true
     },
     "laptop-air": {
-      "width": 1440,
-      "height": 932,
+      "width": 1710,
+      "height": 1068,
       "hidpi": true
     },
     "laptop-air13": {
@@ -88,8 +89,7 @@
       "tailscale": "100.112.227.24",
       "user": "amirhjalali",
       "roles": [
-        "viewer",
-        "target"
+        "viewer"
       ],
       "laptopCanvas": "laptop-air13",
       "type": "mac",

@@ -228,6 +228,16 @@ PL
     # unspawned after bootstrap (2026-08-13); kickstart forces the start.
     launchctl kickstart "gui/$uid/com.amir.mira" 2>/dev/null || true
 
+    # The menu app is a SEPARATE process that launchd does not manage, and it is
+    # the one the user actually clicks "Drive from Here" in. Restarting only the
+    # daemon left 4-day-old drive() logic running through every deploy of
+    # 2026-08-17 — new code shipped, old code still handling the click. The $
+    # anchor matters: it must not match the "--daemon" process above.
+    pkill -f "Applications/MIRA.app/Contents/MacOS/MIRA$" 2>/dev/null || true
+    sleep 1
+    open -a "$HOME/Applications/MIRA.app" 2>/dev/null || \
+      echo "   note: menu app not relaunched (no GUI session?) — open MIRA.app there"
+
     # retire the transitional MIRA2 generation and v1 leftovers
     launchctl bootout "gui/$uid" "$HOME/Library/LaunchAgents/com.amir.mira2.plist" 2>/dev/null || true
     launchctl bootout "gui/$uid" "$HOME/Library/LaunchAgents/com.gabooja.ultrawide.plist" 2>/dev/null || true

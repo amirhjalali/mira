@@ -320,6 +320,18 @@ func emit(_ event: String, _ fields: [(String, EV)] = []) {
     }
 }
 
+// The Jump *viewer* executable is ".../Jump Desktop.app/Contents/MacOS/Jump
+// Desktop"; the *host service* is ".../Jump Desktop Connect.app/Contents/MacOS/
+// JumpConnect". A passenger must kill the former (it streams outward, and a
+// stale viewer session silently renegotiates the far end's display resolution)
+// while never touching the latter, which is what serves inbound access.
+// No trailing "$": the real argv carries args like -psn_0_1234.
+let jumpViewerPattern = "/Jump Desktop\\.app/Contents/MacOS/Jump Desktop"
+
+func matchesJumpViewer(_ argv: String) -> Bool {
+    argv.range(of: jumpViewerPattern, options: .regularExpression) != nil
+}
+
 // MARK: - Ride (a driver's claim on this passenger)
 
 struct Ride: Codable {
@@ -746,11 +758,23 @@ final class DisplayEngine {
         return CGCompleteDisplayConfiguration(cfg, .permanently) == .success
     }
 
-    func mirrorPhysicalsOntoVirtual() -> Bool {
+    // Mirroring without an explicit mode lets CG negotiate a mode all members
+    // share. A laptop panel and the virtual share none, so negotiation left the
+    // virtual modeless (CGDisplayCopyDisplayMode == nil) and WindowServer
+    // reclaimed it ~30 s later — the once-a-minute rebuild loop of 2026-08-18.
+    // The virtual's mode therefore rides in the same transaction as the mirror.
+    func mirrorPhysicalsOntoVirtual(canvas: Canvas, hidpi: Bool) -> Bool {
         guard virtualID != 0 else { return false }
+        let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+        let modes = (CGDisplayCopyAllDisplayModes(virtualID, opts) as? [CGDisplayMode]) ?? []
+        let uiMatches = modes.filter { $0.width == canvas.width && $0.height == canvas.height }
+        let mode = uiMatches.first {
+            hidpi ? $0.pixelWidth == canvas.width * 2 : $0.pixelWidth == canvas.width
+        } ?? uiMatches.first
         var cfg: CGDisplayConfigRef?
         CGBeginDisplayConfiguration(&cfg)
         for p in physicalDisplays() { CGConfigureDisplayMirrorOfDisplay(cfg, p, virtualID) }
+        if let m = mode { CGConfigureDisplayWithDisplayMode(cfg, virtualID, m, nil) }
         CGConfigureDisplayOrigin(cfg, virtualID, 0, 0)  // main
         return CGCompleteDisplayConfiguration(cfg, .permanently) == .success
     }
@@ -786,7 +810,10 @@ final class DisplayEngine {
         if CGDisplayIsMain(virtualID) == 0 { return "virtual is not main" }
         let w = Int(CGDisplayPixelsWide(virtualID))
         if w != canvas.width { return "virtual width \(w) != canvas \(canvas.width)" }
-        if hidpi, let m = CGDisplayCopyDisplayMode(virtualID), m.pixelWidth != canvas.width * 2 {
+        // A modeless virtual (post-mirror negotiation failure) looks converged
+        // by bounds alone, but WindowServer reclaims it within a minute.
+        guard let m = CGDisplayCopyDisplayMode(virtualID) else { return "virtual has no mode" }
+        if hidpi, m.pixelWidth != canvas.width * 2 {
             return "hidpi mode pixelWidth \(m.pixelWidth) != \(canvas.width * 2)"
         }
         for p in physicalDisplays() where CGDisplayMirrorsDisplay(p) != virtualID {
@@ -1098,21 +1125,22 @@ final class Reconciler {
             // fast now so rides converge instantly, and three process spawns a
             // second on a laptop is a battery cost with no benefit.
             if Date() >= nextStreamGuard {
-                sh("pkill -x 'Jump Desktop' 2>/dev/null; pkill -f 'MacOS/Jump Desktop$' 2>/dev/null")
+                sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")
                 nextStreamGuard = Date().addingTimeInterval(15)
             }
-            if engine.passengerInvariantHolds(canvas: canvas, hidpi: wantHi),
-               lastMode == mode { checkWalkupTriggers(); return }
+            let broken = engine.passengerInvariantFailure(canvas: canvas, hidpi: wantHi)
+            if broken == nil, lastMode == mode { checkWalkupTriggers(); return }
             let t0 = Date()
-            log("converge -> passenger(\(canvasKey), hidpi=\(wantHi))")
+            log("converge -> passenger(\(canvasKey), hidpi=\(wantHi))"
+              + (broken.map { " — invariant broken: \($0)" } ?? ""))
             captureArrangement(engine: engine)
             applyHygiene()
             holdDisplayAwake()                                 // wake+hold display stack
-            sh("pkill -x 'Jump Desktop' 2>/dev/null")          // never stream outward
+            sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")          // never stream outward
             guard engine.ensureVirtual(canvas: canvas) else { log("virtual create FAILED"); return }
             engine.unmirrorAll()
             _ = engine.setVirtualMode(canvas: canvas, hidpi: wantHi)
-            _ = engine.mirrorPhysicalsOntoVirtual()
+            _ = engine.mirrorPhysicalsOntoVirtual(canvas: canvas, hidpi: wantHi)
             engine.setMain(engine.virtualID)
             routeAudio(passenger: true)
             let why = engine.passengerInvariantFailure(canvas: canvas, hidpi: wantHi)
@@ -1950,7 +1978,7 @@ extension MenuApp {
     @objc func stop() {
         try? FileManager.default.removeItem(at: drivingFlag)
         for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
-        sh("pkill -x 'Jump Desktop' 2>/dev/null")   // close the viewer locally
+        sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")   // close the viewer locally
         notify("Stopped driving — passengers return to console")
         rebuild()
     }
@@ -2064,6 +2092,19 @@ func selftest() -> Never {
     expect(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.95) == 10, "p95 reaches the tail")
     expect(percentile([], 0.5) == 0, "empty sample is 0, not a crash")
     expect(percentile([5], 0.99) == 5, "single sample")
+    // A passenger must never stream outward, but the guard that enforced it had
+    // never actually worked: `pkill -x "Jump Desktop"` misses because macOS
+    // reports comm as a truncated path, and `pkill -f "MacOS/Jump Desktop$"`
+    // misses because the real argv carries trailing args. A viewer survived 15h
+    // on a passenger and silently resized the driver's monitor (2026-08-18).
+    expect(matchesJumpViewer("/Applications/Jump Desktop.app/Contents/MacOS/Jump Desktop"),
+           "viewer argv matches")
+    expect(matchesJumpViewer("/Applications/Jump Desktop.app/Contents/MacOS/Jump Desktop -psn_0_1234"),
+           "viewer argv with trailing args still matches (the old $ anchor did not)")
+    expect(!matchesJumpViewer("/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect --service"),
+           "host service is NOT matched - killing it would cut inbound access")
+    expect(!matchesJumpViewer("/Applications/Jump Desktop Connect.app/Contents/MacOS/JumpConnect --desktopproxy /var/run/x"),
+           "host desktopproxy is NOT matched")
     // driver handoff: the newest explicit claim wins, and it must not depend on
     // the stop-push landing. 2026-08-17: clicking Drive on air15 while the pro's
     // ride was still live made air15 delete the driving flag it had just created,
@@ -2278,7 +2319,7 @@ case "stop":
     let cfg = loadConfig(); let me = selfMachine(cfg)
     try? FileManager.default.removeItem(at: drivingFlag)
     for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
-    sh("pkill -x 'Jump Desktop' 2>/dev/null")   // close the viewer locally
+    sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")   // close the viewer locally
     print("stopped — passengers return to console")
 case "console":
     let cfg = loadConfig()

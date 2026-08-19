@@ -62,6 +62,82 @@ Every automatic behavior must fail toward *doing nothing*:
 
 ## Incident log
 
+- 2026-08-19: the pro sat on extend for a day when the docked preference is
+  duplicate. Cause: `restoreArrangement` called `unmirrorAll()` and `setMain()`
+  BEFORE checking whether an arrangement had ever been saved, so the
+  "nothing to restore" path was destructive and returned success. A console
+  converge that runs twice is enough: the first restores the arrangement and
+  deletes arrangement.json, the second finds no file and unmirrors what the
+  first just rebuilt. Seen in the log as two `converge -> console` inside the
+  same second (18:24:59), and reproduced deterministically afterwards — set
+  duplicate, run `mira console` once, back to extend.
+  Fix: the empty path now touches nothing at all; `unmirrorAll()` moved below
+  the guard, `setMain()` deleted from it.
+  Lesson: the reconciler converges to console constantly, so every line on that
+  path runs thousands of times a day, including at the worst possible moment.
+  Anything there that mutates displays *without having been asked to* is not a
+  restore, it is a slow leak. "Nothing to give back" must mean touch nothing.
+
+- 2026-08-19: two drivers. air15 took the wheel while air13 was asleep; the
+  fleet ran with two claimants and passengers took rides from both.
+  Three defects, all in the same act:
+  (1) `stopOtherDrivers` pushed `rm -f driving` through `peerRun` WITHOUT
+  `force:`, so the push was skipped by the unreachable-backoff and returned 125
+  without attempting an SSH. peerRun's own comment already said force was for
+  "doctor, an explicit drive" — doctor passed it, drive never did. The second
+  click four seconds later never even tried.
+  (2) The failure was silent: the result was discarded and the notification
+  said "Driving: N/M sessions open". The only evidence was one log line,
+  `could not reach air13 to stop its driving flag`.
+  (3) The documented safety net — "the older claimant still yields on its own"
+  — did not exist for air13. That yield lives in the `.passenger` branch of
+  `tick()`, reached only when a RIDE lands, and rides go only to machines with
+  the `target` role. air13 is `roles:["viewer"]`, so nothing was ever placed on
+  it and it could not yield by any path. It slept holding a dead claim and woke
+  up still driving.
+  Fixes: a wheel beacon — the claim with no ride attached — pushed to every
+  other machine that *may drive* (`otherViewers`, keyed on `mayDrive`, not on
+  the target role), at claim time and again on every beat; a yield check at the
+  TOP of `tick()` that any machine can reach; `force: true` on the claim; the
+  peer's own claim read back each beat so a stale driver stands down even when
+  it was *our* stop that missed; the unreachable list surfaced in the
+  notification and the CLI; `mira wheel` and a doctor check that both name two
+  drivers outright.
+  Lesson: a rule enforced only along the path where it is usually violated is
+  not enforced. "One driver at a time" was checked only where rides land, so
+  the machine that received no rides was the one that could break it.
+
+- 2026-08-19: the Air strobed its panel every 3.5 s for 89 minutes — 1,924 full
+  display teardowns, sev-1 against the prime directive. Cause: the 08-18 fix
+  added `guard let m = CGDisplayCopyDisplayMode(virtualID)` to the passenger
+  invariant, promoting a check that previously ran only on hidpi rides into one
+  that runs on every converge. The ultrawide canvas is hidpi=false, so that call
+  had never executed before. It returns nil when asked immediately after
+  CGCompleteDisplayConfiguration: CoreGraphics answers display queries from a
+  per-process snapshot refreshed only when the process turns its run loop, and
+  the converge queried on the next line. An external probe read the correct
+  3440x1440 mode off the same display throughout. The cheap bounds queries
+  (IsMain, PixelsWide) refresh eagerly and passed, which is what made it look
+  like a genuinely modeless virtual and sent the first fix the wrong way.
+  Collateral: captureArrangement snapshotted the panel mid-teardown and saved a
+  1x 2560x1600 mode, so the console restore would have returned the Air's
+  built-in non-retina.
+  Fixes, all four architectural rather than another patch on the guard:
+  (1) a ConvergeBreaker — N identical consecutive failures stop the loop, log
+  once, and leave the display alone; the failure-bias rule applied to
+  convergence itself. (2) One transaction: unmirror/setMode/mirror/setMain
+  collapsed into a single CG configuration, because every seam between them was
+  a window for CG to renegotiate the set down to a shared mode (the 1024x768
+  trap and the modeless virtual are the same root). setVirtualMode and
+  mirrorPhysicalsOntoVirtual are deleted so the old path cannot come back.
+  (3) settledInvariantFailure turns the run loop and re-asks before believing a
+  failure. (4) the apply's result is logged, never discarded.
+  Lesson: a reconcile loop is only safe when reads are truthful, writes are
+  cheap, and we own the resource. Display config is none of those — reads lag
+  our own writes, each write costs a visible flash, and Jump Desktop mutates
+  the same global state. Any future display invariant must assume its own reads
+  can be wrong, and must be unable to act on that wrongness more than N times.
+
 - 2026-08-18: the Air (passenger, panel + virtual) blinked once a minute all
   morning. Cause: mirroring the panel onto the virtual WITHOUT an explicit
   mode made CG negotiate a mode all members share — panel and virtual share

@@ -120,6 +120,8 @@ let stateDir = URL(fileURLWithPath: NSHomeDirectory())
     .appendingPathComponent("Library/Application Support/MIRA", isDirectory: true)
 let rideFile = stateDir.appendingPathComponent("ride.json")
 let drivingFlag = stateDir.appendingPathComponent("driving")
+// Who holds the wheel fleet-wide, as last told to us by a driver. See "Wheel".
+let wheelFile = stateDir.appendingPathComponent("wheel.json")
 
 // The driving flag carries the moment we claimed the wheel, so a peer's ride can
 // be compared against it. An empty flag (older build, or a file we failed to
@@ -138,9 +140,11 @@ func readDriverClaim() -> Double? {
 // passenger-only machine must be structurally incapable of this. Selftested.
 func mayDrive(roles: [String]) -> Bool { roles.contains("viewer") }
 
-// Claiming the wheel is one act: stamp the claim AND drop any ride another
-// driver left on us. Without the second half our own next tick reads that ride,
-// concludes we are a passenger, and deletes the flag we just wrote.
+// Claiming the wheel is one act: stamp the claim AND drop both of the things a
+// previous driver left on us — its ride and its beacon. Without the ride half
+// our own next tick reads that ride, concludes we are a passenger, and deletes
+// the flag we just wrote; without the beacon half the same happens one layer
+// up, via wheelYields.
 func claimDriver(me: Machine) {
     guard mayDrive(roles: me.roles) else {
         log("refusing to drive: \(me.id) is roles=\(me.roles.joined(separator: ",")) — passenger-only")
@@ -151,8 +155,9 @@ func claimDriver(me: Machine) {
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
     let now = Date().timeIntervalSince1970
     try? String(now).write(to: drivingFlag, atomically: true, encoding: .utf8)
-    emit("claim")
+    emit("claim", [("at", .n(now))])
     try? FileManager.default.removeItem(at: rideFile)
+    try? FileManager.default.removeItem(at: wheelFile)
 }
 let arrangementFile = stateDir.appendingPathComponent("arrangement.json")
 let handbackFile = stateDir.appendingPathComponent("handback")
@@ -589,6 +594,47 @@ func readRide() -> Ride? {
     return try? JSONDecoder().decode(Ride.self, from: d)
 }
 
+// MARK: - Wheel (the claim, fleet-wide)
+
+// A ride says "become a passenger", and rides only ever go to machines with the
+// "target" role. air13 is roles:["viewer"], so nothing was ever placed on it —
+// which meant the "an older claimant still yields on its own" safety net
+// described at driverYields did not cover the one machine that needed it. The
+// beacon is a claim with no ride attached, pushed to every OTHER machine that
+// may drive, at claim time and again on every beat. A machine that was asleep
+// when the wheel changed hands learns it lost the wheel the moment it can be
+// reached again.
+struct Wheel: Codable {
+    let driver: String
+    let claimedAt: Double
+    // When this beacon was written. Freshness for the menu bar ONLY — see below.
+    let ts: Double
+}
+
+func readWheel() -> Wheel? {
+    guard let d = try? Data(contentsOf: wheelFile) else { return nil }
+    return try? JSONDecoder().decode(Wheel.self, from: d)
+}
+
+// A beacon can only ever TAKE the wheel away, never hand it back, so it needs
+// no TTL: once we have yielded we are parked, and the only route back to
+// driving is a fresh claim, which by construction outranks the beacon that
+// unseated us. Expiring this would let a stale beacon lapse and restore a
+// second driver — precisely the bug it exists to kill.
+func wheelYields(me: String, myClaim: Double?, wheel: Wheel?) -> Bool {
+    guard let w = wheel, w.driver != me else { return false }
+    return driverYields(myClaim: myClaim, theirClaim: w.claimedAt)
+}
+
+// Menu bar only: who is driving the fleet, as far as this machine has been
+// told. Display DOES expire — a driver that stopped talking should stop
+// claiming the menu bar — which is exactly why it is not wheelYields.
+func wheelHolder(wheel: Wheel?, me: String, ttl: Double,
+                 now: Double = Date().timeIntervalSince1970) -> String? {
+    guard let w = wheel, w.driver != me, now - w.ts < ttl else { return nil }
+    return w.driver
+}
+
 // MARK: - Mode (pure, selftested)
 
 enum Mode: Equatable { case console; case passenger(canvas: String, hidpi: Bool) }
@@ -936,7 +982,7 @@ final class DisplayEngine {
         if virtualDisplay != nil {
             // Reuse only if built for the same canvas; a live ride whose canvas
             // changed (driver undocks: ultrawide->laptop) must rebuild, else
-            // setVirtualMode can never match and the passenger reconverges forever.
+            // the topology apply can never match and the passenger reconverges forever.
             if let b = builtCanvas, b.width == canvas.width, b.height == canvas.height { return true }
             log("virtual canvas changed \(builtCanvas.map { "\($0.width)x\($0.height)" } ?? "?") -> \(canvas.width)x\(canvas.height); rebuilding")
             destroyVirtual()
@@ -977,42 +1023,52 @@ final class DisplayEngine {
         builtCanvas = nil
     }
 
-    // Choose a mode on the virtual display: UI size WxH at 2x (hidpi) or 1x.
-    func setVirtualMode(canvas: Canvas, hidpi: Bool) -> Bool {
-        guard virtualID != 0 else { return false }
+    // Shared mode pick, so the mode chosen for the transaction and the mode the
+    // invariant later expects can never drift apart.
+    func virtualMode(canvas: Canvas, hidpi: Bool) -> CGDisplayMode? {
+        guard virtualID != 0 else { return nil }
         let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
-        guard let modes = CGDisplayCopyAllDisplayModes(virtualID, opts) as? [CGDisplayMode] else { return false }
+        let modes = (CGDisplayCopyAllDisplayModes(virtualID, opts) as? [CGDisplayMode]) ?? []
         let uiMatches = modes.filter { $0.width == canvas.width && $0.height == canvas.height }
         let exact = uiMatches.first {
             hidpi ? $0.pixelWidth == canvas.width * 2 : $0.pixelWidth == canvas.width
         }
-        guard let mode = exact ?? uiMatches.first else { return false }
-        if exact == nil { log("mode fallback: UI \(canvas.width)x\(canvas.height) with backing \(uiMatches.first!.pixelWidth)px") }
-        var cfg: CGDisplayConfigRef?
-        CGBeginDisplayConfiguration(&cfg)
-        CGConfigureDisplayWithDisplayMode(cfg, virtualID, mode, nil)
-        return CGCompleteDisplayConfiguration(cfg, .permanently) == .success
+        if exact == nil, let f = uiMatches.first {
+            log("mode fallback: UI \(canvas.width)x\(canvas.height) with backing \(f.pixelWidth)px")
+        }
+        return exact ?? uiMatches.first
     }
 
-    // Mirroring without an explicit mode lets CG negotiate a mode all members
-    // share. A laptop panel and the virtual share none, so negotiation left the
-    // virtual modeless (CGDisplayCopyDisplayMode == nil) and WindowServer
-    // reclaimed it ~30 s later — the once-a-minute rebuild loop of 2026-08-18.
-    // The virtual's mode therefore rides in the same transaction as the mirror.
-    func mirrorPhysicalsOntoVirtual(canvas: Canvas, hidpi: Bool) -> Bool {
-        guard virtualID != 0 else { return false }
-        let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
-        let modes = (CGDisplayCopyAllDisplayModes(virtualID, opts) as? [CGDisplayMode]) ?? []
-        let uiMatches = modes.filter { $0.width == canvas.width && $0.height == canvas.height }
-        let mode = uiMatches.first {
-            hidpi ? $0.pixelWidth == canvas.width * 2 : $0.pixelWidth == canvas.width
-        } ?? uiMatches.first
+    // The whole passenger topology in ONE transaction: the virtual holds the
+    // canvas mode, every physical mirrors the virtual, the virtual is main.
+    //
+    // It used to be four transactions (unmirror, set mode, mirror, set main).
+    // Every seam between them was a moment when CG renegotiated the mode for the
+    // whole set, and CG picks the highest mode all members share EXACTLY --
+    // 1024x768 on the BenQ/built-in pair, and a modeless virtual on the laptop
+    // panel pair. Both traps, and the mid-converge flash the owner actually
+    // sees, are one root cause: a topology that is briefly neither the old one
+    // nor the new one. There is no such moment now.
+    func applyPassengerTopology(canvas: Canvas, hidpi: Bool) -> Bool {
+        guard virtualID != 0 else { log("apply topology: no virtual display"); return false }
+        guard let mode = virtualMode(canvas: canvas, hidpi: hidpi) else {
+            log("apply topology: no \(canvas.width)x\(canvas.height) mode published on the virtual")
+            return false
+        }
         var cfg: CGDisplayConfigRef?
-        CGBeginDisplayConfiguration(&cfg)
+        guard CGBeginDisplayConfiguration(&cfg) == .success, let cfg = cfg else {
+            log("apply topology: CGBeginDisplayConfiguration failed")
+            return false
+        }
+        CGConfigureDisplayWithDisplayMode(cfg, virtualID, mode, nil)
         for p in physicalDisplays() { CGConfigureDisplayMirrorOfDisplay(cfg, p, virtualID) }
-        if let m = mode { CGConfigureDisplayWithDisplayMode(cfg, virtualID, m, nil) }
-        CGConfigureDisplayOrigin(cfg, virtualID, 0, 0)  // main
-        return CGCompleteDisplayConfiguration(cfg, .permanently) == .success
+        CGConfigureDisplayOrigin(cfg, virtualID, 0, 0)          // origin 0,0 == main
+        let r = CGCompleteDisplayConfiguration(cfg, .permanently)
+        lastSelfDisplayWrite = Date()
+        // Never discarded. A silent false here is how a converge used to fail
+        // without leaving one line of evidence anywhere.
+        if r != .success { log("apply topology: CGCompleteDisplayConfiguration error \(r.rawValue)") }
+        return r == .success
     }
 
     func unmirrorAll() {
@@ -1057,7 +1113,78 @@ final class DisplayEngine {
         }
         return nil
     }
+
+    // CoreGraphics answers display queries from a PER-PROCESS snapshot that is
+    // refreshed when the process turns its run loop. Reading the invariant on
+    // the line after CGCompleteDisplayConfiguration therefore interrogates a
+    // cache that has not seen the write yet. On 2026-08-19 this daemon read
+    // CGDisplayCopyDisplayMode as nil for 89 minutes while a separate probe
+    // process read the correct 3440x1440 mode off the very same display. The
+    // cheap bounds queries (IsMain, PixelsWide) refresh eagerly and passed
+    // throughout, which is exactly what made it look like a real modeless
+    // virtual and sent the fix in the wrong direction.
+    //
+    // So: give the run loop a turn and re-ask before believing a failure. A
+    // clause still broken once the snapshot has caught up is a real one.
+    func settledInvariantFailure(canvas: Canvas, hidpi: Bool, attempts: Int = 4) -> String? {
+        var why = passengerInvariantFailure(canvas: canvas, hidpi: hidpi)
+        var left = attempts
+        while why != nil, left > 1 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.12))
+            why = passengerInvariantFailure(canvas: canvas, hidpi: hidpi)
+            left -= 1
+        }
+        return why
+    }
 }
+
+// MARK: - Converge circuit breaker
+
+// A converge that cannot succeed must stop trying. On 2026-08-19 a passenger
+// reconverged 1,924 times in 89 minutes: every tick read one invariant clause as
+// broken, tore the whole display topology down, rebuilt it, re-read the same
+// clause as broken, and went round again -- each cycle a visible resolution
+// flash on the owner's panel. Nothing counted the repeats, so the loop could not
+// tell "the world drifted, re-assert" from "I cannot satisfy this, stop asking".
+//
+// Identical consecutive failures carry no new information. A DIFFERENT failure
+// does -- it means the last attempt changed something -- so it restarts the
+// count. Pure and selftested on purpose: this is the guard that has to work
+// when everything else in the display stack is lying.
+struct ConvergeBreaker {
+    let limit: Int
+    private(set) var reason: String?
+    private(set) var streak = 0
+    private(set) var tripped = false
+
+    init(limit: Int = 5) { self.limit = limit }
+
+    // nil failure == converged. Returns true only on the tick that trips the
+    // breaker, so the caller logs the transition exactly once instead of once
+    // per tick forever -- the log spam was its own half of the incident.
+    @discardableResult
+    mutating func record(_ failure: String?) -> Bool {
+        guard let failure = failure else {
+            reason = nil; streak = 0; tripped = false; return false
+        }
+        if failure == reason { streak += 1 } else { reason = failure; streak = 1 }
+        let wasTripped = tripped
+        tripped = streak >= limit
+        return tripped && !wasTripped
+    }
+
+    var shouldAttempt: Bool { !tripped }
+
+    // Anything that makes the previous verdict stale: a new lease, a mode
+    // change, or the display topology actually moving underneath us.
+    mutating func reset() { reason = nil; streak = 0; tripped = false }
+}
+
+// Set immediately after every display transaction WE issue. The reconfiguration
+// callback fires for our own writes too, and a breaker that resets on those
+// would never trip at all.
+var lastSelfDisplayWrite = Date.distantPast
+var displayReconfigured: ((CGDisplayChangeSummaryFlags) -> Void)?
 
 // MARK: - Arrangement capture / restore (origins of physical displays)
 
@@ -1126,12 +1253,23 @@ func captureArrangement(engine: DisplayEngine) {
 // the user's docked BenQ-master/built-in-mirror preference.
 @discardableResult
 func restoreArrangement(engine: DisplayEngine) -> Bool {
-    engine.unmirrorAll()
     guard let data = try? Data(contentsOf: arrangementFile),
           let saved = try? JSONDecoder().decode([SavedDisplay].self, from: data) else {
-        if let first = engine.physicalDisplays().first { engine.setMain(first) }
-        return true   // nothing captured -> nothing to retry
+        // No saved arrangement means we never took the displays away, so there
+        // is nothing to give back — and "nothing to give back" must mean TOUCH
+        // NOTHING. unmirrorAll() and setMain() used to run BEFORE this check,
+        // which made an empty restore a destructive act: it tore the docked
+        // BenQ-master/built-in-mirror pair into extend and returned success.
+        // A console converge that runs twice is enough to trigger it — the
+        // first restores and deletes arrangement.json, the second finds no file
+        // and unmirrors what the first just rebuilt. Reproduced on the pro
+        // 2026-08-19: set duplicate, one `mira console`, back to extend.
+        // The reconciler converges to console constantly; anything on that path
+        // that mutates displays without being asked will eventually be run at
+        // the worst possible moment.
+        return true   // nothing captured -> nothing to do, and nothing to retry
     }
+    engine.unmirrorAll()   // break the virtual's mirror before rebuilding the real one
     let online = Set(engine.onlineDisplays())
     var cfg: CGDisplayConfigRef?
     CGBeginDisplayConfiguration(&cfg)
@@ -1297,6 +1435,9 @@ final class Reconciler {
     var nextStreamGuard = Date.distantPast
     var loggedStaleRideFrom: String?
     var lastLeaseTS: Double?
+    // Stops the 2026-08-19 reconverge storm. Reset by anything that makes an
+    // earlier "cannot converge" verdict stale.
+    var breaker = ConvergeBreaker(limit: 5)
 
     init(cfg: Config) { self.cfg = cfg; self.me = selfMachine(cfg) }
 
@@ -1307,6 +1448,19 @@ final class Reconciler {
     func startWatchers() { if isLaptop { walkup.start() } }
 
     func tick() {
+        // The wheel comes first: a machine that has lost it must stop behaving
+        // like a driver before it does anything else this tick. This is the
+        // ONLY path by which a viewer with no "target" role can learn it was
+        // replaced — nothing ever places a ride on it, so the yield further
+        // down in the .passenger branch is unreachable for it. air13 sat here
+        // holding a dead claim through a sleep and a wake on 2026-08-19.
+        if FileManager.default.fileExists(atPath: drivingFlag.path),
+           wheelYields(me: me.id, myClaim: readDriverClaim(), wheel: readWheel()) {
+            try? FileManager.default.removeItem(at: drivingFlag)
+            let holder = readWheel()?.driver ?? "?"
+            log("yielding the wheel to \(holder) (newer claim, via beacon)")
+            emit("yield", [("to", .s(holder)), ("via", .s("beacon"))])
+        }
         // Walk-up handback: a fresh handback file forces console regardless of ride.
         if let hts = readHandbackTS() {
             let hold = cfg.handbackHoldSeconds ?? 600
@@ -1348,6 +1502,7 @@ final class Reconciler {
             loggedStaleRideFrom = nil
             if let r = ride, r.ts != lastLeaseTS {
                 lastLeaseTS = r.ts
+                breaker.reset()   // a new lease deserves a fresh attempt
                 // Age on arrival: a lease that lands most-expired is the signal
                 // that the driver stamped it before a slow network op.
                 emit("lease_recv", [("drv", .s(r.driver)), ("canvas", .s(r.canvas)),
@@ -1368,7 +1523,12 @@ final class Reconciler {
                 nextStreamGuard = Date().addingTimeInterval(15)
             }
             let broken = engine.passengerInvariantFailure(canvas: canvas, hidpi: wantHi)
-            if broken == nil, lastMode == mode { checkWalkupTriggers(); return }
+            if broken == nil, lastMode == mode { breaker.record(nil); checkWalkupTriggers(); return }
+            // Already proved we cannot satisfy this ride: keep the owner's
+            // display STILL and stay quiet until something actually changes.
+            // Re-asserting a topology that just failed is what turned one bad
+            // read into 89 minutes of strobing.
+            guard breaker.shouldAttempt else { checkWalkupTriggers(); return }
             let t0 = Date()
             log("converge -> passenger(\(canvasKey), hidpi=\(wantHi))"
               + (broken.map { " — invariant broken: \($0)" } ?? ""))
@@ -1377,18 +1537,21 @@ final class Reconciler {
             holdDisplayAwake()                                 // wake+hold display stack
             killJumpViewer()                                   // never stream outward
             guard engine.ensureVirtual(canvas: canvas) else { log("virtual create FAILED"); return }
-            engine.unmirrorAll()
-            _ = engine.setVirtualMode(canvas: canvas, hidpi: wantHi)
-            _ = engine.mirrorPhysicalsOntoVirtual(canvas: canvas, hidpi: wantHi)
-            engine.setMain(engine.virtualID)
+            let applied = engine.applyPassengerTopology(canvas: canvas, hidpi: wantHi)
             routeAudio(passenger: true)
-            let why = engine.passengerInvariantFailure(canvas: canvas, hidpi: wantHi)
+            let why = applied ? engine.settledInvariantFailure(canvas: canvas, hidpi: wantHi)
+                              : "topology transaction failed"
             let ok = why == nil
             log("passenger converged=\(ok) in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s"
               + (why.map { " — \($0)" } ?? ""))
             emit("converge", [("canvas", .s(canvasKey)), ("hidpi", .b(wantHi)),
                               ("ms", .n(Date().timeIntervalSince(t0) * 1000)),
                               ("ok", .b(ok))] + (why.map { [("why", EV.s($0))] } ?? []))
+            if breaker.record(why) {
+                log("converge breaker TRIPPED after \(breaker.streak) identical failures "
+                  + "(\(why ?? "?")) — holding the display still until something changes")
+                emit("breaker_trip", [("why", .s(why ?? "?")), ("n", .n(Double(breaker.streak)))])
+            }
             // The latch is only consumed while a passenger, so console-era
             // input (the owner using this machine hours ago) survives until
             // the first tick of the next ride and hands back a just-started
@@ -1408,6 +1571,7 @@ final class Reconciler {
     }
 
     func convergeConsole() {
+        breaker.reset()   // console is a clean slate for the next ride
         if lastMode == .console || (lastMode == nil && engine.virtualID == 0
             && !FileManager.default.fileExists(atPath: arrangementFile.path)) {
             // A fresh daemon can inherit a stale Jump audio route from a
@@ -1595,23 +1759,95 @@ func driverCanvasKey(cfg: Config, me: Machine, engine: DisplayEngine) -> String 
 // Observed 2026-08-16: pro and air13 both driving left passengers at double the
 // intended logical size and reconverging endlessly.
 // Claiming is therefore explicit — stop every other viewer BEFORE placing rides.
+let wheelDir = "$HOME/Library/Application Support/MIRA"
+
+// One round trip that both takes the wheel away and leaves proof behind: drop
+// the peer's flag AND install our beacon, so a peer we reached cannot be left
+// holding the wheel, and a peer that later restarts still finds our claim.
+// force: an explicit Drive is the most deliberate statement of intent in the
+// system and must never be skipped by a cached "unreachable" verdict. That
+// exact skip is how 2026-08-19 produced two drivers: air13 went into a 15 s
+// backoff at 18:16:36, so the second click four seconds later never even
+// attempted an SSH — it read 125 from the backoff and reported "could not
+// reach". peerRun's own comment already said force was for "doctor, an
+// explicit drive"; doctor passed it and drive did not.
+func takeWheel(from m: Machine, driver: String, claimedAt: Double) -> Bool {
+    let w = Wheel(driver: driver, claimedAt: claimedAt, ts: Date().timeIntervalSince1970)
+    guard let d = try? JSONEncoder().encode(w), let json = String(data: d, encoding: .utf8)
+    else { return false }
+    return peerRun(m, "rm -f \"\(wheelDir)/driving\" && mkdir -p \"\(wheelDir)\" "
+                    + "&& printf %s '\(json)' > \"\(wheelDir)/wheel.json.tmp\" "
+                    + "&& mv -f \"\(wheelDir)/wheel.json.tmp\" \"\(wheelDir)/wheel.json\"",
+                   timeout: 10, force: true).code == 0
+}
+
+// The heartbeat half of the same idea, and the reason handoff is now
+// self-healing rather than best-effort: re-assert our beacon on every other
+// viewer each beat, and read back whatever claim that peer holds. A machine
+// that was asleep when the wheel changed hands gets our claim on its first
+// reachable beat and yields itself. A peer holding a NEWER claim than ours
+// means we are the stale driver, and we stand down.
+// Not forced: this runs every beat, and a sleeping laptop must not cost a
+// connection attempt every 30 s — that is what the backoff is for.
+func syncWheel(with m: Machine, driver: String, claimedAt: Double) -> (reached: Bool, theirClaim: Double?) {
+    let w = Wheel(driver: driver, claimedAt: claimedAt, ts: Date().timeIntervalSince1970)
+    guard let d = try? JSONEncoder().encode(w), let json = String(data: d, encoding: .utf8)
+    else { return (false, nil) }
+    let r = peerRun(m, "mkdir -p \"\(wheelDir)\" "
+                     + "&& printf %s '\(json)' > \"\(wheelDir)/wheel.json.tmp\" "
+                     + "&& mv -f \"\(wheelDir)/wheel.json.tmp\" \"\(wheelDir)/wheel.json\"; "
+                     + "echo \"CLAIM=$(cat \"\(wheelDir)/driving\" 2>/dev/null)\"", timeout: 10)
+    guard r.code == 0 else { return (false, nil) }
+    return (true, parseClaimReadback(r.out))
+}
+
+// The peer's own claim, out of syncWheel's read-back. Pure so the parse is
+// selftested rather than trusted: getting this wrong in the lenient direction
+// (junk read as a huge claim) would make a driver yield to nothing and leave
+// the fleet with NO driver, which is worse than the bug being fixed. An absent
+// flag prints "CLAIM=" and must read as "no claim", never as 0 — a peer with a
+// real claim of 0 does not exist, but a peer with no claim is the normal case.
+func parseClaimReadback(_ out: String) -> Double? {
+    guard let line = out.components(separatedBy: .newlines)
+            .first(where: { $0.hasPrefix("CLAIM=") }) else { return nil }
+    let v = line.dropFirst("CLAIM=".count).trimmingCharacters(in: .whitespaces)
+    guard !v.isEmpty, let d = Double(v), d > 0, d.isFinite else { return nil }
+    return d
+}
+
+// Parking releases the wheel everywhere, so no peer's menu bar goes on naming a
+// driver that stopped. Best-effort by nature: a beacon we fail to clear only
+// expires a menu label (wheelHolder has a TTL), it can never strand anyone.
+func clearWheel(on m: Machine) {
+    _ = peerRun(m, "rm -f \"\(wheelDir)/wheel.json\"", timeout: 10, force: true)
+}
+
+// What an explicit claim actually achieved. `unreachable` is the honest half:
+// those machines keep the wheel until they can be reached, and the beat-by-beat
+// syncWheel above is what eventually takes it from them.
+struct Handoff { let stopped: [String]; let unreachable: [String] }
+
 @discardableResult
-func stopOtherDrivers(cfg: Config, me: Machine) -> [String] {
-    let others = cfg.machines.filter { $0.id != me.id && $0.roles.contains("viewer") }
-    let results = forEachPeer(others) { other -> Bool in
-        peerRun(other, "rm -f \"$HOME/Library/Application Support/MIRA/driving\"", timeout: 10).code == 0
-    }
+func stopOtherDrivers(cfg: Config, me: Machine) -> Handoff {
+    let claim = readDriverClaim() ?? Date().timeIntervalSince1970
+    let others = otherViewers(cfg: cfg, me: me)
+    let results = forEachPeer(others) { takeWheel(from: $0, driver: me.id, claimedAt: claim) }
     // Report in config order, not completion order, so the output is stable.
-    var stopped: [String] = []
+    var stopped: [String] = [], unreachable: [String] = []
     for other in others {
         if results[other.id] == true {
             stopped.append(other.id)
             log("stopped driving on \(other.id) — taking over as driver")
         } else {
-            log("could not reach \(other.id) to stop its driving flag")
+            unreachable.append(other.id)
+            log("could not reach \(other.id) to stop its driving flag "
+              + "— it yields on its first reachable beat")
         }
     }
-    return stopped
+    if !unreachable.isEmpty {
+        emit("handoff_incomplete", [("unreachable", .s(unreachable.joined(separator: "+")))])
+    }
+    return Handoff(stopped: stopped, unreachable: unreachable)
 }
 
 func placeRide(on target: Machine, canvas: String, hidpi: Bool, driver: String,
@@ -1626,8 +1862,23 @@ func placeRide(on target: Machine, canvas: String, hidpi: Bool, driver: String,
     // half-written by a passenger that is now watching for changes rather than
     // polling on a slow timer, and a rename is the event its directory watcher
     // sees for both a new ride and a changed one.
-    return peerRun(target, "mkdir -p \"\(dir)\" && printf %s '\(json)' > \"\(dir)/ride.json.tmp\" "
-                 + "&& mv -f \"\(dir)/ride.json.tmp\" \"\(dir)/ride.json\"").code == 0
+    let r = peerRun(target, "mkdir -p \"\(dir)\" && printf %s '\(json)' > \"\(dir)/ride.json.tmp\" "
+                          + "&& mv -f \"\(dir)/ride.json.tmp\" \"\(dir)/ride.json\"")
+    // A ride that does not land is the whole ballgame: the passenger keeps its
+    // old ride until the TTL, then drops to console and its physical display
+    // comes back (the BenQ snapping to 3440x1440). This used to return a Bool
+    // that every caller discarded, so six consecutive misses produced not one
+    // line of evidence anywhere -- no backoff event, no fan-out timeout, just a
+    // passenger mysteriously "back to widescreen" (2026-08-19).
+    if r.code != 0 {
+        let why = r.code == 125 ? " (skipped by backoff)"
+                : r.code == 124 ? " (our timeout killed it)"
+                : r.code == 255 ? " (ssh transport)" : ""
+        log("ride NOT placed on \(target.id): code \(r.code)\(why)"
+          + (r.out.isEmpty ? "" : " — \(r.out.prefix(160))"))
+        emit("ride_failed", [("id", .s(target.id)), ("code", .n(Double(r.code)))])
+    }
+    return r.code == 0
 }
 
 func endRide(on target: Machine) {
@@ -1645,6 +1896,14 @@ func clearRemoteHandback(on target: Machine) {
 
 func macPassengers(cfg: Config, me: Machine) -> [Machine] {
     cfg.machines.filter { $0.id != me.id && $0.roles.contains("target") && ($0.type ?? "mac") == "mac" }
+}
+
+// Every machine that could be holding the wheel right now. Deliberately NOT
+// macPassengers: a viewer with no "target" role never receives a ride, so
+// anything that fans out over passengers alone cannot reach every driver. It
+// shares mayDrive with the claim path so the two can never drift apart.
+func otherViewers(cfg: Config, me: Machine) -> [Machine] {
+    cfg.machines.filter { $0.id != me.id && mayDrive(roles: $0.roles) }
 }
 
 // Fan out over machines concurrently, collecting results by machine id.
@@ -1700,7 +1959,35 @@ func targetWalkedUp(_ t: Machine, cfg: Config) -> Bool {
 
 var liveRideHiDPI: [String: Bool] = [:]
 
+// Re-assert our claim on every other viewer and collect theirs. Returns the id
+// of a peer whose claim outranks ours (having already dropped our own flag), or
+// nil when we still hold the wheel. Both halves matter: the push is how a peer
+// that was unreachable at claim time finds out it lost, and the pull is how we
+// find out we are the stale one when OUR stop was the one that missed.
+func syncWheelWithViewers(cfg: Config, me: Machine) -> String? {
+    let myClaim = readDriverClaim()
+    let peers = otherViewers(cfg: cfg, me: me)
+    let results = forEachPeer(peers) { syncWheel(with: $0, driver: me.id,
+                                                 claimedAt: myClaim ?? 0) }
+    for p in peers {   // config order, so a tie resolves the same way everywhere
+        guard let r = results[p.id], r.reached,
+              driverYields(myClaim: myClaim, theirClaim: r.theirClaim) else { continue }
+        try? FileManager.default.removeItem(at: drivingFlag)
+        return p.id
+    }
+    return nil
+}
+
 func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Tier) -> Tier {
+    // Settle who holds the wheel BEFORE moving anyone's display. Two drivers
+    // placing rides on the same passenger is the whole failure this beat
+    // exists to prevent, so it is resolved first and rides are skipped
+    // entirely on the beat we stand down.
+    if let yieldedTo = syncWheelWithViewers(cfg: cfg, me: me) {
+        log("yielding the wheel to \(yieldedTo) — it holds a newer claim")
+        emit("yield", [("to", .s(yieldedTo)), ("via", .s("peer-claim"))])
+        return previousTier
+    }
     if defendedPanel == nil { captureConsolePanel() } else { defendConsolePanel() }
     let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
     let home = atHome(cfg: cfg)
@@ -1728,6 +2015,53 @@ func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Ti
             : placeRide(on: t, canvas: canvas, hidpi: hidpi, driver: me.id, content: measured)
     }
     return tier
+}
+
+// MARK: - Who holds the wheel, fleet-wide
+
+// Ask every machine that COULD be driving whether it is. Answering this used to
+// require SSHing to each Mac by hand and remembering where the flag lives; there
+// was no fleet-wide view of driver state anywhere in the system, which is why
+// two drivers could run for a day without anything noticing.
+struct WheelSurvey {
+    let claimants: [String]      // machines holding a driving flag, config order
+    let unreachable: [String]    // machines that could not be asked
+    let claims: [String: Double] // id -> claim stamp, where one was readable
+}
+
+// The flag's EXISTENCE is what makes a machine a driver; the stamp only decides
+// who wins. An unstamped flag (older build, or a write that lost its contents)
+// still drives, so the probe reports the two facts separately — "CLAIM=" alone
+// cannot tell an empty flag from a missing one.
+func parseWheelProbe(_ out: String) -> (flag: Bool, claim: Double?)? {
+    guard let line = out.components(separatedBy: .newlines)
+            .first(where: { $0.hasPrefix("FLAG=") }) else { return nil }
+    return (line.dropFirst("FLAG=".count).trimmingCharacters(in: .whitespaces) == "yes",
+            parseClaimReadback(out))
+}
+
+func surveyWheel(cfg: Config, me: Machine) -> WheelSurvey {
+    let peers = otherViewers(cfg: cfg, me: me)
+    let probe = "echo \"FLAG=$([ -f \"\(wheelDir)/driving\" ] && echo yes || echo no)\"; "
+              + "echo \"CLAIM=$(cat \"\(wheelDir)/driving\" 2>/dev/null)\""
+    let out = forEachPeer(peers, deadline: 15) { p in
+        // force: a survey must probe, not report a cached "unreachable" verdict.
+        let r = peerRun(p, probe, timeout: 10, force: true)
+        return r.code == 0 ? parseWheelProbe(r.out) : nil
+    }
+    var claimants: [String] = [], unreachable: [String] = [], claims: [String: Double] = [:]
+    if FileManager.default.fileExists(atPath: drivingFlag.path) {
+        claimants.append(me.id)
+        if let c = readDriverClaim() { claims[me.id] = c }
+    }
+    for p in peers {   // config order, so the report is stable run to run
+        guard let answer = out[p.id], let a = answer else { unreachable.append(p.id); continue }
+        if a.flag {
+            claimants.append(p.id)
+            if let c = a.claim { claims[p.id] = c }
+        }
+    }
+    return WheelSurvey(claimants: claimants, unreachable: unreachable, claims: claims)
 }
 
 // MARK: - Doctor
@@ -1840,6 +2174,22 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
     if !vnc.trimmingCharacters(in: .whitespaces).isEmpty {
         lines.append("✗ inbound session is VNC — use the Fluid entry"); failures += 1
     } else { lines.append("✓ no VNC session detected") }
+    // Two drivers is the failure nothing ever detected: it was only ever visible
+    // as passengers behaving oddly, and doctor only probed TARGETS, so a viewer
+    // like air13 holding a second claim was outside everything it looked at.
+    let wheelState = surveyWheel(cfg: cfg, me: me)
+    if wheelState.claimants.count > 1 {
+        lines.append("✗ TWO DRIVERS: \(wheelState.claimants.joined(separator: " and ")) both hold a claim"
+                   + " — run Drive from Here on the one you want")
+        failures += 1
+    } else if let only = wheelState.claimants.first {
+        lines.append("✓ one driver: \(only)")
+    } else {
+        lines.append("✓ nobody is driving")
+    }
+    for id in wheelState.unreachable {
+        lines.append("! \(id) unreachable — cannot confirm whether it holds the wheel")
+    }
     lines.append(failures == 0 ? "Doctor: ready" : "Doctor: \(failures) failure(s)")
     return (lines.joined(separator: "\n"), failures)
 }
@@ -1915,6 +2265,26 @@ func runDaemon(cfg: Config) -> Never {
     let wake = DispatchSemaphore(value: 0)
     let stateWatcher = StateWatcher(wake: wake)   // held for the process lifetime
     stateWatcher.start()
+    // Event-driven, so the daemon learns the topology moved the moment it moves
+    // rather than up to reconcileSeconds later -- and so a change we did NOT
+    // cause is recorded as evidence. Attributing display changes was the whole
+    // difficulty on 2026-08-18/19: a stale Jump viewer renegotiates resolution
+    // at unpredictable intervals and looked exactly like MIRA misbehaving.
+    //
+    // Our own writes fire this callback too. A breaker that reset on those
+    // could never trip, so only external changes clear it.
+    displayReconfigured = { flags in
+        // The callback fires twice per change; the begin pass carries no state.
+        if flags.contains(.beginConfigurationFlag) { return }
+        let ours = Date().timeIntervalSince(lastSelfDisplayWrite) < 3
+        log("display reconfigured — \(ours ? "ours" : "EXTERNAL (not MIRA)")")
+        emit("display_reconfig", [("ours", .b(ours)), ("flags", .n(Double(flags.rawValue)))])
+        if !ours { rec.breaker.reset() }
+        wake.signal()
+    }
+    CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
+        displayReconfigured?(flags)
+    }, nil)
     // Wall-clock deadlines rather than per-iteration decrements: the loop is
     // woken early now, so counting iterations would fire the heartbeat far
     // more often than heartbeatSeconds. distantPast = due immediately, which
@@ -2019,6 +2389,10 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     var scrollTap: CFMachPort?
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // Only the daemon used to set this, so every event the menu app emitted
+        // — including "claim", the most important one to be able to attribute —
+        // landed in the log as machine "?".
+        eventMachineID = me.id
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         rebuild()
         installScrollTap()
@@ -2073,7 +2447,12 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         let m = NSMenu()
         let excluded = loadExcluded()
         let riding = macPassengers(cfg: cfg, me: me).filter { !excluded.contains($0.id) }.count
-        let header = driving ? "Driving \(riding) passenger\(riding == 1 ? "" : "s")" : "Parked"
+        // Every machine now knows who holds the wheel, not just whether it does
+        // itself. Before this there was no fleet-wide driver state anywhere:
+        // two menu bars could both show a steering wheel and neither could say so.
+        let elsewhere = wheelHolder(wheel: readWheel(), me: me.id, ttl: cfg.rideTTLSeconds)
+        let header = driving ? "Driving \(riding) passenger\(riding == 1 ? "" : "s")"
+                             : (elsewhere.map { "Parked — \($0) is driving" } ?? "Parked")
         m.addItem(withTitle: header, action: nil, keyEquivalent: "")
         m.addItem(.separator())
         if driving {
@@ -2251,7 +2630,7 @@ extension MenuApp {
         let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
         let cfg = self.cfg, me = self.me
         DispatchQueue.global().async { [self] in
-            _ = stopOtherDrivers(cfg: cfg, me: me)
+            let handoff = stopOtherDrivers(cfg: cfg, me: me)
             let excluded = loadExcluded()
             let targets = macPassengers(cfg: cfg, me: me).filter { !excluded.contains($0.id) }
             // An explicit drive overrides any walk-up, so there is nothing to
@@ -2262,7 +2641,15 @@ extension MenuApp {
             }
             let opened = openSessionWindows(cfg: cfg, me: me, targets: targets)
             DispatchQueue.main.async {
-                self.notify("Driving: \(opened)/\(targets.count) sessions open (\(canvas))")
+                // Say it when the handoff was not clean. Silence here is what
+                // let "could not reach air13 to stop its driving flag" sit in
+                // a log file while the fleet ran with two drivers.
+                var msg = "Driving: \(opened)/\(targets.count) sessions open (\(canvas))"
+                if !handoff.unreachable.isEmpty {
+                    msg += "\n\(handoff.unreachable.joined(separator: ", ")) "
+                         + "could not be stopped — will yield on waking"
+                }
+                self.notify(msg)
                 self.rebuild()
             }
         }
@@ -2277,7 +2664,14 @@ extension MenuApp {
     }
     @objc func stop() {
         try? FileManager.default.removeItem(at: drivingFlag)
+        try? FileManager.default.removeItem(at: wheelFile)
         for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
+        // Release the wheel everywhere too, so no other menu bar goes on
+        // naming a driver that has parked.
+        let cfg = self.cfg, me = self.me
+        DispatchQueue.global().async {
+            _ = forEachPeer(otherViewers(cfg: cfg, me: me)) { clearWheel(on: $0) }
+        }
         sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")   // close the viewer locally
         notify("Stopped driving — passengers return to console")
         rebuild()
@@ -2370,6 +2764,33 @@ func selftest() -> Never {
     expect(shElapsed < 4, "sh() timeout is enforced despite an orphan holding the pipe "
                         + "(took \(String(format: "%.1f", shElapsed))s)")
     expect(shR.code == 124, "sh() reports 124 on timeout")
+    // ---- converge circuit breaker ----
+    // The 2026-08-19 incident in miniature: 1,924 identical failures, each one
+    // tearing down the owner's display, because nothing counted them. The same
+    // failure repeated is not new information and must stop the loop.
+    var br = ConvergeBreaker(limit: 3)
+    expect(br.shouldAttempt, "a fresh breaker attempts")
+    br.record("virtual has no mode")
+    br.record("virtual has no mode")
+    expect(br.shouldAttempt, "under the limit it keeps trying")
+    expect(br.record("virtual has no mode"), "the trip is reported on the tick it happens")
+    expect(!br.shouldAttempt, "identical failure x3 stops the loop")
+    expect(!br.record("virtual has no mode"), "staying tripped does not re-report (no log spam)")
+    var br2 = ConvergeBreaker(limit: 3)
+    br2.record("virtual has no mode")
+    br2.record("virtual is not main")
+    expect(br2.streak == 1 && br2.shouldAttempt,
+           "a DIFFERENT failure is new information: the count restarts")
+    var br3 = ConvergeBreaker(limit: 2)
+    br3.record("x"); br3.record("x")
+    expect(!br3.shouldAttempt, "tripped after the limit")
+    br3.record(nil)
+    expect(br3.shouldAttempt && br3.streak == 0, "a success clears the breaker")
+    var br4 = ConvergeBreaker(limit: 2)
+    br4.record("x"); br4.record("x")
+    br4.reset()
+    expect(br4.shouldAttempt, "reset clears it (new lease, or the topology moved under us)")
+
     // ---- event log (JSONL, transition-only, size-capped) ----
     // Every bug chased on 2026-08-16/17 was invisible in the human log: we could
     // see "converged=false" but not why, and nothing recorded that a lease
@@ -2418,6 +2839,62 @@ func selftest() -> Never {
     expect(driverYields(myClaim: nil, theirClaim: 100),
            "no claim of our own: any explicit claim wins")
     expect(!driverYields(myClaim: nil, theirClaim: nil), "no claims at all: nothing to yield to")
+    // The wheel beacon. driverYields only ever ran in the .passenger branch of
+    // tick(), which is reached only when a RIDE lands — and rides only go to
+    // machines with the "target" role. air13 is roles:["viewer"], so no driver
+    // ever placed anything on it and the "older claimant still yields on its
+    // own" safety net documented above did not cover it at all. On 2026-08-19
+    // air13 was asleep when air15 claimed ("could not reach air13 to stop its
+    // driving flag"), so it kept the wheel, woke up still holding it, and drove
+    // alongside air15. The beacon is the ride's equivalent for machines that
+    // never ride: it carries a claim and nothing else.
+    let beaconAir15 = Wheel(driver: "air15", claimedAt: 200, ts: now)
+    expect(wheelYields(me: "air13", myClaim: 100, wheel: beaconAir15),
+           "a viewer that never receives rides still yields to a newer claim")
+    expect(!wheelYields(me: "air13", myClaim: 300, wheel: beaconAir15),
+           "our newer claim survives an older beacon")
+    expect(!wheelYields(me: "air15", myClaim: 200, wheel: beaconAir15),
+           "our own beacon echoed back never unseats us")
+    expect(!wheelYields(me: "air13", myClaim: 100, wheel: nil),
+           "no beacon -> nothing to yield to")
+    expect(wheelYields(me: "air13", myClaim: nil, wheel: beaconAir15),
+           "an unstamped flag (older build, or a failed write) yields to any real claim")
+    // Display only: a beacon whose driver stopped talking must stop claiming
+    // the menu bar. It must NEVER expire the yield above — a stale beacon that
+    // could hand the wheel back is how two drivers come back.
+    expect(wheelHolder(wheel: beaconAir15, me: "air13", ttl: 90, now: now + 10) == "air15",
+           "a fresh beacon names the driver")
+    expect(wheelHolder(wheel: beaconAir15, me: "air13", ttl: 90, now: now + 120) == nil,
+           "a beacon older than the TTL names nobody")
+    expect(wheelHolder(wheel: beaconAir15, me: "air15", ttl: 90, now: now + 10) == nil,
+           "our own beacon is not someone else driving")
+    // The claim read-back. A false positive here makes a driver yield to a peer
+    // that holds nothing, leaving NOBODY driving — so every unparseable form
+    // must read as "no claim", not as a number.
+    expect(parseClaimReadback("CLAIM=1787180657.5\n") == 1787180657.5, "a stamped claim reads back")
+    expect(parseClaimReadback("CLAIM=\n") == nil, "an absent flag is no claim, not 0")
+    expect(parseClaimReadback("CLAIM=   \n") == nil, "whitespace is no claim")
+    expect(parseClaimReadback("") == nil, "no read-back line at all is no claim")
+    expect(parseClaimReadback("mkdir: permission denied\n") == nil, "stderr noise is no claim")
+    expect(parseClaimReadback("CLAIM=garbage\n") == nil, "an unstamped legacy flag is no claim")
+    expect(parseClaimReadback("CLAIM=0\n") == nil, "zero is not a real claim")
+    expect(parseClaimReadback("CLAIM=-5\n") == nil, "a negative claim is junk")
+    expect(parseClaimReadback("CLAIM=nan\n") == nil, "NaN never outranks a real claim")
+    expect(parseClaimReadback("CLAIM=inf\n") == nil, "infinity never outranks a real claim")
+    expect(parseClaimReadback("some noise\nCLAIM=42\nmore noise\n") == 42,
+           "the claim line is found among other output")
+    // ...and the guard that matters: junk must not unseat a live driver.
+    expect(!driverYields(myClaim: 100, theirClaim: parseClaimReadback("CLAIM=\n")),
+           "a peer holding no claim never takes the wheel")
+    // Flag existence, not the stamp, is what makes a machine a driver.
+    expect(parseWheelProbe("FLAG=yes\nCLAIM=42\n")?.flag == true, "a stamped flag is a driver")
+    expect(parseWheelProbe("FLAG=yes\nCLAIM=42\n")?.claim == 42, "and its stamp is read")
+    expect(parseWheelProbe("FLAG=yes\nCLAIM=\n")?.flag == true,
+           "an UNSTAMPED flag is still a driver — the survey must not miss it")
+    expect(parseWheelProbe("FLAG=yes\nCLAIM=\n")?.claim == nil, "with no stamp to compare")
+    expect(parseWheelProbe("FLAG=no\nCLAIM=\n")?.flag == false, "no flag is not a driver")
+    expect(parseWheelProbe("ssh: connect refused\n") == nil,
+           "an unanswered probe is unreachable, never 'not driving'")
     // peer backoff: a sleeping machine must not cost a connection attempt every beat
     expect(backoffSeconds(consecutiveFailures: 0) == 0, "healthy peer is never skipped")
     expect(backoffSeconds(consecutiveFailures: 1) == 15, "first failure backs off 15s")
@@ -2543,6 +3020,21 @@ func selftest() -> Never {
     let cfg = loadConfig()
     expect(cfg.machines.count >= 3, "config has machines")
     expect(cfg.canvases[cfg.dockedCanvas] != nil, "docked canvas defined")
+    // The structural gap itself, pinned: the set of machines that can hold the
+    // wheel is NOT the set that receives rides. Anything that fans out only
+    // over macPassengers cannot reach every machine that might be driving.
+    let anyMe = cfg.machines.first(where: { $0.roles.contains("viewer") })!
+    let viewerIDs = Set(otherViewers(cfg: cfg, me: anyMe).map { $0.id })
+    let passengerIDs = Set(macPassengers(cfg: cfg, me: anyMe).map { $0.id })
+    expect(!viewerIDs.subtracting(passengerIDs).isEmpty,
+           "a machine can drive but never receives a ride — the beacon is why it exists")
+    for m in cfg.machines where m.roles.contains("viewer") && m.id != anyMe.id {
+        expect(viewerIDs.contains(m.id), "wheel push reaches viewer \(m.id)")
+    }
+    expect(!viewerIDs.contains(anyMe.id), "we never push the wheel to ourselves")
+    for m in cfg.machines where !m.roles.contains("viewer") {
+        expect(!viewerIDs.contains(m.id), "wheel push skips passenger-only \(m.id)")
+    }
 
     // A laptop canvas IS the Jump viewer's FULLSCREEN CONTENT AREA in points.
     // Not the panel, and not panel/2: on a notched Mac, macOS lays fullscreen
@@ -2674,6 +3166,13 @@ case "status":
                            now: Date().timeIntervalSince1970)
     let driving = FileManager.default.fileExists(atPath: drivingFlag.path)
     var line = "machine: \(me.id)  mode: \(mode)  driving: \(driving)"
+    if let w = readWheel() {
+        let age = Int(Date().timeIntervalSince1970 - w.ts)
+        line += "  wheel: \(w.driver) (claim \(String(format: "%.0f", w.claimedAt)), beacon \(age)s old)"
+    } else {
+        line += "  wheel: no beacon"
+    }
+    if driving { line += "  ourClaim: \(readDriverClaim().map { String(format: "%.0f", $0) } ?? "UNSTAMPED")" }
     if driving {
         line += readSessionMarker() == bootEpoch()
             ? "  windows: opened this boot"
@@ -2683,7 +3182,11 @@ case "status":
 case "drive":
     let cfg = loadConfig(); let me = selfMachine(cfg)
     claimDriver(me: me)
-    for id in stopOtherDrivers(cfg: cfg, me: me) { print("\(id): stopped driving") }
+    let handoff = stopOtherDrivers(cfg: cfg, me: me)
+    for id in handoff.stopped { print("\(id): stopped driving") }
+    for id in handoff.unreachable {
+        print("\(id): UNREACHABLE — still holds its claim, yields on its first reachable beat")
+    }
     let engine = DisplayEngine()
     let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
     let targets = macPassengers(cfg: cfg, me: me)
@@ -2699,10 +3202,35 @@ case "drive":
     let opened = openSessionWindows(cfg: cfg, me: me, targets: targets)
     print(opened > 0 ? "opened \(opened) session window(s)"
                      : "no windows opened — use the MIRA menu (Drive from Here / Reopen Session Windows)")
+case "wheel":
+    // "Who is driving?" — the question that took an evening of hand-SSH to
+    // answer on 2026-08-19, and the fastest way to confirm a handoff landed.
+    let cfg = loadConfig(); let me = selfMachine(cfg)
+    let s = surveyWheel(cfg: cfg, me: me)
+    func stamp(_ id: String) -> String {
+        s.claims[id].map { "  claim \(String(format: "%.0f", $0))" } ?? "  claim UNSTAMPED"
+    }
+    switch s.claimants.count {
+    case 0: print("nobody is driving")
+    case 1: print("driver: \(s.claimants[0])\(stamp(s.claimants[0]))")
+    default:
+        print("TWO DRIVERS — this is the bug:")
+        for id in s.claimants { print("  \(id)\(stamp(id))") }
+        let winner = s.claimants.max(by: { (s.claims[$0] ?? 0) < (s.claims[$1] ?? 0) })
+        print("newest claim: \(winner ?? "?") — the others yield on their next reachable beat")
+    }
+    for id in s.unreachable { print("\(id): unreachable — cannot confirm") }
+    if let w = readWheel() {
+        print("local beacon: \(w.driver) (claim \(String(format: "%.0f", w.claimedAt)), "
+            + "\(Int(Date().timeIntervalSince1970 - w.ts))s old)")
+    }
+    exit(s.claimants.count > 1 ? 1 : 0)
 case "stop":
     let cfg = loadConfig(); let me = selfMachine(cfg)
     try? FileManager.default.removeItem(at: drivingFlag)
+    try? FileManager.default.removeItem(at: wheelFile)
     for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
+    _ = forEachPeer(otherViewers(cfg: cfg, me: me)) { clearWheel(on: $0) }
     sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")   // close the viewer locally
     print("stopped — passengers return to console")
 case "console":

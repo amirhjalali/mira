@@ -112,3 +112,25 @@ start editing numbers. Symptom map:
 - The doctor VNC check (`screensharingd` >5% CPU) produced one failure that did
   not reproduce seconds later, with no process and no ESTABLISHED :5900. Likely
   a transient; if it recurs, it is a false positive worth tightening.
+
+## A display symptom that is not a display problem
+
+2026-08-18, after rebooting air15: "the mac mini resolution looks a little
+funny". Nothing was wrong with any canvas. The mini had a **driving claim**
+stamped at 21:27:38 — newer than air15's — so it rejected every incoming ride as
+stale, destroyed its virtual display and fell back to its own 1920x1080 console.
+The size was correct for what it had become: a driver with no passengers.
+
+The mini is `roles: ["target"]`. It must never drive. But `claimDriver()` asked
+nobody, "Drive from Here" sat in its menu, and `mira drive` worked on its command
+line. One stray claim on a passenger-only machine strands the fleet, and the
+symptom points at the display.
+
+Now: `mayDrive(roles:)` gates the claim, the daemon clears such a flag at start
+so it cannot survive a reboot, and the menu offers "Passenger only — cannot
+drive" instead of the wheel. All selftested.
+
+**Read the mode before the pixels.** `mira status` on the machine that looks
+wrong answers this in one line: a passenger that says `driving: false` and names
+a canvas is being driven; anything else is an arbitration problem, not a
+geometry one.

@@ -129,10 +129,25 @@ func readDriverClaim() -> Double? {
     return Double(s.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
+// Only a viewer may take the wheel. The mini is roles:["target"] -- it has no
+// business driving anything -- but "Drive from Here" was reachable in its menu
+// and the drive verb on its command line, neither of which asked. One stray
+// claim there (2026-08-18 21:27:38) outranked air15's, so the mini rejected
+// every ride as stale, tore down its virtual display and dropped to its own
+// 1920x1080 console: "the mac mini resolution looks a little funny". A
+// passenger-only machine must be structurally incapable of this. Selftested.
+func mayDrive(roles: [String]) -> Bool { roles.contains("viewer") }
+
 // Claiming the wheel is one act: stamp the claim AND drop any ride another
 // driver left on us. Without the second half our own next tick reads that ride,
 // concludes we are a passenger, and deletes the flag we just wrote.
-func claimDriver() {
+func claimDriver(me: Machine) {
+    guard mayDrive(roles: me.roles) else {
+        log("refusing to drive: \(me.id) is roles=\(me.roles.joined(separator: ",")) — passenger-only")
+        emit("drive_refused", [("id", .s(me.id))])
+        try? FileManager.default.removeItem(at: drivingFlag)
+        return
+    }
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
     let now = Date().timeIntervalSince1970
     try? String(now).write(to: drivingFlag, atomically: true, encoding: .utf8)
@@ -1884,6 +1899,12 @@ func runDaemon(cfg: Config) -> Never {
     let rec = Reconciler(cfg: cfg)
     rec.startWatchers()
     eventMachineID = rec.me.id
+    // A claim that should never have existed must not survive a reboot either.
+    if !mayDrive(roles: rec.me.roles), FileManager.default.fileExists(atPath: drivingFlag.path) {
+        try? FileManager.default.removeItem(at: drivingFlag)
+        log("cleared a driving claim on \(rec.me.id): passenger-only machines never drive")
+        emit("drive_claim_cleared", [("id", .s(rec.me.id))])
+    }
     log("mira daemon started on \(rec.me.id) (driver+passenger roles: \(rec.me.roles))")
     emit("start", [("roles", .s(rec.me.roles.joined(separator: "+")))])
     var tier: Tier = .standard
@@ -2058,8 +2079,12 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         if driving {
             m.addItem(withTitle: "Stop Driving", action: #selector(stop), keyEquivalent: "d").target = self
             m.addItem(withTitle: "Reopen Session Windows", action: #selector(reopenWindows), keyEquivalent: "r").target = self
-        } else {
+        } else if mayDrive(roles: me.roles) {
             m.addItem(withTitle: "Drive from Here", action: #selector(drive), keyEquivalent: "d").target = self
+        } else {
+            // Do not offer the wheel to a machine that must never take it: one
+            // stray click on the mini was enough to strand the whole fleet.
+            m.addItem(withTitle: "Passenger only — cannot drive", action: nil, keyEquivalent: "")
         }
         m.addItem(.separator())
         for t in macPassengers(cfg: cfg, me: me) {
@@ -2221,7 +2246,7 @@ func rideablePassengers(cfg: Config, me: Machine) -> [Machine] {
 extension MenuApp {
     @objc func drive() {
         try? FileManager.default.removeItem(at: handbackFile)   // explicit drive overrides walk-up
-        claimDriver()
+        claimDriver(me: me)
         let engine = DisplayEngine()
         let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
         let cfg = self.cfg, me = self.me
@@ -2552,6 +2577,12 @@ func selftest() -> Never {
            "an implausible measurement cannot shrink a passenger")
     expect(rideCanvas(base: seedCanvas, ride: nil).height == 932, "no measurement -> config seed")
     expect(rideCanvas(base: seedCanvas, ride: measuredRide).hidpi, "measurement never changes hidpi")
+    // Only viewers drive. The mini claiming the wheel is what made its display
+    // "look funny": rides rejected as stale, virtual display destroyed, console.
+    expect(mayDrive(roles: ["viewer", "target"]), "a viewer may drive")
+    expect(mayDrive(roles: ["viewer"]), "a viewer-only machine may drive")
+    expect(!mayDrive(roles: ["target"]), "a target-only machine may never drive")
+    expect(!mayDrive(roles: []), "no roles -> no driving")
     // Sticky measurement: the flap that bounced passengers between measured and seed.
     let measured903 = ContentArea(w: 1440, h: 903)
     expect(adoptMeasurement(previous: measured903, observed: nil) == measured903,
@@ -2651,7 +2682,7 @@ case "status":
     print(line)
 case "drive":
     let cfg = loadConfig(); let me = selfMachine(cfg)
-    claimDriver()
+    claimDriver(me: me)
     for id in stopOtherDrivers(cfg: cfg, me: me) { print("\(id): stopped driving") }
     let engine = DisplayEngine()
     let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)

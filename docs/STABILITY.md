@@ -62,6 +62,23 @@ Every automatic behavior must fail toward *doing nothing*:
 
 ## Incident log
 
+- 2026-08-18: the Air (passenger, panel + virtual) blinked once a minute all
+  morning. Cause: mirroring the panel onto the virtual WITHOUT an explicit
+  mode made CG negotiate a mode all members share — panel and virtual share
+  none, so the virtual was left modeless (CGDisplayCopyDisplayMode == nil,
+  bounds still 3440x1440 so the invariant passed) and WindowServer reclaimed
+  it ~30 s later; the reconciler rebuilt it every tick-after-death. Headless
+  mini (no mirror) was immune. Fix: the virtual's mode now rides in the same
+  display transaction as the mirror; invariant gained a "virtual has no mode"
+  check; every reconverge logs WHICH invariant check broke. Diagnosed by
+  sampling CGGetOnlineDisplayList every 2 s (px=0 on the virtual, then gone).
+- 2026-08-17: the Pro's first day as a closed-lid passenger flapped through
+  Clamshell Sleep / DarkWake every few seconds all evening (display off/on;
+  session stutter). Assertions can't beat clamshell sleep (proven 07-22).
+  The Air rode clamshell fine because it already had `pmset disablesleep 1`;
+  the Pro never got it — it had always been the driver. Fix: disablesleep=1
+  on the Pro. Convention: EVERY laptop that can be driven gets
+  `sudo pmset -a disablesleep 1` at onboarding (candidate for add-machine.sh).
 - 2026-07-19: v1 login agent stole displays at physical login (invisible-apps).
   Root cause: unconditional display mutation. Led to v2 reconciler design.
 - 2026-07-22 AM: macOS 26.5.2 stripped TCC on both passengers; no signal

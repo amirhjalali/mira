@@ -332,6 +332,223 @@ func matchesJumpViewer(_ argv: String) -> Bool {
     argv.range(of: jumpViewerPattern, options: .regularExpression) != nil
 }
 
+// MARK: - The measurement everything hangs off
+
+// A canvas is not a preference. It is the size of the hole the picture is poured
+// into: the Jump viewer's content rect on the driver's panel, in points. Every
+// "the resolution is wrong / it doesn't fill the screen" round has been a
+// hand-typed constant drifting away from that hole. panel/2 is itself wrong on
+// any notched Mac -- macOS lays fullscreen content out BELOW the camera, so a
+// 1440x932 panel gives a 1440x903 viewer (measured on air15, 2026-08-18) -- and
+// the constant went stale again whenever a mode, a machine, or an unrelated
+// commit moved (45f0502 set it right, 7df68eb silently reverted it).
+//
+// So the rule is: config SEEDS the canvas, measurement OWNS it.
+struct ContentArea: Codable, Equatable { let w: Int; let h: Int }
+
+// Jump puts up a connection bar and a toolbar strip beside the real session
+// window (measured 1440x29 and 1440x32 against the true 1440x903 content).
+// Treating either as the canvas would collapse every passenger to a sliver, so
+// take the largest window that actually covers the screen. Pure and selftested.
+func pickViewerContent(windows: [ContentArea], screen: ContentArea,
+                       minCoverage: Double = 0.6) -> ContentArea? {
+    let screenArea = Double(screen.w * screen.h)
+    guard screenArea > 0 else { return nil }
+    return windows
+        .filter { Double($0.w * $0.h) / screenArea >= minCoverage }
+        .max { ($0.w * $0.h) < ($1.w * $1.h) }
+}
+
+// A measured canvas only overrides the seed when it is plausibly a session:
+// a garbage measurement must never be able to shrink a passenger to nothing.
+func rideCanvas(base: Canvas, ride: Ride?) -> Canvas {
+    guard let w = ride?.canvasW, let h = ride?.canvasH, w >= 600, h >= 400 else { return base }
+    return Canvas(width: w, height: h, hidpi: base.hidpi)
+}
+
+// A measurement is STICKY. observedViewerContent() returns nil whenever the
+// session window is not on screen right now -- a Space switch, a reconnect, a
+// minimise -- and letting that nil fall back to the config seed makes the
+// passenger rebuild its display twice per flap. That is the "resolution bounces
+// from here to there" the user sees; the picture is only ever as stable as the
+// least stable input. So: once measured, keep it until a DIFFERENT plausible
+// measurement replaces it.
+//
+// The deadband stops the other thrash: a one-point window nudge is not worth
+// tearing down and rebuilding a virtual display for. Pure and selftested.
+func adoptMeasurement(previous: ContentArea?, observed: ContentArea?, slack: Int = 2) -> ContentArea? {
+    guard let seen = observed else { return previous }
+    guard let prev = previous else { return seen }
+    let moved = abs(seen.w - prev.w) > slack || abs(seen.h - prev.h) > slack
+    return moved ? seen : prev
+}
+
+func mainScreenPoints() -> ContentArea {
+    let b = CGDisplayBounds(CGMainDisplayID())
+    return ContentArea(w: Int(b.width), h: Int(b.height))
+}
+
+func observedViewerContent() -> ContentArea? {
+    let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return nil }
+    var wins: [ContentArea] = []
+    for w in info {
+        guard let owner = w[kCGWindowOwnerName as String] as? String,
+              owner == "Jump Desktop",
+              let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+              let width = b["Width"], let height = b["Height"] else { continue }
+        wins.append(ContentArea(w: Int(width), h: Int(height)))
+    }
+    return pickViewerContent(windows: wins, screen: mainScreenPoints())
+}
+
+// MARK: - Defending the driver's own panel
+
+// Jump renegotiates display modes on BOTH ends of a session, so the driver's own
+// screen is not safe either: air15's panel was replaced with 1920x1200 @1x twice
+// in 40 minutes while a session was live (2026-08-18), silently undoing the fix
+// each time. Passengers get re-asserted every tick; the console panel had no
+// defender at all.
+struct PanelMode: Equatable { let w: Int; let h: Int; let px: Int; let py: Int; let hz: Double }
+
+// Only fight back when the new mode is objectively WORSE -- 1x where we had
+// HiDPI, or an aspect the panel does not have. A deliberate resolution change by
+// the user is a legitimate choice and must be left alone. Pure and selftested.
+func panelModeIsWorse(saved: PanelMode, now: PanelMode, nativeAspect: Double,
+                      tolerance: Double = 0.01) -> Bool {
+    if saved == now { return false }
+    let lostHiDPI = saved.px >= saved.w * 2 && now.px < now.w * 2
+    let nowAspect = now.h > 0 ? Double(now.w) / Double(now.h) : 0
+    return lostHiDPI || abs(nowAspect - nativeAspect) > tolerance
+}
+
+// BSD ps prints elapsed time as [[dd-]hh:]mm:ss. Pure and selftested.
+func parseETime(_ s: String) -> Double? {
+    var days = 0.0
+    var rest = s
+    if let dash = rest.firstIndex(of: "-") {
+        guard let d = Double(rest[rest.startIndex..<dash]) else { return nil }
+        days = d
+        rest = String(rest[rest.index(after: dash)...])
+    }
+    let parts = rest.split(separator: ":").map { Double($0) ?? -1 }
+    guard !parts.contains(-1), parts.count == 2 || parts.count == 3 else { return nil }
+    let secs = parts.count == 3 ? parts[0] * 3600 + parts[1] * 60 + parts[2]
+                                : parts[0] * 60 + parts[1]
+    return days * 86400 + secs
+}
+
+func currentPanelMode(_ d: CGDirectDisplayID) -> PanelMode? {
+    guard let m = CGDisplayCopyDisplayMode(d) else { return nil }
+    return PanelMode(w: m.width, h: m.height, px: m.pixelWidth, py: m.pixelHeight, hz: m.refreshRate)
+}
+
+// Native aspect = the aspect of the densest mode the panel offers.
+func nativePanelAspect(_ d: CGDirectDisplayID) -> Double? {
+    let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+    guard let modes = CGDisplayCopyAllDisplayModes(d, opts) as? [CGDisplayMode],
+          let biggest = modes.max(by: { $0.pixelWidth * $0.pixelHeight < $1.pixelWidth * $1.pixelHeight }),
+          biggest.pixelHeight > 0 else { return nil }
+    return Double(biggest.pixelWidth) / Double(biggest.pixelHeight)
+}
+
+// Anything that can take the screen away from us, NAMED, so a defense is
+// attributable instead of mysterious. Deliberately not a kill list: screensharingd
+// is launchd-managed and simply respawns (the same reason `pkill -f JumpConnect`
+// was recorded as futile), and it is also the way back into a machine that is not
+// in front of you. The defender does not care who moved the mode -- it restores it
+// either way -- so what is actually missing here is a name to go quit.
+func screenTakers() -> [String] {
+    var found: [String] = []
+    if !sh("netstat -an 2>/dev/null | grep -E '\\.5900[ ].*ESTABLISHED' | head -1").out
+        .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        found.append("VNC session on :5900")
+    }
+    if sh("pgrep -x screensharingd >/dev/null").code == 0 { found.append("screensharingd") }
+    if sh("pgrep -x sidecar-relay >/dev/null").code == 0 { found.append("Sidecar") }
+    let proxies = sh("ps -Ao etime,command | grep '[d]esktopproxy'").out
+        .split(separator: "\n").compactMap { line -> String? in
+            let f = line.trimmingCharacters(in: .whitespaces).split(separator: " ").first.map(String.init)
+            guard let secs = f.flatMap(parseETime) else { return nil }
+            return String(format: "inbound Jump session (%.1fh)", secs / 3600)
+        }
+    found.append(contentsOf: proxies)
+    return found
+}
+
+var defendedPanel: PanelMode?
+var lastRefusedBaseline: PanelMode?
+var lastMeasuredContent: ContentArea?
+
+// Only ever baseline a SANE mode. Taking the wheel while the panel is already
+// wrong (1x, or an aspect the panel does not have) would otherwise enshrine the
+// damage as the thing we defend, and the defender would sit quiet forever.
+func panelModeIsSane(_ m: PanelMode, nativeAspect: Double, tolerance: Double = 0.01) -> Bool {
+    let isHiDPI = m.px >= m.w * 2
+    let aspect = m.h > 0 ? Double(m.w) / Double(m.h) : 0
+    return isHiDPI && abs(aspect - nativeAspect) <= tolerance
+}
+
+func captureConsolePanel() {
+    let d = CGMainDisplayID()
+    guard let now = currentPanelMode(d), let native = nativePanelAspect(d) else { return }
+    guard panelModeIsSane(now, nativeAspect: native) else {
+        if lastRefusedBaseline != now {
+            lastRefusedBaseline = now
+            log("console panel is \(now.w)x\(now.h) px=\(now.px)x\(now.py) — not a sane baseline,"
+              + " waiting for a HiDPI native-aspect mode before defending it")
+        }
+        return
+    }
+    defendedPanel = now
+    log("console panel baseline \(now.w)x\(now.h) px=\(now.px)x\(now.py)")
+}
+
+func defendConsolePanel() {
+    guard FileManager.default.fileExists(atPath: drivingFlag.path) else { defendedPanel = nil; return }
+    let d = CGMainDisplayID()
+    guard let saved = defendedPanel, let now = currentPanelMode(d),
+          let aspect = nativePanelAspect(d),
+          panelModeIsWorse(saved: saved, now: now, nativeAspect: aspect) else { return }
+    guard let mode = matchMode(display: d, w: saved.w, h: saved.h, hz: saved.hz, px: saved.px) else {
+        log("console panel changed to \(now.w)x\(now.h) px=\(now.px) — cannot restore \(saved.w)x\(saved.h)")
+        return
+    }
+    var cfgRef: CGDisplayConfigRef?
+    CGBeginDisplayConfiguration(&cfgRef)
+    CGConfigureDisplayWithDisplayMode(cfgRef, d, mode, nil)
+    let ok = CGCompleteDisplayConfiguration(cfgRef, .permanently) == .success
+    let takers = screenTakers()
+    log("console panel changed under us to \(now.w)x\(now.h) px=\(now.px)x\(now.py)"
+      + " — restored \(saved.w)x\(saved.h) ok=\(ok)"
+      + (takers.isEmpty ? " (no screen-taking agent found — suspect the live Jump session)"
+                        : " — on screen right now: \(takers.joined(separator: ", "))"))
+    emit("panel_defended", [("was", .s("\(now.w)x\(now.h)@\(now.px)")), ("restored", .b(ok))])
+}
+
+// MARK: - Anti-stream guard
+
+// pkill sends SIGTERM, and an AppKit app can simply never act on it: a stale
+// viewer survived 14h24m of a passenger firing this guard every 15 s
+// (2026-08-18) while holding sessions into two other machines and renegotiating
+// their resolutions. That is why "the guard never worked" twice over -- the
+// pattern always matched, the signal was just ignored. Signal, VERIFY, escalate.
+@discardableResult
+func killJumpViewer() -> Bool {
+    func alive() -> Bool { sh("pgrep -f '\(jumpViewerPattern)' >/dev/null").code == 0 }
+    guard alive() else { return true }
+    sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")
+    usleep(1_200_000)
+    guard alive() else { return true }
+    log("viewer ignored SIGTERM — escalating to SIGKILL")
+    sh("pkill -9 -f '\(jumpViewerPattern)' 2>/dev/null")
+    usleep(500_000)
+    let stillAlive = alive()
+    if stillAlive { log("viewer SURVIVED SIGKILL — this passenger is still streaming outward") }
+    emit("stream_guard", [("escalated", .b(true)), ("killed", .b(!stillAlive))])
+    return !stillAlive
+}
+
 // MARK: - Ride (a driver's claim on this passenger)
 
 struct Ride: Codable {
@@ -343,6 +560,10 @@ struct Ride: Codable {
     // receiver decide whether this ride outranks its own claim. Optional so a
     // ride from an older build still decodes — it simply never unseats anyone.
     let claimedAt: Double?
+    // The driver's MEASURED viewer content area, in points. Optional so an older
+    // build still decodes (it simply falls back to the config seed).
+    var canvasW: Int? = nil
+    var canvasH: Int? = nil
     func isLive(ttl: Double, now: Double = Date().timeIntervalSince1970) -> Bool {
         now - ts < ttl
     }
@@ -1117,7 +1338,10 @@ final class Reconciler {
                 emit("lease_recv", [("drv", .s(r.driver)), ("canvas", .s(r.canvas)),
                                     ("age", .n(Date().timeIntervalSince1970 - r.ts))])
             }
-            guard let canvas = cfg.canvases[canvasKey] else { return }
+            // Measurement owns the size; the config entry is only the seed used
+            // until the driver has a viewer window to measure.
+            guard let seed = cfg.canvases[canvasKey] else { return }
+            let canvas = rideCanvas(base: seed, ride: ride)
             let wantHi = hidpi && canvas.hidpi
             // A passenger never streams outward — enforce repeatedly, not just
             // on transition (the viewer can be relaunched under us). Held at
@@ -1125,7 +1349,7 @@ final class Reconciler {
             // fast now so rides converge instantly, and three process spawns a
             // second on a laptop is a battery cost with no benefit.
             if Date() >= nextStreamGuard {
-                sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")
+                killJumpViewer()
                 nextStreamGuard = Date().addingTimeInterval(15)
             }
             let broken = engine.passengerInvariantFailure(canvas: canvas, hidpi: wantHi)
@@ -1136,7 +1360,7 @@ final class Reconciler {
             captureArrangement(engine: engine)
             applyHygiene()
             holdDisplayAwake()                                 // wake+hold display stack
-            sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")          // never stream outward
+            killJumpViewer()                                   // never stream outward
             guard engine.ensureVirtual(canvas: canvas) else { log("virtual create FAILED"); return }
             engine.unmirrorAll()
             _ = engine.setVirtualMode(canvas: canvas, hidpi: wantHi)
@@ -1375,9 +1599,11 @@ func stopOtherDrivers(cfg: Config, me: Machine) -> [String] {
     return stopped
 }
 
-func placeRide(on target: Machine, canvas: String, hidpi: Bool, driver: String) -> Bool {
+func placeRide(on target: Machine, canvas: String, hidpi: Bool, driver: String,
+               content: ContentArea? = nil) -> Bool {
     let ride = Ride(driver: driver, canvas: canvas, hidpi: hidpi,
-                    ts: Date().timeIntervalSince1970, claimedAt: readDriverClaim())
+                    ts: Date().timeIntervalSince1970, claimedAt: readDriverClaim(),
+                    canvasW: content?.w, canvasH: content?.h)
     guard let d = try? JSONEncoder().encode(ride),
           let json = String(data: d, encoding: .utf8) else { return false }
     let dir = "$HOME/Library/Application Support/MIRA"
@@ -1460,6 +1686,7 @@ func targetWalkedUp(_ t: Machine, cfg: Config) -> Bool {
 var liveRideHiDPI: [String: Bool] = [:]
 
 func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Tier) -> Tier {
+    if defendedPanel == nil { captureConsolePanel() } else { defendConsolePanel() }
     let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
     let home = atHome(cfg: cfg)
     let docked = canvas == (me.dockedCanvas ?? cfg.dockedCanvas)
@@ -1472,9 +1699,18 @@ func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Ti
         }
     }
     let hidpi = tierWantsHiDPI(tier) && loadSettings().hidpiRides
+    // Close the loop: what the passengers render is what this viewer actually
+    // shows, re-measured every tick. A mode change, a notch, a window resize or
+    // a new machine corrects itself here instead of waiting to be noticed by eye.
+    let measured = adoptMeasurement(previous: lastMeasuredContent, observed: observedViewerContent())
+    if let m = measured, m != lastMeasuredContent {
+        lastMeasuredContent = m
+        log("viewer content area measured \(m.w)x\(m.h) — canvas follows it")
+        emit("content_measured", [("w", .n(Double(m.w))), ("h", .n(Double(m.h)))])
+    }
     _ = forEachPeer(macPassengers(cfg: cfg, me: me)) { t in
         targetWalkedUp(t, cfg: cfg) ? false
-            : placeRide(on: t, canvas: canvas, hidpi: hidpi, driver: me.id)
+            : placeRide(on: t, canvas: canvas, hidpi: hidpi, driver: me.id, content: measured)
     }
     return tier
 }
@@ -1544,6 +1780,45 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
         for t in macPassengers(cfg: cfg, me: me)
         where !FileManager.default.fileExists(atPath: sessionAlias(for: t.id).path) {
             lines.append("! no session alias for \(t.id) — File > Export in Jump Desktop, put \(t.id).jump in \(aliasesDir.path)")
+        }
+    }
+    // Geometry. Every round of "the resolution is wrong" happened while doctor
+    // said ready, because doctor had never once looked at a screen.
+    let mainD = CGMainDisplayID()
+    if let now = currentPanelMode(mainD), let native = nativePanelAspect(mainD) {
+        let isHiDPI = now.px >= now.w * 2
+        let aspect = now.h > 0 ? Double(now.w) / Double(now.h) : 0
+        let aspectOK = abs(aspect - native) <= 0.01
+        if isHiDPI && aspectOK {
+            lines.append("✓ console panel \(now.w)x\(now.h) HiDPI at native aspect")
+        } else {
+            lines.append("✗ console panel \(now.w)x\(now.h) px=\(now.px)x\(now.py)"
+                + (isHiDPI ? "" : " is NOT HiDPI (1x renders small and soft)")
+                + (aspectOK ? "" : String(format: " — aspect %.3f, panel is %.3f (bars at the edges)", aspect, native)))
+            failures += 1
+        }
+    }
+    if FileManager.default.fileExists(atPath: drivingFlag.path) {
+        if let seen = observedViewerContent() {
+            lines.append("✓ viewer content area \(seen.w)x\(seen.h) — canvas follows this measurement")
+        } else {
+            lines.append("! driving but no Jump viewer window found to measure — passengers are on the config seed")
+        }
+    }
+    for taker in screenTakers() where !taker.hasPrefix("inbound Jump") {
+        lines.append("! \(taker) can renegotiate this Mac's resolution")
+    }
+    // A long-lived inbound session is not cosmetic: it renegotiates this Mac's
+    // resolution whenever it goes active. One at 14h24m is what spent an evening
+    // undoing every fix (2026-08-18).
+    for line in sh("ps -Ao etime,command | grep '[d]esktopproxy'").out.split(separator: "\n") {
+        let field = line.trimmingCharacters(in: .whitespaces).split(separator: " ").first.map(String.init)
+        guard let secs = field.flatMap(parseETime) else { continue }
+        if secs > 12 * 3600 {
+            lines.append(String(format: "✗ inbound Jump session open %.1fh — it renegotiates this Mac's display; quit the viewer holding it", secs / 3600))
+            failures += 1
+        } else if secs > 4 * 3600 {
+            lines.append(String(format: "! inbound Jump session open %.1fh", secs / 3600))
         }
     }
     let vnc = sh("ps -Aro pcpu,comm | awk '$2 ~ /screensharingd/ && $1+0 > 5'").out
@@ -2243,6 +2518,84 @@ func selftest() -> Never {
     let cfg = loadConfig()
     expect(cfg.machines.count >= 3, "config has machines")
     expect(cfg.canvases[cfg.dockedCanvas] != nil, "docked canvas defined")
+
+    // A laptop canvas IS the Jump viewer's FULLSCREEN CONTENT AREA in points.
+    // Not the panel, and not panel/2: on a notched Mac, macOS lays fullscreen
+    // content out BELOW the camera, so the content area is shorter than the
+    // screen by safeAreaInsets.top. Measured on air15 2026-08-18 with the panel
+    // in its native-aspect 1440x932 mode: NSScreen frame 1440x932, safeArea top
+    // 28, Jump content window y=29 h=903. A canvas taller than that makes Jump
+    // scale the image down to fit and pillarbox it -- "the screen isn't fully
+    // used" -- while every log still reads converged=true.
+    //
+    // History: set to panel/2 (1440x932) in 45f0502, reverted to the 16:10
+    // legacy 1710x1068 by the unrelated 7df68eb, corrected to the measured
+    // content area here. Diagnosed by eye three times before this gate existed.
+    // Re-measure with NSScreen.frame + safeAreaInsets + CGWindowListCopyWindowInfo
+    // whenever a viewer's panel mode changes; a guess is what caused every round.
+    // The measurement that now owns the canvas.
+    let screen1440 = ContentArea(w: 1440, h: 932)
+    expect(pickViewerContent(windows: [ContentArea(w: 1440, h: 29), ContentArea(w: 1440, h: 32),
+                                       ContentArea(w: 1440, h: 903)], screen: screen1440)
+           == ContentArea(w: 1440, h: 903), "viewer content is the session window, not the toolbars")
+    expect(pickViewerContent(windows: [ContentArea(w: 1440, h: 29)], screen: screen1440) == nil,
+           "a toolbar strip alone is never the canvas")
+    expect(pickViewerContent(windows: [], screen: screen1440) == nil, "no viewer window -> no measurement")
+    let seedCanvas = Canvas(width: 1440, height: 932, hidpi: true)
+    let measuredRide = Ride(driver: "air15", canvas: "laptop-air", hidpi: true, ts: 1, claimedAt: nil,
+                            canvasW: 1440, canvasH: 903)
+    let junkRide = Ride(driver: "air15", canvas: "laptop-air", hidpi: true, ts: 1, claimedAt: nil,
+                        canvasW: 1440, canvasH: 29)
+    expect(rideCanvas(base: seedCanvas, ride: measuredRide).height == 903,
+           "measured content beats the config seed")
+    expect(rideCanvas(base: seedCanvas, ride: junkRide).height == 932,
+           "an implausible measurement cannot shrink a passenger")
+    expect(rideCanvas(base: seedCanvas, ride: nil).height == 932, "no measurement -> config seed")
+    expect(rideCanvas(base: seedCanvas, ride: measuredRide).hidpi, "measurement never changes hidpi")
+    // Sticky measurement: the flap that bounced passengers between measured and seed.
+    let measured903 = ContentArea(w: 1440, h: 903)
+    expect(adoptMeasurement(previous: measured903, observed: nil) == measured903,
+           "a momentarily missing viewer window keeps the last measurement")
+    expect(adoptMeasurement(previous: nil, observed: measured903) == measured903,
+           "first measurement is adopted")
+    expect(adoptMeasurement(previous: measured903, observed: ContentArea(w: 1440, h: 904)) == measured903,
+           "a one-point nudge does not rebuild a display")
+    expect(adoptMeasurement(previous: measured903, observed: ContentArea(w: 1280, h: 800))
+           == ContentArea(w: 1280, h: 800), "a real resize is adopted")
+    expect(adoptMeasurement(previous: nil, observed: nil) == nil, "nothing measured yet stays nil")
+    // Console panel defense.
+    let airNative = 2880.0 / 1864.0
+    let goodMode = PanelMode(w: 1440, h: 932, px: 2880, py: 1864, hz: 60)
+    let jumpedMode = PanelMode(w: 1920, h: 1200, px: 1920, py: 1200, hz: 60)
+    let deliberate = PanelMode(w: 1280, h: 828, px: 2560, py: 1656, hz: 60)
+    expect(panelModeIsWorse(saved: goodMode, now: jumpedMode, nativeAspect: airNative),
+           "1x wrong-aspect mode is worse -> re-assert")
+    expect(!panelModeIsWorse(saved: goodMode, now: goodMode, nativeAspect: airNative),
+           "unchanged panel is not worse")
+    expect(!panelModeIsWorse(saved: goodMode, now: deliberate, nativeAspect: airNative),
+           "a deliberate native-aspect HiDPI change is left alone")
+    expect(panelModeIsSane(goodMode, nativeAspect: airNative), "native-aspect HiDPI is a sane baseline")
+    expect(!panelModeIsSane(jumpedMode, nativeAspect: airNative),
+           "a 1x wrong-aspect mode is never baselined as good")
+    // ps etime parsing, used to spot the session that renegotiates resolutions.
+    let hhmmss: Double = 51855      // 14:24:15, the session that undid every fix
+    let mmss: Double = 1244         // 20:44
+    let ddhhmmss: Double = 506_009  // 05-20:33:29
+    expect(parseETime("14:24:15") == hhmmss, "etime hh:mm:ss")
+    expect(parseETime("20:44") == mmss, "etime mm:ss")
+    expect(parseETime("05-20:33:29") == ddhhmmss, "etime dd-hh:mm:ss")
+    expect(parseETime("garbage") == nil, "etime rejects junk")
+    let viewerContentPoints: [String: (w: Int, h: Int)] = [
+        "laptop-air": (1440, 903),   // Air 15" M4, panel 2880x1864 @ 1440x932, notch inset 29
+        "laptop-pro": (1728, 1117),  // Pro 16": panel/2, UNMEASURED as a viewer -- notch inset
+                                     // likely applies here too when the pro drives
+    ]
+    for (key, want) in viewerContentPoints.sorted(by: { $0.key < $1.key }) {
+        guard let c = cfg.canvases[key] else { expect(false, "canvas \(key) defined"); continue }
+        expect(c.width == want.w && c.height == want.h,
+               "canvas \(key) matches viewer content area: \(c.width)x\(c.height) == \(want.w)x\(want.h)")
+    }
+
     // Starlink's LAN is 192.168.1.0/24 too — subnet alone must not mean "home"
     expect(homeVerdict(onHomeSubnet: true, gatewayMAC: "80:82:fe:34:40:dd",
                        expected: "80:82:FE:34:40:DD"), "home: subnet + right gateway")

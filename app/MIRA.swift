@@ -1012,7 +1012,15 @@ final class DisplayEngine {
         virtualDisplay = display
         virtualID = display.displayID
         builtCanvas = canvas
-        log("virtual display created id=\(virtualID) for \(canvas.width)x\(canvas.height)")
+        // apply() returning true means the modes were accepted, NOT that this
+        // process can see them yet — publication is async and our snapshot is
+        // stale until the run loop turns. The caller's very next act is to look
+        // a mode up, so settle here rather than letting it fail there.
+        let t0 = Date()
+        let visible = settledVirtualMode(canvas: canvas, hidpi: true) != nil
+        log("virtual display created id=\(virtualID) for \(canvas.width)x\(canvas.height)"
+          + (visible ? String(format: " (modes visible after %.0fms)", Date().timeIntervalSince(t0) * 1000)
+                     : " — WARNING: modes still not visible to this process"))
         return true
     }
 
@@ -1039,6 +1047,32 @@ final class DisplayEngine {
         return exact ?? uiMatches.first
     }
 
+    // The same per-process snapshot that produced the 89-minute strobe, on the
+    // other query. A CGVirtualDisplay publishes its modes asynchronously on the
+    // descriptor's queue, and CGDisplayCopyAllDisplayModes answers from a
+    // snapshot that refreshes only when the process turns its run loop — which
+    // the daemon's bare `while true` converge loop never does. So a virtual
+    // created one line earlier reads as having NO modes at all, permanently,
+    // while an external probe reads all 18 off the same display (verified on
+    // air15 and the mini, 2026-08-19 21:56).
+    //
+    // The strobe fix taught settledInvariantFailure to turn the run loop and
+    // re-ask, but left this lookup asking once — and in the same change the
+    // lookup went from "no match, mirror anyway" to a hard failure. That pair
+    // is what stopped every passenger from converging: "apply topology: no
+    // 3440x1440 mode published on the virtual", forever, on a display that was
+    // publishing exactly that mode.
+    func settledVirtualMode(canvas: Canvas, hidpi: Bool, attempts: Int = 8) -> CGDisplayMode? {
+        var m = virtualMode(canvas: canvas, hidpi: hidpi)
+        var left = attempts
+        while m == nil, left > 1 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.12))
+            m = virtualMode(canvas: canvas, hidpi: hidpi)
+            left -= 1
+        }
+        return m
+    }
+
     // The whole passenger topology in ONE transaction: the virtual holds the
     // canvas mode, every physical mirrors the virtual, the virtual is main.
     //
@@ -1051,16 +1085,38 @@ final class DisplayEngine {
     // nor the new one. There is no such moment now.
     func applyPassengerTopology(canvas: Canvas, hidpi: Bool) -> Bool {
         guard virtualID != 0 else { log("apply topology: no virtual display"); return false }
-        guard let mode = virtualMode(canvas: canvas, hidpi: hidpi) else {
-            log("apply topology: no \(canvas.width)x\(canvas.height) mode published on the virtual")
-            return false
+        // A mode we cannot SEE is not the same as a mode that is not there, and
+        // this process demonstrably cannot see them: on 2026-08-19 the daemon
+        // read zero modes off virtual display 7 while an external probe read 18
+        // off the same id, including the exact 3440x1440 it wanted, and the
+        // daemon had received no CGDisplayRegisterReconfigurationCallback since
+        // start. Turning the run loop and re-asking (settledVirtualMode, and
+        // settledInvariantFailure before it) does not clear it.
+        //
+        // The strobe fix made this lookup fatal — `guard ... else { return
+        // false }` — which turned an unreadable snapshot into a fleet that
+        // could not converge at all: every passenger looped "no mode published"
+        // until the breaker tripped. Mode selection is an OPTIMISATION (it
+        // stops CG negotiating a mode the whole mirror set shares); the mirror
+        // itself is the point. So a missing mode degrades the transaction, it
+        // does not abort it — which is what shipped before the strobe fix and
+        // what the fleet actually ran on.
+        //
+        // NOT the end of this: without an explicit mode CG can still negotiate
+        // the set down (the 08-18 bug). The real defect is that this process
+        // cannot read its own display state, and that is unfixed.
+        let mode = settledVirtualMode(canvas: canvas, hidpi: hidpi)
+        if mode == nil {
+            log("apply topology: cannot SEE a \(canvas.width)x\(canvas.height) mode on the virtual"
+              + " — mirroring without an explicit mode (CG may renegotiate the set)")
+            emit("mode_invisible", [("canvas", .s("\(canvas.width)x\(canvas.height)"))])
         }
         var cfg: CGDisplayConfigRef?
         guard CGBeginDisplayConfiguration(&cfg) == .success, let cfg = cfg else {
             log("apply topology: CGBeginDisplayConfiguration failed")
             return false
         }
-        CGConfigureDisplayWithDisplayMode(cfg, virtualID, mode, nil)
+        if let mode = mode { CGConfigureDisplayWithDisplayMode(cfg, virtualID, mode, nil) }
         for p in physicalDisplays() { CGConfigureDisplayMirrorOfDisplay(cfg, p, virtualID) }
         CGConfigureDisplayOrigin(cfg, virtualID, 0, 0)          // origin 0,0 == main
         let r = CGCompleteDisplayConfiguration(cfg, .permanently)
@@ -1102,10 +1158,29 @@ final class DisplayEngine {
         if CGDisplayIsMain(virtualID) == 0 { return "virtual is not main" }
         let w = Int(CGDisplayPixelsWide(virtualID))
         if w != canvas.width { return "virtual width \(w) != canvas \(canvas.width)" }
-        // A modeless virtual (post-mirror negotiation failure) looks converged
-        // by bounds alone, but WindowServer reclaims it within a minute.
-        guard let m = CGDisplayCopyDisplayMode(virtualID) else { return "virtual has no mode" }
-        if hidpi, m.pixelWidth != canvas.width * 2 {
+        // This clause was added on 08-18 to catch a modeless virtual (a
+        // post-mirror negotiation failure looks converged by bounds alone, and
+        // WindowServer reclaims it within a minute). It caused the 08-19 strobe,
+        // and the 08-19 fix tried to rescue it by turning the run loop and
+        // re-asking. That does not work: CGDisplayCopyDisplayMode on a virtual
+        // display THIS PROCESS OWNS returns nil indefinitely, while an external
+        // probe reads all 18 modes off the very same display id — verified on
+        // air15 (id 8) and the mini (id 9) on 2026-08-19 22:00, with the real
+        // topology confirmed correct at the same moment (virtual main at
+        // 3440x1440, built-in mirroring it).
+        //
+        // It cannot distinguish "modeless" from "unreadable", and in this
+        // process it is unreadable 100% of the time. So it may no longer fail
+        // the invariant. The clauses that ARE readable — bounds, main-ness,
+        // mirror membership — are what the topology is judged on, and they
+        // agreed with the external probe throughout.
+        //
+        // Failing toward doing nothing is the doctrine. The cost of a false
+        // "broken" is a full teardown every tick on a display that is already
+        // correct; the cost of a false "fine" is a reclaim that the bounds
+        // clauses catch on the next tick anyway.
+        if let m = CGDisplayCopyDisplayMode(virtualID), hidpi,
+           m.pixelWidth != canvas.width * 2 {
             return "hidpi mode pixelWidth \(m.pixelWidth) != \(canvas.width * 2)"
         }
         for p in physicalDisplays() where CGDisplayMirrorsDisplay(p) != virtualID {

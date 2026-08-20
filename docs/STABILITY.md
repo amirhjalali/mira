@@ -62,6 +62,37 @@ Every automatic behavior must fail toward *doing nothing*:
 
 ## Incident log
 
+- 2026-08-19 (evening): no passenger could converge at all. Every ride ended
+  `apply topology: no 3440x1440 mode published on the virtual` →
+  `converged=false — topology transaction failed`, on repeat until the breaker
+  tripped, then again on the next lease. Cause: **this process cannot read the
+  display state of a virtual display it owns.** An external probe read all 18
+  modes off virtual display id 8 — including the exact `3440x1440 px=6880x2880`
+  wanted — while the owning daemon read none off the same id, and
+  `CGDisplayCopyDisplayMode(virtualID)` returned nil indefinitely. Turning the
+  run loop and re-asking does not clear it (tried, deployed, measured: no
+  change). The daemon had received no `CGDisplayRegisterReconfigurationCallback`
+  since start.
+  What made an unreadable snapshot fatal was the morning's strobe fix, in two
+  places: the mode lookup became `guard ... else { return false }` where it had
+  been "no match, mirror anyway", and the 08-18 `CGDisplayCopyDisplayMode`
+  invariant clause was kept and merely wrapped in a settle.
+  Fixes: (1) a missing mode DEGRADES the transaction instead of aborting it —
+  mode selection only stops CG renegotiating the mirror set, the mirror itself
+  is the point. (2) the unreadable clause may no longer fail the invariant; the
+  clauses that ARE readable in-process (bounds, main-ness, mirror membership)
+  judge the topology, and they agreed with the external probe throughout.
+  Result: `converged=true` on air15 and the mini, topology externally verified
+  (virtual main at 3440x1440, physical mirroring it), and zero reconverges in
+  75 s where it had been flapping every 3–6 s.
+  Lesson, and it is the same one twice in a day: an invariant that cannot tell
+  "broken" from "unreadable" must never report "broken". Two fixes in a row
+  tried to make the unreadable read (settle, re-ask); both failed, because the
+  read is not late, it is unavailable. **Unfixed:** why a process cannot read
+  its own virtual display. Everything above works around that, it does not
+  solve it — and without an explicit mode CG can still renegotiate the set,
+  which is the 08-18 bug waiting to return.
+
 - 2026-08-19: the pro sat on extend for a day when the docked preference is
   duplicate. Cause: `restoreArrangement` called `unmirrorAll()` and `setMain()`
   BEFORE checking whether an arrangement had ever been saved, so the

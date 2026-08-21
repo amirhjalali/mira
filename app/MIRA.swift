@@ -999,6 +999,11 @@ final class DisplayEngine {
     // create-time property: publish both 2x and 1x modes under hiDPI so tier
     // changes are mode switches, not recreations.
     func ensureVirtual(canvas: Canvas) -> Bool {
+        // Same instrumentation: which engine, and what did it find on entry.
+        log("ensureVirtual entry — had=\(virtualDisplay != nil) id=\(virtualID) "
+          + "built=\(builtCanvas.map { "\($0.width)x\($0.height)" } ?? "nil") "
+          + "engine=\(UInt(bitPattern: ObjectIdentifier(self).hashValue) & 0xffff) "
+          + "pid=\(ProcessInfo.processInfo.processIdentifier)")
         if virtualDisplay != nil {
             // Reuse only if built for the same canvas; a live ride whose canvas
             // changed (driver undocks: ultrawide->laptop) must rebuild, else
@@ -1047,8 +1052,16 @@ final class DisplayEngine {
         return true
     }
 
-    func destroyVirtual() {
-        if virtualDisplay != nil { log("virtual display destroyed") }
+    // Instrumented 2026-08-21. air15 created 272 virtual displays in a morning
+    // while logging 3 destroys and 0 terminations — meaning virtualDisplay was
+    // nil at ensureVirtual 269 times with nothing having set it. That is not
+    // possible for a strong property with two assignment sites, so one of those
+    // premises is false and the log has to say which rather than me reasoning
+    // about it a third time. Logs UNCONDITIONALLY, with the caller and the
+    // engine identity.
+    func destroyVirtual(_ caller: String = #function, _ line: Int = #line) {
+        log("destroyVirtual from \(caller):\(line) — had=\(virtualDisplay != nil) id=\(virtualID) "
+          + "engine=\(UInt(bitPattern: ObjectIdentifier(self).hashValue) & 0xffff)")
         virtualDisplay = nil
         virtualID = 0
         builtCanvas = nil

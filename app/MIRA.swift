@@ -955,6 +955,26 @@ func routeAudio(passenger: Bool) {
 
 let miraVendorID: UInt32 = 0x4D49_5241 & 0xFFFF  // "RA" tail of 'MIRA'
 
+// CGVirtualDisplay delivers every callback it has — mode publication, state
+// changes, termination — on the queue given in its descriptor. That queue was
+// DispatchQueue.main, and the daemon NEVER RUNS THE MAIN RUN LOOP: runDaemon is
+// a bare `while true` that blocks in DispatchSemaphore.wait. Blocks dispatched
+// to main are therefore never delivered, in the one process whose whole job is
+// owning virtual displays.
+//
+// That single line accounts for all three symptoms chased on 08-19/20:
+//   * modes never became visible in-process, while an external probe read all
+//     18 off the same display id (publication callback never delivered);
+//   * the display was reclaimed and rebuilt every 30-45 s — 717 creations on
+//     air15 in one day, each with a fresh id — because a client that never
+//     services its queue is a client the framework stops waiting on;
+//   * `terminationHandler` logged ZERO times across those 717 teardowns, which
+//     is what made the teardown invisible and sent two days of fixes at the
+//     symptoms instead.
+// A private serial queue is serviced by libdispatch's own threads and needs no
+// run loop, which is what this always should have been.
+private let virtualDisplayQueue = DispatchQueue(label: "com.amir.mira.virtualdisplay")
+
 final class DisplayEngine {
     private var virtualDisplay: CGVirtualDisplay?
     private(set) var virtualID: CGDirectDisplayID = 0
@@ -995,8 +1015,11 @@ final class DisplayEngine {
         desc.serialNum = 1
         desc.productID = 0x4D32
         desc.vendorID = miraVendorID
-        desc.queue = DispatchQueue.main
-        desc.terminationHandler = { _, _ in log("virtual display terminated by system") }
+        desc.queue = virtualDisplayQueue   // NEVER DispatchQueue.main — see above
+        desc.terminationHandler = { _, _ in
+            log("virtual display terminated by system")
+            emit("virtual_terminated")
+        }
         guard let display = CGVirtualDisplay(descriptor: desc) else { return false }
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = 1

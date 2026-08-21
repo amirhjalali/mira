@@ -62,6 +62,39 @@ Every automatic behavior must fail toward *doing nothing*:
 
 ## Incident log
 
+- 2026-08-20: air15 rebuilt its virtual display **717 times in one day**, one
+  every ~46 s, and the mini spent the day on Jump Desktop's own 1920x1080
+  headless virtual instead of MIRA's canvas — which is what "both letterboxed"
+  actually was. Two causes, one of them two days old and one of them original.
+  **`desc.queue = DispatchQueue.main`.** CGVirtualDisplay delivers every
+  callback it has on that queue, and `runDaemon` is a bare `while true` blocked
+  in `DispatchSemaphore.wait` — it never runs the main run loop, so nothing
+  dispatched to main is ever delivered, in the one process whose whole job is
+  owning virtual displays. That single line accounts for all three symptoms
+  chased across 08-19/20: modes never became visible in-process while an
+  external probe read all 18 off the same display id (publication callback never
+  delivered); the framework reclaimed a client that never serviced its queue;
+  and `terminationHandler` logged ZERO times across 717 teardowns, which is what
+  made the teardown invisible and sent two days of fixes at symptoms instead of
+  the cause. Now a private serial queue, serviced by libdispatch's own threads,
+  needing no run loop.
+  **rideTTLSeconds 90 -> 300.** With the teardowns no longer silent the residue
+  was visible: leases arrived FRESH (age 0.04 s) but in 82-95 s gaps against a
+  90 s TTL, because beats cost 9-14 s. Every expiry dropped the passenger to
+  console, and a console fall destroys and rebuilds the virtual display — the
+  bounce. The TTL only has to fire when a driver DISAPPEARS; a deliberate Stop
+  deletes ride.json outright. Ten beats of slack for a safety net costs nothing.
+  Result: 7 minutes with 1 virtual created, 0 destroyed, 0 console falls on both
+  machines, both showing MIRA's canvas — against 745 converges/day before.
+  Lesson: three separate fixes went at "the display keeps failing" while the
+  event that would have named the cause was queued to a thread that never ran.
+  A callback you never receive is indistinguishable from an event that never
+  happens; if a lifecycle handler has never fired once, that is the bug, not
+  evidence of health.
+  **Still unfixed:** modes remain unreadable in-process even on the new queue,
+  so the mirror is still applied without an explicit mode and CG could yet
+  renegotiate the set (the 08-18 bug). It has not, but nothing prevents it.
+
 - 2026-08-19 (evening): no passenger could converge at all. Every ride ended
   `apply topology: no 3440x1440 mode published on the virtual` →
   `converged=false — topology transaction failed`, on repeat until the breaker

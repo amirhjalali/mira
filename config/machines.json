@@ -1,6 +1,7 @@
 {
   "comment": "The whole rig in one tracked file. A machine finds itself by unix user name.",
-  "rideTTLSeconds": 90,
+  "comment_rideTTL": "300, not 90. The TTL exists ONLY to return a passenger to console if the driver DISAPPEARS -- a deliberate Stop deletes ride.json outright (endRide), so this never gates the normal case. At 90 it gated the abnormal one constantly: beats cost 9-14s, leases landed in 82-95s gaps, and every expiry dropped the passenger to console, which DESTROYS AND REBUILDS the virtual display. That teardown is the visible bounce. 300 gives ten beats of slack for a safety net that only has to fire when a driver dies.",
+  "rideTTLSeconds": 300,
   "heartbeatSeconds": 30,
   "reconcileSeconds": 2,
   "presenceThresholdSeconds": 20,

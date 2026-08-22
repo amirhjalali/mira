@@ -1546,6 +1546,9 @@ final class Reconciler {
     var nextStreamGuard = Date.distantPast
     var loggedStaleRideFrom: String?
     var lastLeaseTS: Double?
+    // Expiry probe: is the driver actually gone, or are we just not hearing it?
+    var nextDriverProbe = Date.distantPast
+    var driverStillDriving = false
     // Stops the 2026-08-19 reconverge storm. Reset by anything that makes an
     // earlier "cannot converge" verdict stale.
     var breaker = ConvergeBreaker(limit: 5)
@@ -1677,8 +1680,43 @@ final class Reconciler {
                 emit("lease_expire", [("drv", .s(r.driver)),
                                       ("age", .n(Date().timeIntervalSince1970 - r.ts))])
             }
+            // A STALE ride is not the same as NO ride, and only one of them means
+            // the driver is gone. An explicit Stop deletes ride.json outright, so
+            // `ride == nil` is the deliberate case and still converges instantly.
+            // A ride that merely aged out means we stopped HEARING from a driver
+            // that may be perfectly alive — and on 2026-08-21 that is exactly what
+            // happened: pro beat every 31 s and logged no failure while air15 saw
+            // no new lease for 6.5 minutes, expired at 300.3 s, and tore its
+            // display down. The teardown was the damage; the missed rides were
+            // invisible to the user.
+            // So before dropping a live display, ASK whether the driver is
+            // actually gone. Failing toward doing nothing is the doctrine, and
+            // doing nothing here means keeping the picture the user is looking at.
+            if let r = ride, keepRidingDespiteExpiry(r) { return }
             convergeConsole()
         }
+
+    // Probe the driver, at most once a minute, and cache the verdict. Returns
+    // true = keep the display up. Unreachable counts as GONE (nil verdict ->
+    // false): if we cannot reach the driver, neither can its rides, and the
+    // console is the honest place to be.
+    func keepRidingDespiteExpiry(_ ride: Ride) -> Bool {
+        guard let drv = cfg.machines.first(where: { $0.id == ride.driver }) else { return false }
+        if Date() < nextDriverProbe { return driverStillDriving }
+        nextDriverProbe = Date().addingTimeInterval(60)
+        let r = peerRun(drv, "cat \"$HOME/Library/Application Support/MIRA/driving\" 2>/dev/null; echo",
+                        timeout: 8, force: true)
+        let holds = r.code == 0
+            && Double(r.out.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
+        if holds != driverStillDriving {
+            log(holds
+                ? "lease expired but \(ride.driver) still holds the wheel — keeping the display up"
+                : "lease expired and \(ride.driver) is not driving \(r.code == 0 ? "" : "(unreachable) ")— console")
+            emit("expiry_probe", [("drv", .s(ride.driver)), ("holds", .b(holds))])
+        }
+        driverStillDriving = holds
+        return holds
+    }
     }
 
     func convergeConsole() {
@@ -2121,9 +2159,20 @@ func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Ti
         log("viewer content area measured \(m.w)x\(m.h) — canvas follows it")
         emit("content_measured", [("w", .n(Double(m.w))), ("h", .n(Double(m.h)))])
     }
-    _ = forEachPeer(macPassengers(cfg: cfg, me: me)) { t in
-        targetWalkedUp(t, cfg: cfg) ? false
-            : placeRide(on: t, canvas: canvas, hidpi: hidpi, driver: me.id, content: measured)
+    // Every target must account for itself every beat. The result used to be
+    // discarded wholesale (`_ = forEachPeer`), so a target that got no ride left
+    // NO evidence unless placeRide itself failed loudly — and on 2026-08-21 pro
+    // beat 11 times in a row while air15 received nothing, with not one line
+    // written on either side. "Placed" is the only silent outcome now.
+    let targets = macPassengers(cfg: cfg, me: me)
+    let placed = forEachPeer(targets) { t -> String in
+        if targetWalkedUp(t, cfg: cfg) { return "skipped: walked up" }
+        return placeRide(on: t, canvas: canvas, hidpi: hidpi, driver: me.id,
+                         content: measured) ? "placed" : "FAILED"
+    }
+    for t in targets where placed[t.id] != "placed" {
+        log("ride not placed on \(t.id) this beat: \(placed[t.id] ?? "no answer within fan-out deadline")")
+        emit("ride_miss", [("id", .s(t.id)), ("why", .s(placed[t.id] ?? "fanout-deadline"))])
     }
     return tier
 }

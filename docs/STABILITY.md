@@ -62,6 +62,35 @@ Every automatic behavior must fail toward *doing nothing*:
 
 ## Incident log
 
+- 2026-08-21: air15 tore its display down at 23:49:59 and dropped to a non-MIRA
+  1080p display — the "resolution bounce" as the user actually experiences it.
+  Not a mystery this time; the instrumentation named it outright:
+  `destroyVirtual from convergeConsole():1695 — had=true id=3855`. MIRA did it
+  deliberately, because the ride had aged out.
+  Why it aged out is still open: pro beat every 31 s across the whole window and
+  logged no failure, while air15 recorded NO new lease for 6.5 minutes
+  (23:44:59 -> 23:51:31) and expired at exactly 300.3 s. Eleven consecutive
+  beats placed a ride that the passenger never saw, with not one line written on
+  either side. Ruled out: walk-up handback (zero occurrences on both machines),
+  stale Jump sessions (killing desktopproxy changed nothing), and the ride TTL
+  being wrong (it was 300 as intended).
+  Two changes:
+  (1) **A stale ride no longer tears the display down.** A ride that merely aged
+  out means we stopped HEARING a driver that may be perfectly alive; a
+  deliberate Stop deletes ride.json outright, so `ride == nil` remains the
+  instant-console case. On expiry the passenger now probes the driver once a
+  minute and keeps the picture up while that driver still holds the wheel.
+  Unreachable counts as gone — if we cannot reach the driver, neither can its
+  rides. The teardown was the damage; the missed rides were invisible.
+  (2) **A skipped ride can no longer be silent.** The fan-out result was
+  discarded wholesale, so "placed" and "never attempted" looked identical.
+  Every target now accounts for itself each beat and anything but "placed" is
+  logged and emitted.
+  Lesson: the TTL was written as "the driver is gone" but implemented as "we
+  have not heard from the driver", and those differ exactly when the network
+  misbehaves — which is the moment it does the most damage. An automatic
+  teardown must verify the condition it claims to detect, not a proxy for it.
+
 - 2026-08-20: air15 rebuilt its virtual display **717 times in one day**, one
   every ~46 s, and the mini spent the day on Jump Desktop's own 1920x1080
   headless virtual instead of MIRA's canvas — which is what "both letterboxed"

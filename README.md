@@ -20,8 +20,12 @@ inside the app.
   (displays, audio, arrangement, mirror topology) within 90 s. A reconciler
   re-asserts the whole invariant every 15 s, so hot-plugs and half-applied
   transitions converge instead of stranding.
-- **Walk-up handback**: open a driven laptop's lid (or type on it) and it
-  hands itself back to you — console restored, driver notified.
+- **Walk-up handback** (OFF by default): open a driven laptop's lid (or type on
+  it) and it hands itself back to you — console restored, driver notified.
+  Off because clicking **Drive from Here** on the machine you just sat down at
+  says the same thing explicitly, and already stops the other driver; the
+  heuristic fired on a mouse nudge and then held the machine out of the session
+  for `handbackHoldSeconds`. Toggle it per machine in the Settings menu.
 - **Reboot-proof**: the menu app is a login item; when a driving viewer
   reboots, it reopens the Jump session windows once per boot automatically
   (menu also has "Reopen Session Windows" for a mid-session mishap).

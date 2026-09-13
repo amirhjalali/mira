@@ -205,6 +205,8 @@ let hygieneFile = stateDir.appendingPathComponent("hygiene.json")
 let excludedFile = stateDir.appendingPathComponent("excluded.json")
 let healthFile = stateDir.appendingPathComponent("health.json")
 let viewerHealthFile = stateDir.appendingPathComponent("viewer-health.json")
+// Survives daemon restarts on purpose -- see PanelBaseline.
+let panelBaselineFile = stateDir.appendingPathComponent("console-panel.json")
 // Boot epoch at the time session windows were last opened; gates boot-resume.
 let sessionMarkerFile = stateDir.appendingPathComponent("sessions-opened")
 // Per-passenger Jump connection documents (File > Export in Jump Desktop,
@@ -231,11 +233,20 @@ let settingsFile = URL(fileURLWithPath: NSHomeDirectory())
 // Viewer-local settings, editable from the menu. Missing file = all defaults.
 struct Settings: Codable {
     var reverseScroll: Bool = true
-    var walkupHandback: Bool = true
+    // OFF by default since 2026-09-12. Walk-up handback guesses "a person sat
+    // down" from a burst of local input, and the guess is both unnecessary and
+    // expensive: clicking Drive from Here on the machine you are sitting at is
+    // the same statement of intent, explicitly, and it already stops the other
+    // driver and restores this machine's console. The heuristic meanwhile fires
+    // on a nudge of the mouse and then holds the machine out of the session for
+    // handbackHoldSeconds (600) -- observed on the pro 2026-09-12 18:53, which
+    // cost a converged passenger and a manual re-drive. Still toggleable per
+    // machine in the menu for anyone who wants it.
+    var walkupHandback: Bool = false
     var hidpiRides: Bool = true
     // Idle-time presence detection false-fired on injected input 2026-07-22
     // and kicked a live session. OFF until proven under the live-fire
-    // protocol (docs/STABILITY.md); lid-transition walk-up remains on.
+    // protocol (docs/STABILITY.md).
     var walkupPresence: Bool = false
 }
 
@@ -471,15 +482,31 @@ func observedViewerContent() -> ContentArea? {
 // defender at all.
 struct PanelMode: Equatable { let w: Int; let h: Int; let px: Int; let py: Int; let hz: Double }
 
-// Only fight back when the new mode is objectively WORSE -- 1x where we had
-// HiDPI, or an aspect the panel does not have. A deliberate resolution change by
-// the user is a legitimate choice and must be left alone. Pure and selftested.
-func panelModeIsWorse(saved: PanelMode, now: PanelMode, nativeAspect: Double,
+// Only fight back when the new mode is objectively WORSE THAN THE BASELINE --
+// 1x where the baseline was HiDPI, or a different shape than the baseline. A
+// deliberate resolution change by the user is a legitimate choice and must be
+// left alone. Pure and selftested.
+//
+// This compares against the baseline and NOT against the panel's "native"
+// aspect, because there is no trustworthy native aspect to compare with.
+// Measured on the pro 2026-09-12, with the BenQ mirroring the built-in:
+//
+//   BenQ (mirror master): screenSize 816.6x348.3mm -> 2.344, really 2.389
+//                         densest offered mode 3840x2160 -> 1.778, really 2.389
+//   built-in (mirrored):  screenSize 329.7x127.0mm -> 2.596, for a 1.547 panel
+//
+// A mirror set negotiates its own mode list and macOS reports the set's
+// geometry, not the glass. Judging a mirrored console against any of those
+// numbers is why the pro's own correct docked mode, 3440x1440, was refused as
+// "not a sane baseline" while the defender sat idle and a live Jump session
+// walked the panel down to 1280x960.
+func panelModeIsWorse(baseline: PanelMode, now: PanelMode,
                       tolerance: Double = 0.01) -> Bool {
-    if saved == now { return false }
-    let lostHiDPI = saved.px >= saved.w * 2 && now.px < now.w * 2
-    let nowAspect = now.h > 0 ? Double(now.w) / Double(now.h) : 0
-    return lostHiDPI || abs(nowAspect - nativeAspect) > tolerance
+    if baseline == now { return false }
+    let lostHiDPI = baseline.px >= baseline.w * 2 && now.px < now.w * 2
+    let a0 = baseline.h > 0 ? Double(baseline.w) / Double(baseline.h) : 0
+    let a1 = now.h > 0 ? Double(now.w) / Double(now.h) : 0
+    return lostHiDPI || abs(a1 - a0) > tolerance
 }
 
 // BSD ps prints elapsed time as [[dd-]hh:]mm:ss. Pure and selftested.
@@ -503,13 +530,12 @@ func currentPanelMode(_ d: CGDirectDisplayID) -> PanelMode? {
     return PanelMode(w: m.width, h: m.height, px: m.pixelWidth, py: m.pixelHeight, hz: m.refreshRate)
 }
 
-// Native aspect = the aspect of the densest mode the panel offers.
-func nativePanelAspect(_ d: CGDirectDisplayID) -> Double? {
-    let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
-    guard let modes = CGDisplayCopyAllDisplayModes(d, opts) as? [CGDisplayMode],
-          let biggest = modes.max(by: { $0.pixelWidth * $0.pixelHeight < $1.pixelWidth * $1.pixelHeight }),
-          biggest.pixelHeight > 0 else { return nil }
-    return Double(biggest.pixelWidth) / Double(biggest.pixelHeight)
+// Which panel the baseline describes. A baseline captured while mirrored means
+// nothing once the set is broken apart -- the mode list is the SET's, not the
+// panel's -- so the mirror state is part of the identity.
+func panelDisplayKey(_ d: CGDirectDisplayID) -> String {
+    "\(CGDisplayVendorNumber(d))-\(CGDisplayModelNumber(d))-\(CGDisplaySerialNumber(d))"
+        + (CGDisplayIsInMirrorSet(d) != 0 ? "-mirrored" : "")
 }
 
 // Anything that can take the screen away from us, NAMED, so a defense is
@@ -536,42 +562,65 @@ func screenTakers() -> [String] {
     return found
 }
 
-var defendedPanel: PanelMode?
-var lastRefusedBaseline: PanelMode?
 var lastMeasuredContent: ContentArea?
 
-// Only ever baseline a SANE mode. Taking the wheel while the panel is already
-// wrong (1x, or an aspect the panel does not have) would otherwise enshrine the
-// damage as the thing we defend, and the defender would sit quiet forever.
-func panelModeIsSane(_ m: PanelMode, nativeAspect: Double, tolerance: Double = 0.01) -> Bool {
-    let isHiDPI = m.px >= m.w * 2
-    let aspect = m.h > 0 ? Double(m.w) / Double(m.h) : 0
-    return isHiDPI && abs(aspect - nativeAspect) <= tolerance
+// The mode the console panel is SUPPOSED to be in. On disk, not in memory: the
+// pro's daemon restarted 2026-09-12 14:10 and forgot a baseline it had no way to
+// re-derive, which is the other half of why the BenQ sat at 1280x960 for hours.
+struct PanelBaseline: Codable, Equatable {
+    let display: String
+    let w: Int; let h: Int; let px: Int; let py: Int; let hz: Double
+    var mode: PanelMode { PanelMode(w: w, h: h, px: px, py: py, hz: hz) }
+    init(display: String, mode m: PanelMode) {
+        self.display = display
+        w = m.w; h = m.h; px = m.px; py = m.py; hz = m.hz
+    }
 }
 
-func captureConsolePanel() {
+func readPanelBaseline() -> PanelBaseline? {
+    guard let d = try? Data(contentsOf: panelBaselineFile) else { return nil }
+    return try? JSONDecoder().decode(PanelBaseline.self, from: d)
+}
+
+func writePanelBaseline(_ b: PanelBaseline) {
+    try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+    if let d = try? JSONEncoder().encode(b) { try? d.write(to: panelBaselineFile) }
+}
+
+// A mode on screen is only the USER'S mode when nobody is streaming this
+// machine. With a session live it may just as easily be the session's
+// renegotiation, so adopting then is how damage gets enshrined as the thing we
+// defend. Adopt at console with the coast clear, defend while a session is
+// live, re-adopt the moment it ends. Pure and selftested.
+func shouldAdoptBaseline(current: PanelMode, saved: PanelBaseline?,
+                         key: String, sessionLive: Bool) -> Bool {
+    if sessionLive { return false }
+    guard let s = saved else { return true }
+    return s.display != key || s.mode != current
+}
+
+// Runs at console on EVERY tick, driving or parked. It used to run only inside
+// driveTick, so a parked machine -- exactly the machine someone is looking at
+// through Jump -- had no defender at all. That is the pro on 2026-09-12: nobody
+// driving, session live from air13, mirror set renegotiated down to 1280x960,
+// and nothing in MIRA was watching.
+func guardConsolePanel() {
     let d = CGMainDisplayID()
-    guard let now = currentPanelMode(d), let native = nativePanelAspect(d) else { return }
-    guard panelModeIsSane(now, nativeAspect: native) else {
-        if lastRefusedBaseline != now {
-            lastRefusedBaseline = now
-            log("console panel is \(now.w)x\(now.h) px=\(now.px)x\(now.py) — not a sane baseline,"
-              + " waiting for a HiDPI native-aspect mode before defending it")
+    guard let now = currentPanelMode(d) else { return }
+    let key = panelDisplayKey(d)
+    let saved = readPanelBaseline()
+    if shouldAdoptBaseline(current: now, saved: saved, key: key,
+                           sessionLive: inboundSessionActive()) {
+        writePanelBaseline(PanelBaseline(display: key, mode: now))
+        if saved?.mode != now {
+            log("console panel baseline \(now.w)x\(now.h) px=\(now.px)x\(now.py) on \(key)")
         }
         return
     }
-    defendedPanel = now
-    log("console panel baseline \(now.w)x\(now.h) px=\(now.px)x\(now.py)")
-}
-
-func defendConsolePanel() {
-    guard FileManager.default.fileExists(atPath: drivingFlag.path) else { defendedPanel = nil; return }
-    let d = CGMainDisplayID()
-    guard let saved = defendedPanel, let now = currentPanelMode(d),
-          let aspect = nativePanelAspect(d),
-          panelModeIsWorse(saved: saved, now: now, nativeAspect: aspect) else { return }
-    guard let mode = matchMode(display: d, w: saved.w, h: saved.h, hz: saved.hz, px: saved.px) else {
-        log("console panel changed to \(now.w)x\(now.h) px=\(now.px) — cannot restore \(saved.w)x\(saved.h)")
+    guard let s = saved, s.display == key,
+          panelModeIsWorse(baseline: s.mode, now: now) else { return }
+    guard let mode = matchMode(display: d, w: s.w, h: s.h, hz: s.hz, px: s.px) else {
+        log("console panel changed to \(now.w)x\(now.h) px=\(now.px) — cannot restore \(s.w)x\(s.h)")
         return
     }
     var cfgRef: CGDisplayConfigRef?
@@ -580,7 +629,7 @@ func defendConsolePanel() {
     let ok = CGCompleteDisplayConfiguration(cfgRef, .permanently) == .success
     let takers = screenTakers()
     log("console panel changed under us to \(now.w)x\(now.h) px=\(now.px)x\(now.py)"
-      + " — restored \(saved.w)x\(saved.h) ok=\(ok)"
+      + " — restored \(s.w)x\(s.h) ok=\(ok)"
       + (takers.isEmpty ? " (no screen-taking agent found — suspect the live Jump session)"
                         : " — on screen right now: \(takers.joined(separator: ", "))"))
     emit("panel_defended", [("was", .s("\(now.w)x\(now.h)@\(now.px)")), ("restored", .b(ok))])
@@ -1052,6 +1101,40 @@ final class DisplayEngine {
             log("virtual canvas changed \(builtCanvas.map { "\($0.width)x\($0.height)" } ?? "?") -> \(canvas.width)x\(canvas.height); rebuilding")
             destroyVirtual()
         }
+        guard buildVirtual(canvas: canvas, soleMode: false) else { return false }
+        // apply() returning true means the modes were accepted, NOT that this
+        // process can see them yet — publication is async and our snapshot is
+        // stale until the run loop turns. The caller's very next act is to look
+        // a mode up, so settle here rather than letting it fail there.
+        let t0 = Date()
+        if settledVirtualMode(canvas: canvas, hidpi: true) != nil {
+            log("virtual display created id=\(virtualID) for \(canvas.width)x\(canvas.height)"
+              + String(format: " (modes visible after %.0fms)", Date().timeIntervalSince(t0) * 1000))
+            return true
+        }
+        // Modes we cannot SEE are modes we cannot SELECT, and CG then leaves the
+        // display on the largest mode it published — which, with the canvas*2
+        // entry in the list, is exactly twice the canvas IN POINTS. That is
+        // air15 and the mini on 2026-09-12: a freshly created 1280x800 virtual
+        // reporting 2560x1600, "virtual width 2560 != canvas 1280" five times,
+        // and the converge breaker then freezing both passengers at double size
+        // while the pro — whose modes did become visible — converged fine.
+        //
+        // So stop depending on the lookup. Offer the canvas as the ONLY mode:
+        // CG's default is then the canvas by construction, and nothing has to
+        // be selected or seen for the passenger to be the right size.
+        log("virtual display created id=\(virtualID) for \(canvas.width)x\(canvas.height)"
+          + " — modes not visible to this process; rebuilding with the canvas as its only mode")
+        emit("virtual_sole_mode", [("canvas", .s("\(canvas.width)x\(canvas.height)"))])
+        destroyVirtual()
+        guard buildVirtual(canvas: canvas, soleMode: true) else { return false }
+        log("virtual display rebuilt id=\(virtualID) with \(canvas.width)x\(canvas.height) as its only mode")
+        return true
+    }
+
+    // soleMode: publish ONLY the canvas mode, so CG cannot default to anything
+    // else. Used when this process cannot see the published modes — see above.
+    private func buildVirtual(canvas: Canvas, soleMode: Bool) -> Bool {
         let desc = CGVirtualDisplayDescriptor()
         desc.name = "MIRA"
         desc.maxPixelsWide = 6880
@@ -1069,26 +1152,17 @@ final class DisplayEngine {
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = 1
         var modes: [CGVirtualDisplayMode] = []
-        for c in [canvas] {
-            modes.append(CGVirtualDisplayMode(width: UInt32(c.width * 2),
-                                              height: UInt32(c.height * 2), refreshRate: 60))
-            modes.append(CGVirtualDisplayMode(width: UInt32(c.width),
-                                              height: UInt32(c.height), refreshRate: 60))
+        if !soleMode {
+            modes.append(CGVirtualDisplayMode(width: UInt32(canvas.width * 2),
+                                              height: UInt32(canvas.height * 2), refreshRate: 60))
         }
+        modes.append(CGVirtualDisplayMode(width: UInt32(canvas.width),
+                                          height: UInt32(canvas.height), refreshRate: 60))
         settings.modes = modes
         guard display.apply(settings) else { return false }
         virtualDisplay = display
         virtualID = display.displayID
         builtCanvas = canvas
-        // apply() returning true means the modes were accepted, NOT that this
-        // process can see them yet — publication is async and our snapshot is
-        // stale until the run loop turns. The caller's very next act is to look
-        // a mode up, so settle here rather than letting it fail there.
-        let t0 = Date()
-        let visible = settledVirtualMode(canvas: canvas, hidpi: true) != nil
-        log("virtual display created id=\(virtualID) for \(canvas.width)x\(canvas.height)"
-          + (visible ? String(format: " (modes visible after %.0fms)", Date().timeIntervalSince(t0) * 1000)
-                     : " — WARNING: modes still not visible to this process"))
         return true
     }
 
@@ -1200,7 +1274,29 @@ final class DisplayEngine {
         // Never discarded. A silent false here is how a converge used to fail
         // without leaving one line of evidence anywhere.
         if r != .success { log("apply topology: CGCompleteDisplayConfiguration error \(r.rawValue)") }
+        // "The real defect is that this process cannot read its own display
+        // state, and that is unfixed" — fixed here. A FRESH process reads the
+        // virtual's modes fine (verified on air15 and the mini 2026-08-19: an
+        // external probe saw all 18 off a display the daemon read as modeless),
+        // so when this process is blind, delegate the one thing it needs a mode
+        // for. Without it the framebuffer is right (2560x1600 for a 1280x800
+        // HiDPI canvas) but macOS presents it 1x, and the passenger comes up at
+        // exactly twice the canvas in points — air15 and the mini, 2026-09-12.
+        if r == .success, mode == nil { selectVirtualModeOutOfProcess(canvas: canvas, hidpi: hidpi) }
         return r == .success
+    }
+
+    // Runs `mira vmode <id> <w> <h> <px>` — a new process, a fresh CG snapshot.
+    func selectVirtualModeOutOfProcess(canvas: Canvas, hidpi: Bool) {
+        let exe = Bundle.main.executablePath ?? CommandLine.arguments.first ?? ""
+        guard !exe.isEmpty else { return }
+        let px = hidpi ? canvas.width * 2 : canvas.width
+        let res = sh("'\(exe)' vmode \(virtualID) \(canvas.width) \(canvas.height) \(px)", timeout: 15)
+        lastSelfDisplayWrite = Date()
+        log("out-of-process mode select for \(canvas.width)x\(canvas.height)@\(px)px: "
+          + res.out.trimmingCharacters(in: .whitespacesAndNewlines) + " (code \(res.code))")
+        emit("vmode_delegated", [("canvas", .s("\(canvas.width)x\(canvas.height)")),
+                                 ("ok", .b(res.code == 0))])
     }
 
     func unmirrorAll() {
@@ -1625,6 +1721,10 @@ final class Reconciler {
             }
             try? FileManager.default.removeItem(at: handbackFile)   // stale
         }
+
+        // Only meaningful at console: while a ride is converged the main display
+        // is the virtual one, which the ride re-asserts every tick anyway.
+        if engine.virtualID == 0 { guardConsolePanel() }
 
         let ride = readRide()
         let mode = computeMode(ride: ride, ttl: cfg.rideTTLSeconds,
@@ -2177,7 +2277,6 @@ func driveTick(cfg: Config, me: Machine, engine: DisplayEngine, previousTier: Ti
         emit("yield", [("to", .s(yieldedTo)), ("via", .s("peer-claim"))])
         return previousTier
     }
-    if defendedPanel == nil { captureConsolePanel() } else { defendConsolePanel() }
     let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
     let home = atHome(cfg: cfg)
     let docked = canvas == (me.dockedCanvas ?? cfg.dockedCanvas)
@@ -2334,17 +2433,23 @@ func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
     // Geometry. Every round of "the resolution is wrong" happened while doctor
     // said ready, because doctor had never once looked at a screen.
     let mainD = CGMainDisplayID()
-    if let now = currentPanelMode(mainD), let native = nativePanelAspect(mainD) {
-        let isHiDPI = now.px >= now.w * 2
-        let aspect = now.h > 0 ? Double(now.w) / Double(now.h) : 0
-        let aspectOK = abs(aspect - native) <= 0.01
-        if isHiDPI && aspectOK {
-            lines.append("✓ console panel \(now.w)x\(now.h) HiDPI at native aspect")
-        } else {
+    // Judged against the remembered baseline, never against a guessed "native"
+    // aspect: doctor used to fail the pro's correct 3440x1440 docked mode for
+    // being 1x and "the wrong aspect" for a mirror set whose reported geometry
+    // belongs to neither panel. See panelModeIsWorse.
+    if let now = currentPanelMode(mainD) {
+        let key = panelDisplayKey(mainD)
+        let base = readPanelBaseline()
+        if let b = base, b.display == key, panelModeIsWorse(baseline: b.mode, now: now) {
             lines.append("✗ console panel \(now.w)x\(now.h) px=\(now.px)x\(now.py)"
-                + (isHiDPI ? "" : " is NOT HiDPI (1x renders small and soft)")
-                + (aspectOK ? "" : String(format: " — aspect %.3f, panel is %.3f (bars at the edges)", aspect, native)))
+                + " — drifted from baseline \(b.w)x\(b.h) px=\(b.px)x\(b.py)"
+                + (screenTakers().isEmpty ? "" : " while \(screenTakers().joined(separator: ", ")) is on screen"))
             failures += 1
+        } else if let b = base, b.display == key {
+            lines.append("✓ console panel \(now.w)x\(now.h) px=\(now.px)x\(now.py) matches its baseline")
+        } else {
+            lines.append("! console panel \(now.w)x\(now.h) px=\(now.px)x\(now.py)"
+                + " — no baseline for this panel yet (the daemon adopts one on its next tick at console)")
         }
     }
     if FileManager.default.fileExists(atPath: drivingFlag.path) {
@@ -3334,19 +3439,43 @@ func selftest() -> Never {
            == ContentArea(w: 1280, h: 800), "a real resize is adopted")
     expect(adoptMeasurement(previous: nil, observed: nil) == nil, "nothing measured yet stays nil")
     // Console panel defense.
-    let airNative = 2880.0 / 1864.0
     let goodMode = PanelMode(w: 1440, h: 932, px: 2880, py: 1864, hz: 60)
     let jumpedMode = PanelMode(w: 1920, h: 1200, px: 1920, py: 1200, hz: 60)
     let deliberate = PanelMode(w: 1280, h: 828, px: 2560, py: 1656, hz: 60)
-    expect(panelModeIsWorse(saved: goodMode, now: jumpedMode, nativeAspect: airNative),
-           "1x wrong-aspect mode is worse -> re-assert")
-    expect(!panelModeIsWorse(saved: goodMode, now: goodMode, nativeAspect: airNative),
+    expect(panelModeIsWorse(baseline: goodMode, now: jumpedMode),
+           "1x mode is worse than a HiDPI baseline -> re-assert")
+    expect(!panelModeIsWorse(baseline: goodMode, now: goodMode),
            "unchanged panel is not worse")
-    expect(!panelModeIsWorse(saved: goodMode, now: deliberate, nativeAspect: airNative),
-           "a deliberate native-aspect HiDPI change is left alone")
-    expect(panelModeIsSane(goodMode, nativeAspect: airNative), "native-aspect HiDPI is a sane baseline")
-    expect(!panelModeIsSane(jumpedMode, nativeAspect: airNative),
-           "a 1x wrong-aspect mode is never baselined as good")
+    expect(!panelModeIsWorse(baseline: goodMode, now: deliberate),
+           "a deliberate same-shape HiDPI change is left alone")
+    // The pro, 2026-09-12. The BenQ's correct docked mode is 1x -- the panel has
+    // no HiDPI mode at all -- and the mode that replaced it was 2x. Every
+    // HiDPI-based test gets this exactly backwards; shape against the baseline
+    // gets it right.
+    let benqDocked = PanelMode(w: 3440, h: 1440, px: 3440, py: 1440, hz: 60)
+    let benqWalkedDown = PanelMode(w: 1280, h: 960, px: 2560, py: 1920, hz: 60)
+    expect(panelModeIsWorse(baseline: benqDocked, now: benqWalkedDown),
+           "4:3 1280x960 is worse than the 21:9 docked baseline (pro 2026-09-12)")
+    expect(!panelModeIsWorse(baseline: benqDocked, now: benqDocked),
+           "a 1x ultrawide at its docked mode is never fought")
+    // Baseline adoption: the coast has to be clear, or a renegotiated mode
+    // becomes the thing we defend.
+    let benqKey = "1000-2000-3000-mirrored"
+    let savedDocked = PanelBaseline(display: benqKey, mode: benqDocked)
+    expect(shouldAdoptBaseline(current: benqDocked, saved: nil, key: benqKey, sessionLive: false),
+           "first sane look with no session adopts a baseline")
+    expect(!shouldAdoptBaseline(current: benqWalkedDown, saved: savedDocked,
+                                key: benqKey, sessionLive: true),
+           "a mode seen while a session streams is never adopted")
+    expect(shouldAdoptBaseline(current: benqWalkedDown, saved: savedDocked,
+                               key: benqKey, sessionLive: false),
+           "with no session live the user's own change becomes the new baseline")
+    expect(shouldAdoptBaseline(current: benqDocked, saved: savedDocked,
+                               key: "9-9-9", sessionLive: false),
+           "a different panel does not inherit another panel's baseline")
+    expect(!shouldAdoptBaseline(current: benqDocked, saved: savedDocked,
+                                key: benqKey, sessionLive: false),
+           "an unchanged baseline is not rewritten every tick")
     // ps etime parsing, used to spot the session that renegotiates resolutions.
     let hhmmss: Double = 51855      // 14:24:15, the session that undid every fix
     let mmss: Double = 1244         // 20:44
@@ -3405,6 +3534,31 @@ func selftest() -> Never {
 
 let args = CommandLine.arguments
 switch args.count > 1 ? args[1] : "" {
+// Select a display mode from a FRESH process, whose CoreGraphics snapshot can
+// actually see a virtual display's published modes. Called by the daemon when
+// its own snapshot is blind — see selectVirtualModeOutOfProcess.
+case "vmode":
+    let a = CommandLine.arguments.dropFirst(2).compactMap { Int($0) }
+    guard a.count == 4 else { print("usage: mira vmode <displayID> <w> <h> <px>"); exit(2) }
+    let (did, w, h, px) = (CGDirectDisplayID(a[0]), a[1], a[2], a[3])
+    let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+    let all = (CGDisplayCopyAllDisplayModes(did, opts) as? [CGDisplayMode]) ?? []
+    guard !all.isEmpty else { print("no modes visible on \(did) either"); exit(1) }
+    let want = all.first { $0.width == w && $0.height == h && $0.pixelWidth == px }
+        ?? all.first { $0.width == w && $0.height == h }
+    guard let target = want else {
+        print("saw \(all.count) modes on \(did) but none at \(w)x\(h)"); exit(1)
+    }
+    var vcfg: CGDisplayConfigRef?
+    guard CGBeginDisplayConfiguration(&vcfg) == .success, let vcfg = vcfg else {
+        print("CGBeginDisplayConfiguration failed"); exit(1)
+    }
+    CGConfigureDisplayWithDisplayMode(vcfg, did, target, nil)
+    let vr = CGCompleteDisplayConfiguration(vcfg, .permanently)
+    print(vr == .success
+          ? "set \(target.width)x\(target.height) px=\(target.pixelWidth) (of \(all.count) modes)"
+          : "CGCompleteDisplayConfiguration error \(vr.rawValue)")
+    exit(vr == .success ? 0 : 1)
 case "selftest": selftest()
 case "--daemon": runDaemon(cfg: loadConfig())
 case "status":

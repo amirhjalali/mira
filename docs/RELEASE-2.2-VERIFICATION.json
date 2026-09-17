@@ -1,0 +1,239 @@
+{
+  "verifiedAt": 1789441858.8490932,
+  "release": {
+    "build": "20260914.7",
+    "version": "2.2.0",
+    "binarySHA256": "c3bc1880d1a2c2158f12e58e87db19e7770022fe722ceceb65d7f4e407f6cf91",
+    "sources": {
+      "app/MIRA.swift": "4be9058cc670fc7a81ffbebc1c8d86433a0bc0c35e1af96695592f92b6faa2e0",
+      "app/Reliability.swift": "3b4f530717f0bafcaf2989380a0ab6bf4f5f7dfce6ded762918b6437e07426e2",
+      "app/shim.h": "a6e41e0ee361a42620aa5e4d848377d452332d09b4532e9b27258760c0a34854",
+      "config/machines.json": "9c070acfa82766b841889f0102d28d204e12f88899471bdd42286b4b89d0c85d"
+    }
+  },
+  "liveCanary": {
+    "build": "20260914.7",
+    "binarySHA256": "c3bc1880d1a2c2158f12e58e87db19e7770022fe722ceceb65d7f4e407f6cf91",
+    "machine": "mini",
+    "verifiedAt": 1789391138.369601,
+    "session": {
+      "claim": 1789385821.26247,
+      "driver": "pro"
+    },
+    "initial": {
+      "session": {
+        "claim": 1789385821.26247,
+        "driver": "pro"
+      },
+      "pixelWidth": 3440,
+      "pixelHeight": 1440,
+      "height": 1440,
+      "pid": 70124,
+      "build": "20260914.7",
+      "ts": 1789391120.018806,
+      "fdCount": 6,
+      "machine": "mini",
+      "state": "ready",
+      "detail": "Display matches the driver",
+      "role": "passenger",
+      "width": 3440
+    },
+    "transitions": [
+      {
+        "session": {
+          "claim": 1789385821.26247,
+          "driver": "pro"
+        },
+        "pixelWidth": 2560,
+        "pixelHeight": 1600,
+        "height": 800,
+        "pid": 70124,
+        "build": "20260914.7",
+        "ts": 1789391126.04827,
+        "fdCount": 6,
+        "machine": "mini",
+        "state": "ready",
+        "detail": "Display matches the driver",
+        "role": "passenger",
+        "width": 1280
+      },
+      {
+        "session": {
+          "claim": 1789385821.26247,
+          "driver": "pro"
+        },
+        "pixelWidth": 3440,
+        "pixelHeight": 1440,
+        "height": 1440,
+        "pid": 70124,
+        "build": "20260914.7",
+        "ts": 1789391129.190887,
+        "fdCount": 6,
+        "machine": "mini",
+        "state": "ready",
+        "detail": "Display matches the driver",
+        "role": "passenger",
+        "width": 3440
+      },
+      {
+        "session": {
+          "claim": 1789385821.26247,
+          "driver": "pro"
+        },
+        "pixelWidth": 2560,
+        "pixelHeight": 1600,
+        "height": 800,
+        "pid": 70124,
+        "build": "20260914.7",
+        "ts": 1789391132.821356,
+        "fdCount": 6,
+        "machine": "mini",
+        "state": "ready",
+        "detail": "Display matches the driver",
+        "role": "passenger",
+        "width": 1280
+      },
+      {
+        "session": {
+          "claim": 1789385821.26247,
+          "driver": "pro"
+        },
+        "pixelWidth": 3440,
+        "pixelHeight": 1440,
+        "height": 1440,
+        "pid": 70124,
+        "build": "20260914.7",
+        "ts": 1789391136.5989141,
+        "fdCount": 6,
+        "machine": "mini",
+        "state": "ready",
+        "detail": "Display matches the driver",
+        "role": "passenger",
+        "width": 3440
+      }
+    ]
+  },
+  "fleet": [
+    {
+      "machine": "pro",
+      "runtime": {
+        "width": 1280,
+        "session": {
+          "driver": "air13",
+          "claim": 1789406930.154756
+        },
+        "pixelHeight": 1600,
+        "pid": 13464,
+        "ts": 1789441852.1277242,
+        "machine": "pro",
+        "role": "passenger",
+        "fdCount": 6,
+        "state": "ready",
+        "build": "20260914.7",
+        "height": 800,
+        "detail": "Display matches the driver",
+        "pixelWidth": 2560
+      },
+      "viewerHealth": {
+        "axTrusted": true,
+        "ts": 1789441600.161622,
+        "scrollTap": true
+      },
+      "processes": [
+        "13464 /Applications/MIRA.app/Contents/MacOS/MIRA --daemon",
+        "13467 /Applications/MIRA.app/Contents/MacOS/MIRA"
+      ],
+      "binarySHA256": "c3bc1880d1a2c2158f12e58e87db19e7770022fe722ceceb65d7f4e407f6cf91"
+    },
+    {
+      "machine": "air15",
+      "runtime": {
+        "state": "ready",
+        "pixelHeight": 1600,
+        "width": 1280,
+        "height": 800,
+        "fdCount": 6,
+        "machine": "air15",
+        "pixelWidth": 2560,
+        "ts": 1789441852.220471,
+        "role": "passenger",
+        "pid": 59111,
+        "session": {
+          "driver": "air13",
+          "claim": 1789406930.154756
+        },
+        "detail": "Display matches the driver",
+        "build": "20260914.7"
+      },
+      "viewerHealth": {
+        "axTrusted": true,
+        "scrollTap": true,
+        "ts": 1789441855.070374
+      },
+      "processes": [
+        "59111 /Users/amirjalali/Applications/MIRA.app/Contents/MacOS/MIRA --daemon",
+        "59114 /Users/amirjalali/Applications/MIRA.app/Contents/MacOS/MIRA"
+      ],
+      "binarySHA256": "c3bc1880d1a2c2158f12e58e87db19e7770022fe722ceceb65d7f4e407f6cf91"
+    },
+    {
+      "machine": "mini",
+      "runtime": {
+        "build": "20260914.7",
+        "width": 1280,
+        "machine": "mini",
+        "pixelWidth": 2560,
+        "detail": "Display matches the driver",
+        "fdCount": 6,
+        "height": 800,
+        "pixelHeight": 1600,
+        "session": {
+          "claim": 1789406930.154756,
+          "driver": "air13"
+        },
+        "state": "ready",
+        "role": "passenger",
+        "ts": 1789441852.181633,
+        "pid": 70124
+      },
+      "viewerHealth": {
+        "axTrusted": false,
+        "ts": 1789441813.635171,
+        "scrollTap": false
+      },
+      "processes": [
+        "70124 /Users/gabooja/Applications/MIRA.app/Contents/MacOS/MIRA --daemon",
+        "70128 /Users/gabooja/Applications/MIRA.app/Contents/MacOS/MIRA"
+      ],
+      "binarySHA256": "c3bc1880d1a2c2158f12e58e87db19e7770022fe722ceceb65d7f4e407f6cf91"
+    },
+    {
+      "machine": "air13",
+      "runtime": {
+        "session": {
+          "driver": "air13",
+          "claim": 1789406930.154756
+        },
+        "role": "driver",
+        "build": "20260914.7",
+        "machine": "air13",
+        "ts": 1789441856.27949,
+        "detail": "Driving from air13",
+        "fdCount": 5,
+        "pid": 80953,
+        "state": "driving"
+      },
+      "viewerHealth": {
+        "scrollTap": true,
+        "axTrusted": true,
+        "ts": 1789441748.4684448
+      },
+      "processes": [
+        "80818 /Users/amirhjalali/Applications/MIRA.app/Contents/MacOS/MIRA",
+        "80953 /Users/amirhjalali/Applications/MIRA.app/Contents/MacOS/MIRA --daemon"
+      ],
+      "binarySHA256": "c3bc1880d1a2c2158f12e58e87db19e7770022fe722ceceb65d7f4e407f6cf91"
+    }
+  ],
+  "limits": "No dock/lid stress test or long-duration soak claimed."
+}

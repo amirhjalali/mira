@@ -26,61 +26,55 @@ func openFileDescriptorCount() -> Int {
     return n
 }
 
+@discardableResult
 func sh(_ cmd: String, timeout: TimeInterval = 30) -> (out: String, code: Int32) {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/bin/bash")
-    p.arguments = ["-c", cmd]
-    let pipe = Pipe()
-    p.standardOutput = pipe
-    p.standardError = pipe
-    // A spawn failure is NOT a remote "command not found", and conflating the two
-    // cost two days: once the daemon ran out of file descriptors every ssh came
-    // back as a bare `code 127` with empty output, which reads exactly like the
-    // far end missing a binary. Say which it is.
-    do { try p.run() } catch {
-        try? pipe.fileHandleForReading.close()
-        try? pipe.fileHandleForWriting.close()
-        log("SPAWN FAILED (local, not remote): \(error.localizedDescription) — "
-          + "openFDs=\(openFileDescriptorCount())")
-        emit("spawn_failed", [("fds", .n(Double(openFileDescriptorCount())))])
-        return ("", 126)
+    var fds: [Int32] = [0, 0]
+    guard pipe(&fds) == 0 else { return ("local pipe creation failed", 126) }
+    var actions: posix_spawn_file_actions_t?
+    var attr: posix_spawnattr_t?
+    posix_spawn_file_actions_init(&actions); posix_spawnattr_init(&attr)
+    defer { posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attr) }
+    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP))
+    posix_spawnattr_setpgroup(&attr, 0)
+    posix_spawn_file_actions_adddup2(&actions, fds[1], 1)
+    posix_spawn_file_actions_adddup2(&actions, fds[1], 2)
+    posix_spawn_file_actions_addclose(&actions, fds[0])
+    posix_spawn_file_actions_addclose(&actions, fds[1])
+    var argv: [UnsafeMutablePointer<CChar>?] = ["/bin/bash", "-c", cmd].map { value in value.withCString { strdup($0) } }
+    argv.append(nil)
+    defer { argv.forEach { if let p = $0 { free(p) } } }
+    var pid: pid_t = 0
+    let rc = posix_spawn(&pid, "/bin/bash", &actions, &attr, argv, environ)
+    close(fds[1])
+    guard rc == 0 else { close(fds[0]); return ("local spawn failed: \(rc)", 126) }
+    defer { close(fds[0]) }
+    _ = fcntl(fds[0], F_SETFL, O_NONBLOCK)
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    var data = Data(), buffer = [UInt8](repeating: 0, count: 8192), status: Int32 = 0
+    func drain() {
+        for _ in 0..<128 {
+            let n = read(fds[0], &buffer, buffer.count)
+            if n <= 0 { break }
+            if data.count < 1_048_576 { data.append(contentsOf: buffer.prefix(min(n, 1_048_576 - data.count))) }
+        }
     }
-    let deadline = Date().addingTimeInterval(timeout)
-    while p.isRunning && Date() < deadline { usleep(50_000) }
-    if p.isRunning {
-        // Timed out. This path used to be terminate() + readDataToEndOfFile(),
-        // and that made the timeout a lie: SIGTERM kills bash but *reparents*
-        // its children rather than killing them, and an orphaned ssh still
-        // holding the pipe's write end means the read to EOF never returns.
-        // That is how a 20 s timeout became a multi-minute stall of the whole
-        // daemon (2026-08-16). Kill hard rather than terminate().
-        //
-        // "Abandon the pipe — letting the Pipe deallocate closes our read end"
-        // was wrong, and it was the most expensive line in this file. The Pipe
-        // CANNOT deallocate here: `p` still references it as stdout and stderr,
-        // and `p` outlives this scope inside Foundation until the child is
-        // reaped. So every timeout leaked both descriptors, permanently.
-        // Measured on the pro 2026-08-22 after 18 h uptime: 2,568 open fds, of
-        // which 2,555 were PIPE. When the daemon hit its ceiling, Process.run()
-        // began throwing — surfacing as `code 127, empty output` on every ssh,
-        // which looked like a remote failure. Rides then stopped landing, leases
-        // expired, and passengers tore their displays down. Every uptime-
-        // correlated symptom of the last three days traces back here.
-        // Close both ends explicitly and reap the child.
-        kill(p.processIdentifier, SIGKILL)
-        try? pipe.fileHandleForReading.close()
-        try? pipe.fileHandleForWriting.close()
-        p.waitUntilExit()
-        return ("", 124)
+    while true {
+        drain()
+        let ended = waitpid(pid, &status, WNOHANG)
+        if ended == pid {
+            drain()
+            // Background descendants must not outlive a completed command.
+            kill(-pid, SIGKILL)
+            return (String(data: data, encoding: .utf8) ?? "", (status & 0x7f) == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f))
+        }
+        if ended < 0 { return ("local wait failed", 126) }
+        if ProcessInfo.processInfo.systemUptime >= deadline {
+            kill(-pid, SIGKILL); kill(pid, SIGKILL)
+            _ = waitpid(pid, &status, 0); drain()
+            return (String(data: data, encoding: .utf8) ?? "", 124)
+        }
+        usleep(10_000)
     }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
-    // Explicit, not left to ARC. The whole fd leak came from assuming a Pipe
-    // deallocates when this scope ends; it does not while Process still holds
-    // it. Closing by hand costs nothing and cannot be wrong.
-    try? pipe.fileHandleForReading.close()
-    try? pipe.fileHandleForWriting.close()
-    return (String(data: data, encoding: .utf8) ?? "", p.terminationStatus)
 }
 
 // MARK: - Config
@@ -136,6 +130,8 @@ func loadConfig() -> Config {
 }
 
 func selfMachine(_ cfg: Config) -> Machine {
+    if let id = try? String(contentsOf: URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/mira/machine-id"), encoding: .utf8),
+       let m = cfg.machines.first(where: { $0.id == id.trimmingCharacters(in: .whitespacesAndNewlines) }) { return m }
     let me = NSUserName()
     let cands = cfg.machines.filter { $0.user == me }
     // A unix account is not an identity: two machines can share one (pro and
@@ -146,9 +142,7 @@ func selfMachine(_ cfg: Config) -> Machine {
         let host = Host.current().localizedName ?? ""
         if let m = cands.first(where: { $0.jumpName == host }) { return m }
         if let m = cands.first(where: { ($0.jumpAliases ?? []).contains(host) }) { return m }
-        FileHandle.standardError.write(
-            "MIRA: \(cands.count) machines share user \(me); ComputerName \"\(host)\" matched none — using \(cands[0].id)\n"
-                .data(using: .utf8)!)
+        fatalError("MIRA: ambiguous identity for \(me), ComputerName \(host). Set ~/.config/mira/machine-id.")
     }
     if let m = cands.first { return m }
     fatalError("no machine in machines.json with user \(me)")
@@ -156,8 +150,7 @@ func selfMachine(_ cfg: Config) -> Machine {
 
 // MARK: - State
 
-let stateDir = URL(fileURLWithPath: NSHomeDirectory())
-    .appendingPathComponent("Library/Application Support/MIRA", isDirectory: true)
+let stateDir = ProcessInfo.processInfo.environment["MIRA_STATE_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) } ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support/MIRA", isDirectory: true)
 let rideFile = stateDir.appendingPathComponent("ride.json")
 let drivingFlag = stateDir.appendingPathComponent("driving")
 // Who holds the wheel fleet-wide, as last told to us by a driver. See "Wheel".
@@ -452,6 +445,43 @@ func adoptMeasurement(previous: ContentArea?, observed: ContentArea?, slack: Int
     guard let prev = previous else { return seen }
     let moved = abs(seen.w - prev.w) > slack || abs(seen.h - prev.h) > slack
     return moved ? seen : prev
+}
+
+// Sticky, but not immortal. A measurement describes a hole in a PARTICULAR
+// panel during a PARTICULAR session; when either of those is gone, so is the
+// measurement's claim on the canvas. Without this, the stickiness above never
+// releases: the pro undocked on 2026-09-16 and kept asserting the BenQ's
+// 3440x1440 content rect onto both passengers for fourteen hours.
+// The TTL is long (two minutes, four heartbeats) precisely so an ordinary
+// Space switch or reconnect -- which stops the measurement for seconds, not
+// minutes -- still falls through to the sticky value. Pure and selftested.
+func adoptedGeometry(previous: ContentArea?, measurement: ViewerMeasurement?, session: SessionID,
+                     screen: ContentArea, now: Double, ttl: Double = 120) -> ContentArea? {
+    guard let m = measurement else { return previous }   // never measured / file gone
+    guard m.session == session else { return nil }       // someone else's hole
+    guard m.screen == screen else { return nil }         // this panel is not that panel
+    guard now - m.ts <= ttl else { return nil }          // nobody has looked in two minutes
+    return adoptMeasurement(previous: previous, observed: m.content)
+}
+
+// MARK: - The driver's own screen, read out of process
+
+// CoreGraphics refreshes a process's display list from the reconfiguration
+// callback, and that callback needs a run loop. runDaemon deliberately has
+// none -- it is a bare loop blocking on a semaphore, for the reasons spelled
+// out above virtualDisplayQueue -- so the daemon's own CGGetOnlineDisplayList
+// can name a monitor that was unplugged hours ago. Every OTHER process on the
+// same Mac reads the truth, which is why `mira doctor` was right and the
+// driver was wrong at the same moment (2026-09-16).
+//
+// So the driver asks a fresh process what is plugged in, the same way
+// inspectDisplay already asks one what a display is doing.
+struct ScreenSurvey: Codable { let widths: [Int] }
+
+func decodeScreenSurvey(_ text: String) -> [Int]? {
+    guard let d = text.data(using: .utf8),
+          let s = try? JSONDecoder().decode(ScreenSurvey.self, from: d) else { return nil }
+    return s.widths
 }
 
 func mainScreenPoints() -> ContentArea {
@@ -1067,6 +1097,25 @@ private let virtualDisplayQueue = DispatchQueue(label: "com.amir.mira.virtualdis
 final class DisplayEngine {
     private var virtualDisplay: CGVirtualDisplay?
     private(set) var virtualID: CGDirectDisplayID = 0
+    private var savedVirtual: CGVirtualDisplay?
+    private var savedVirtualID: CGDirectDisplayID = 0
+    private var savedCanvas: Canvas?
+    private var savedHiDPI = false
+    func beginDisplayTransition(hidpi: Bool) {
+        savedVirtual = virtualDisplay; savedVirtualID = virtualID
+        savedCanvas = builtCanvas
+        savedHiDPI = inspectDisplay(virtualID).map { $0.px == $0.w * 2 } ?? hidpi
+    }
+    func finishDisplayTransition(success: Bool) {
+        defer { savedVirtual = nil; savedCanvas = nil; savedVirtualID = 0 }
+        if !success, let old = savedVirtual, let canvas = savedCanvas, old.displayID != virtualID {
+            let failed = virtualDisplay
+            virtualDisplay = old; virtualID = savedVirtualID; builtCanvas = canvas
+            _ = applyPassengerTopology(canvas: canvas, hidpi: savedHiDPI, retainedDisplayID: failed?.displayID)
+            withExtendedLifetime(failed) {} // release only after restoring the mirror topology
+            emit("display_rollback")
+        }
+    }
     private var builtCanvas: Canvas?     // dims the current virtual was created for
 
     func onlineDisplays() -> [CGDirectDisplayID] {
@@ -1101,34 +1150,10 @@ final class DisplayEngine {
             log("virtual canvas changed \(builtCanvas.map { "\($0.width)x\($0.height)" } ?? "?") -> \(canvas.width)x\(canvas.height); rebuilding")
             destroyVirtual()
         }
-        guard buildVirtual(canvas: canvas, soleMode: false) else { return false }
-        // apply() returning true means the modes were accepted, NOT that this
-        // process can see them yet — publication is async and our snapshot is
-        // stale until the run loop turns. The caller's very next act is to look
-        // a mode up, so settle here rather than letting it fail there.
-        let t0 = Date()
-        if settledVirtualMode(canvas: canvas, hidpi: true) != nil {
-            log("virtual display created id=\(virtualID) for \(canvas.width)x\(canvas.height)"
-              + String(format: " (modes visible after %.0fms)", Date().timeIntervalSince(t0) * 1000))
-            return true
-        }
-        // Modes we cannot SEE are modes we cannot SELECT, and CG then leaves the
-        // display on the largest mode it published — which, with the canvas*2
-        // entry in the list, is exactly twice the canvas IN POINTS. That is
-        // air15 and the mini on 2026-09-12: a freshly created 1280x800 virtual
-        // reporting 2560x1600, "virtual width 2560 != canvas 1280" five times,
-        // and the converge breaker then freezing both passengers at double size
-        // while the pro — whose modes did become visible — converged fine.
-        //
-        // So stop depending on the lookup. Offer the canvas as the ONLY mode:
-        // CG's default is then the canvas by construction, and nothing has to
-        // be selected or seen for the passenger to be the right size.
-        log("virtual display created id=\(virtualID) for \(canvas.width)x\(canvas.height)"
-          + " — modes not visible to this process; rebuilding with the canvas as its only mode")
-        emit("virtual_sole_mode", [("canvas", .s("\(canvas.width)x\(canvas.height)"))])
-        destroyVirtual()
+        // Publish the requested canvas once. The fresh-process mode selector
+        // chooses its 1x/2x variant; a stale owner snapshot never triggers a rebuild.
         guard buildVirtual(canvas: canvas, soleMode: true) else { return false }
-        log("virtual display rebuilt id=\(virtualID) with \(canvas.width)x\(canvas.height) as its only mode")
+        log("virtual display created id=\(virtualID) for \(canvas.width)x\(canvas.height)")
         return true
     }
 
@@ -1140,7 +1165,7 @@ final class DisplayEngine {
         desc.maxPixelsWide = 6880
         desc.maxPixelsHigh = 3824
         desc.sizeInMillimeters = CGSize(width: 800, height: 335)
-        desc.serialNum = 1
+        desc.serialNum = nextVirtualSerial()  // retained rollback display must have a different identity
         desc.productID = 0x4D32
         desc.vendorID = miraVendorID
         desc.queue = virtualDisplayQueue   // NEVER DispatchQueue.main — see above
@@ -1223,80 +1248,18 @@ final class DisplayEngine {
         return m
     }
 
-    // The whole passenger topology in ONE transaction: the virtual holds the
-    // canvas mode, every physical mirrors the virtual, the virtual is main.
-    //
-    // It used to be four transactions (unmirror, set mode, mirror, set main).
-    // Every seam between them was a moment when CG renegotiated the mode for the
-    // whole set, and CG picks the highest mode all members share EXACTLY --
-    // 1024x768 on the BenQ/built-in pair, and a modeless virtual on the laptop
-    // panel pair. Both traps, and the mid-converge flash the owner actually
-    // sees, are one root cause: a topology that is briefly neither the old one
-    // nor the new one. There is no such moment now.
-    func applyPassengerTopology(canvas: Canvas, hidpi: Bool) -> Bool {
-        guard virtualID != 0 else { log("apply topology: no virtual display"); return false }
-        // A mode we cannot SEE is not the same as a mode that is not there, and
-        // this process demonstrably cannot see them: on 2026-08-19 the daemon
-        // read zero modes off virtual display 7 while an external probe read 18
-        // off the same id, including the exact 3440x1440 it wanted, and the
-        // daemon had received no CGDisplayRegisterReconfigurationCallback since
-        // start. Turning the run loop and re-asking (settledVirtualMode, and
-        // settledInvariantFailure before it) does not clear it.
-        //
-        // The strobe fix made this lookup fatal — `guard ... else { return
-        // false }` — which turned an unreadable snapshot into a fleet that
-        // could not converge at all: every passenger looped "no mode published"
-        // until the breaker tripped. Mode selection is an OPTIMISATION (it
-        // stops CG negotiating a mode the whole mirror set shares); the mirror
-        // itself is the point. So a missing mode degrades the transaction, it
-        // does not abort it — which is what shipped before the strobe fix and
-        // what the fleet actually ran on.
-        //
-        // NOT the end of this: without an explicit mode CG can still negotiate
-        // the set down (the 08-18 bug). The real defect is that this process
-        // cannot read its own display state, and that is unfixed.
-        let mode = settledVirtualMode(canvas: canvas, hidpi: hidpi)
-        if mode == nil {
-            log("apply topology: cannot SEE a \(canvas.width)x\(canvas.height) mode on the virtual"
-              + " — mirroring without an explicit mode (CG may renegotiate the set)")
-            emit("mode_invisible", [("canvas", .s("\(canvas.width)x\(canvas.height)"))])
-        }
-        var cfg: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&cfg) == .success, let cfg = cfg else {
-            log("apply topology: CGBeginDisplayConfiguration failed")
-            return false
-        }
-        if let mode = mode { CGConfigureDisplayWithDisplayMode(cfg, virtualID, mode, nil) }
-        for p in physicalDisplays() { CGConfigureDisplayMirrorOfDisplay(cfg, p, virtualID) }
-        CGConfigureDisplayOrigin(cfg, virtualID, 0, 0)          // origin 0,0 == main
-        let r = CGCompleteDisplayConfiguration(cfg, .permanently)
+    // The daemon retains both display objects. A short-lived helper performs
+    // mode + mirror + main-origin changes using one fresh CoreGraphics snapshot.
+    // This avoids both cached mode tables and cached IDs/origins in the owner.
+    func applyPassengerTopology(canvas: Canvas, hidpi: Bool, retainedDisplayID: CGDirectDisplayID? = nil) -> Bool {
+        guard virtualID != 0 else { return false }
+        let other = retainedDisplayID ?? savedVirtualID
+        let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        let factor = hidpi ? 2 : 1
+        let r = sh("\(shellQuote(exe)) configure-passenger \(virtualID) \(canvas.width) \(canvas.height) \(canvas.width * factor) \(canvas.height * factor) \(other)", timeout: 8)
         lastSelfDisplayWrite = Date()
-        // Never discarded. A silent false here is how a converge used to fail
-        // without leaving one line of evidence anywhere.
-        if r != .success { log("apply topology: CGCompleteDisplayConfiguration error \(r.rawValue)") }
-        // "The real defect is that this process cannot read its own display
-        // state, and that is unfixed" — fixed here. A FRESH process reads the
-        // virtual's modes fine (verified on air15 and the mini 2026-08-19: an
-        // external probe saw all 18 off a display the daemon read as modeless),
-        // so when this process is blind, delegate the one thing it needs a mode
-        // for. Without it the framebuffer is right (2560x1600 for a 1280x800
-        // HiDPI canvas) but macOS presents it 1x, and the passenger comes up at
-        // exactly twice the canvas in points — air15 and the mini, 2026-09-12.
-        if r == .success, mode == nil { selectVirtualModeOutOfProcess(canvas: canvas, hidpi: hidpi) }
-        return r == .success
-    }
-
-    // Runs `mira vmode <id> <w> <h> <px>` — a new process, a fresh CG snapshot.
-    func selectVirtualModeOutOfProcess(canvas: Canvas, hidpi: Bool) {
-        let exe = Bundle.main.executablePath ?? CommandLine.arguments.first ?? ""
-        guard !exe.isEmpty else { return }
-        let px = hidpi ? canvas.width * 2 : canvas.width
-        let res = sh("'\(exe)' vmode \(virtualID) \(canvas.width) \(canvas.height) \(px)", timeout: 15)
-        lastSelfDisplayWrite = Date()
-        log("out-of-process mode select for \(canvas.width)x\(canvas.height)@\(px)px: "
-          + res.out.trimmingCharacters(in: .whitespacesAndNewlines) + " (code \(res.code))")
-        emit("vmode_delegated", [("canvas", .s("\(canvas.width)x\(canvas.height)")),
-                                 ("ok", .b(res.code == 0))])
+        log("passenger topology: " + r.out.trimmingCharacters(in: .whitespacesAndNewlines) + " (code \(r.code))")
+        return r.code == 0
     }
 
     func unmirrorAll() {
@@ -1326,53 +1289,12 @@ final class DisplayEngine {
     // (observed on the pro, 2026-08-17). Naming the failing guard makes that
     // diagnosable instead of guesswork.
     func passengerInvariantFailure(canvas: Canvas, hidpi: Bool) -> String? {
-        if virtualID == 0 { return "no virtual display" }
-        if CGDisplayIsMain(virtualID) == 0 { return "virtual is not main" }
-        let w = Int(CGDisplayPixelsWide(virtualID))
-        if w != canvas.width { return "virtual width \(w) != canvas \(canvas.width)" }
-        // This clause was added on 08-18 to catch a modeless virtual (a
-        // post-mirror negotiation failure looks converged by bounds alone, and
-        // WindowServer reclaims it within a minute). It caused the 08-19 strobe,
-        // and the 08-19 fix tried to rescue it by turning the run loop and
-        // re-asking. That does not work: CGDisplayCopyDisplayMode on a virtual
-        // display THIS PROCESS OWNS returns nil indefinitely, while an external
-        // probe reads all 18 modes off the very same display id — verified on
-        // air15 (id 8) and the mini (id 9) on 2026-08-19 22:00, with the real
-        // topology confirmed correct at the same moment (virtual main at
-        // 3440x1440, built-in mirroring it).
-        //
-        // It cannot distinguish "modeless" from "unreadable", and in this
-        // process it is unreadable 100% of the time. So it may no longer fail
-        // the invariant. The clauses that ARE readable — bounds, main-ness,
-        // mirror membership — are what the topology is judged on, and they
-        // agreed with the external probe throughout.
-        //
-        // Failing toward doing nothing is the doctrine. The cost of a false
-        // "broken" is a full teardown every tick on a display that is already
-        // correct; the cost of a false "fine" is a reclaim that the bounds
-        // clauses catch on the next tick anyway.
-        if let m = CGDisplayCopyDisplayMode(virtualID), hidpi,
-           m.pixelWidth != canvas.width * 2 {
-            return "hidpi mode pixelWidth \(m.pixelWidth) != \(canvas.width * 2)"
-        }
-        for p in physicalDisplays() where CGDisplayMirrorsDisplay(p) != virtualID {
-            return "display \(p) (\(CGDisplayPixelsWide(p))x\(CGDisplayPixelsHigh(p))) not mirroring virtual"
-        }
-        return nil
+        guard virtualID != 0 else { return "no virtual display" }
+        return displayFailure(inspectDisplay(virtualID), canvas: canvas, hidpi: hidpi)
     }
 
-    // CoreGraphics answers display queries from a PER-PROCESS snapshot that is
-    // refreshed when the process turns its run loop. Reading the invariant on
-    // the line after CGCompleteDisplayConfiguration therefore interrogates a
-    // cache that has not seen the write yet. On 2026-08-19 this daemon read
-    // CGDisplayCopyDisplayMode as nil for 89 minutes while a separate probe
-    // process read the correct 3440x1440 mode off the very same display. The
-    // cheap bounds queries (IsMain, PixelsWide) refresh eagerly and passed
-    // throughout, which is exactly what made it look like a real modeless
-    // virtual and sent the fix in the wrong direction.
-    //
-    // So: give the run loop a turn and re-ask before believing a failure. A
-    // clause still broken once the snapshot has caught up is a real one.
+    // Verify one fresh snapshot, including main/mirror topology. Mixing the
+    // owner's stale bounds with a helper's fresh mode caused false rollbacks.
     func settledInvariantFailure(canvas: Canvas, hidpi: Bool, attempts: Int = 4) -> String? {
         var why = passengerInvariantFailure(canvas: canvas, hidpi: hidpi)
         var left = attempts
@@ -1445,6 +1367,7 @@ struct SavedDisplay: Codable {
     var h: Int? = nil       // UI height
     var hz: Double? = nil
     var px: Int? = nil      // backing pixel width (w*2 when hidpi)
+    var stableID: String? = nil
 }
 
 // What restore must do to one display. Pure, selftested: the mode/mirror
@@ -1488,10 +1411,10 @@ func captureArrangement(engine: DisplayEngine) {
                             main: CGDisplayIsMain(d) != 0,
                             mirrorOf: master == kCGNullDirectDisplay ? nil : master,
                             w: m.map { $0.width }, h: m.map { $0.height },
-                            hz: m.map { $0.refreshRate }, px: m.map { $0.pixelWidth })
+                            hz: m.map { $0.refreshRate }, px: m.map { $0.pixelWidth }, stableID: physicalDisplayKey(d))
     }
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
-    if let d = try? JSONEncoder().encode(saved) { try? d.write(to: arrangementFile) }
+    try? atomicJSON(saved, to: arrangementFile)
 }
 
 // Returns true when the arrangement is restored (or there is nothing to
@@ -1518,9 +1441,20 @@ func restoreArrangement(engine: DisplayEngine) -> Bool {
     }
     engine.unmirrorAll()   // break the virtual's mirror before rebuilding the real one
     let online = Set(engine.onlineDisplays())
+    let remapped = saved.compactMap { original -> SavedDisplay? in
+        let id = original.stableID.flatMap { key in online.first { physicalDisplayKey($0) == key } }
+            ?? (online.contains(original.id) ? original.id : nil)
+        guard let id = id else { return nil }
+        let mirror = original.mirrorOf.flatMap { old in
+            saved.first { $0.id == old }?.stableID.flatMap { key in online.first { physicalDisplayKey($0) == key } }
+                ?? (online.contains(old) ? old : nil)
+        }
+        return SavedDisplay(id: id, x: original.x, y: original.y, main: original.main, mirrorOf: mirror,
+            w: original.w, h: original.h, hz: original.hz, px: original.px, stableID: original.stableID)
+    }
     var cfg: CGDisplayConfigRef?
     CGBeginDisplayConfiguration(&cfg)
-    for s in saved where online.contains(s.id) {
+    for s in remapped {
         let step = restoreStep(s, online: online)
         if step.setMode, let w = s.w, let h = s.h,
            let mode = matchMode(display: s.id, w: w, h: h, hz: s.hz, px: s.px) {
@@ -1536,11 +1470,22 @@ func restoreArrangement(engine: DisplayEngine) -> Bool {
         log("restoreArrangement config failed — leaving arrangement.json for retry")
         return false
     }
-    if let main = saved.first(where: { $0.main }), online.contains(main.id) {
+    if let main = remapped.first(where: { $0.main }), online.contains(main.id) {
         engine.setMain(main.id)
     } else if let first = engine.physicalDisplays().first {
         engine.setMain(first)
     }
+    for display in remapped {
+        if let w = display.w, let h = display.h {
+            guard let observed = inspectDisplay(display.id), observed.w == w, observed.h == h,
+                  display.px == nil || observed.px == display.px else {
+                log("Console restoration not verified for display \(display.id); retaining snapshot")
+                return false
+            }
+        }
+        if let mirror = display.mirrorOf, CGDisplayMirrorsDisplay(display.id) != mirror { return false }
+    }
+    try? atomicJSON(saved, to: stateDir.appendingPathComponent("last-console-arrangement.json"))
     try? FileManager.default.removeItem(at: arrangementFile)
     return true
 }
@@ -1682,6 +1627,10 @@ final class Reconciler {
     var nextStreamGuard = Date.distantPast
     var loggedStaleRideFrom: String?
     var lastLeaseTS: Double?
+    var lastGeometryKey: String?
+    var explicitTargets = Set<String>()
+    var lastRuntimePublish = 0.0
+    var consoleRestoreAttempts = 0
     // Expiry probe: is the driver actually gone, or are we just not hearing it?
     var nextDriverProbe = Date.distantPast
     var driverStillDriving = false
@@ -1711,10 +1660,15 @@ final class Reconciler {
             log("yielding the wheel to \(holder) (newer claim, via beacon)")
             emit("yield", [("to", .s(holder)), ("via", .s("beacon"))])
         }
+        // Local use holds until explicitly included or a new driver takes over.
+        if FileManager.default.fileExists(atPath: localHoldFile.path) {
+            removeState(rideFile); convergeConsole(); return
+        }
         // Walk-up handback: a fresh handback file forces console regardless of ride.
         if let hts = readHandbackTS() {
             let hold = cfg.handbackHoldSeconds ?? 600
             if handbackIsFresh(ts: hts, hold: hold) {
+                if let session = readRide()?.session { try? atomicJSON(session, to: localHoldFile) }
                 try? FileManager.default.removeItem(at: rideFile)
                 convergeConsole()
                 return
@@ -1756,7 +1710,10 @@ final class Reconciler {
             loggedStaleRideFrom = nil
             if let r = ride, r.ts != lastLeaseTS {
                 lastLeaseTS = r.ts
-                breaker.reset()   // a new lease deserves a fresh attempt
+                if r.geometryKey != lastGeometryKey {
+                    lastGeometryKey = r.geometryKey
+                    breaker.reset()
+                }
                 // Age on arrival: a lease that lands most-expired is the signal
                 // that the driver stamped it before a slow network op.
                 emit("lease_recv", [("drv", .s(r.driver)), ("canvas", .s(r.canvas)),
@@ -1773,7 +1730,6 @@ final class Reconciler {
             // fast now so rides converge instantly, and three process spawns a
             // second on a laptop is a battery cost with no benefit.
             if Date() >= nextStreamGuard {
-                killJumpViewer()
                 nextStreamGuard = Date().addingTimeInterval(15)
             }
             let broken = engine.passengerInvariantFailure(canvas: canvas, hidpi: wantHi)
@@ -1786,25 +1742,34 @@ final class Reconciler {
             let t0 = Date()
             log("converge -> passenger(\(canvasKey), hidpi=\(wantHi))"
               + (broken.map { " — invariant broken: \($0)" } ?? ""))
+            consoleRestoreAttempts = 0
             captureArrangement(engine: engine)
             applyHygiene()
             holdDisplayAwake()                                 // wake+hold display stack
-            killJumpViewer()                                   // never stream outward
-            guard engine.ensureVirtual(canvas: canvas) else { log("virtual create FAILED"); return }
+            if lastMode == nil || lastMode == .console { killJumpViewer() }
+            engine.beginDisplayTransition(hidpi: wantHi)
+            guard engine.ensureVirtual(canvas: canvas) else {
+                log("virtual create FAILED"); engine.finishDisplayTransition(success: false)
+                _ = breaker.record("virtual create failed"); return
+            }
             let applied = engine.applyPassengerTopology(canvas: canvas, hidpi: wantHi)
             routeAudio(passenger: true)
             let why = applied ? engine.settledInvariantFailure(canvas: canvas, hidpi: wantHi)
                               : "topology transaction failed"
-            let ok = why == nil
+            let observed = inspectDisplay(engine.virtualID)
+            let verification = geometryFailure(observed, canvas: canvas, hidpi: wantHi)
+            let ok = why == nil && verification == nil
+            engine.finishDisplayTransition(success: ok)
+            let failure = why ?? verification
             log("passenger converged=\(ok) in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s"
-              + (why.map { " — \($0)" } ?? ""))
+              + (failure.map { " — \($0)" } ?? ""))
             emit("converge", [("canvas", .s(canvasKey)), ("hidpi", .b(wantHi)),
                               ("ms", .n(Date().timeIntervalSince(t0) * 1000)),
-                              ("ok", .b(ok))] + (why.map { [("why", EV.s($0))] } ?? []))
-            if breaker.record(why) {
+                              ("ok", .b(ok))] + (failure.map { [("why", EV.s($0))] } ?? []))
+            if breaker.record(failure) {
                 log("converge breaker TRIPPED after \(breaker.streak) identical failures "
-                  + "(\(why ?? "?")) — holding the display still until something changes")
-                emit("breaker_trip", [("why", .s(why ?? "?")), ("n", .n(Double(breaker.streak)))])
+                  + "(\(failure ?? "?")) — holding the display still until something changes")
+                emit("breaker_trip", [("why", .s(failure ?? "?")), ("n", .n(Double(breaker.streak)))])
             }
             // The latch is only consumed while a passenger, so console-era
             // input (the owner using this machine hours ago) survives until
@@ -1836,26 +1801,10 @@ final class Reconciler {
             convergeConsole()
         }
 
-    // Probe the driver, at most once a minute, and cache the verdict. Returns
-    // true = keep the display up. Unreachable counts as GONE (nil verdict ->
-    // false): if we cannot reach the driver, neither can its rides, and the
-    // console is the honest place to be.
     func keepRidingDespiteExpiry(_ ride: Ride) -> Bool {
-        guard let drv = cfg.machines.first(where: { $0.id == ride.driver }) else { return false }
-        if Date() < nextDriverProbe { return driverStillDriving }
-        nextDriverProbe = Date().addingTimeInterval(60)
-        let r = peerRun(drv, "cat \"$HOME/Library/Application Support/MIRA/driving\" 2>/dev/null; echo",
-                        timeout: 8, force: true)
-        let holds = r.code == 0
-            && Double(r.out.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
-        if holds != driverStillDriving {
-            log(holds
-                ? "lease expired but \(ride.driver) still holds the wheel — keeping the display up"
-                : "lease expired and \(ride.driver) is not driving \(r.code == 0 ? "" : "(unreachable) ")— console")
-            emit("expiry_probe", [("drv", .s(ride.driver)), ("holds", .b(holds))])
-        }
-        driverStillDriving = holds
-        return holds
+        // Lost contact is not permission to destroy the picture. Explicit Stop,
+        // Use This Mac Locally, and a newer session still release immediately.
+        return true
     }
     }
 
@@ -1869,6 +1818,8 @@ final class Reconciler {
             if lastMode == nil && currentDefaultOutputIsJump() { routeAudio(passenger: false) }
             lastMode = .console; return
         }
+        guard consoleRestoreAttempts < 3 else { return }
+        consoleRestoreAttempts += 1
         log("converge -> console")
         engine.destroyVirtual()
         let restored = restoreArrangement(engine: engine)
@@ -2033,8 +1984,27 @@ func measureNet(to m: Machine) -> (avg: Double, jitter: Double)? {
     return (parts[0], parts[1])
 }
 
+// One subprocess every few seconds, for the one question this process cannot
+// answer about itself. A failed or unreadable survey falls back to the local
+// list and is NOT cached, so a transient fork failure costs one beat, not the
+// session.
+var screenSurvey: (widths: [Int], at: Double)?
+
+func freshPhysicalWidths(engine: DisplayEngine, ttl: Double = 5) -> [Int] {
+    let now = ProcessInfo.processInfo.systemUptime
+    if let s = screenSurvey, now - s.at < ttl { return s.widths }
+    let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
+    let r = sh("\(shellQuote(exe)) inspect-screens", timeout: 3)
+    guard r.code == 0, let widths = decodeScreenSurvey(r.out) else {
+        log("screen survey unavailable (code \(r.code)) — falling back to this process's display list")
+        return engine.physicalWidths()
+    }
+    screenSurvey = (widths, now)
+    return widths
+}
+
 func driverCanvasKey(cfg: Config, me: Machine, engine: DisplayEngine) -> String {
-    pickCanvas(physicalWidths: engine.physicalWidths(),
+    pickCanvas(physicalWidths: freshPhysicalWidths(engine: engine),
                dockedCanvas: me.dockedCanvas ?? cfg.dockedCanvas,
                laptopCanvas: me.laptopCanvas ?? "laptop-pro")
 }
@@ -2366,136 +2336,39 @@ func surveyWheel(cfg: Config, me: Machine) -> WheelSurvey {
 // MARK: - Doctor
 
 func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
-    var lines = ["MIRA Doctor — \(me.id)"], failures = 0
-    let group = DispatchGroup(); let lock = NSLock(); var peerLines: [String] = []
-    for t in macPassengers(cfg: cfg, me: me) {
-        group.enter()
-        DispatchQueue.global().async {
-            var l: [String] = []
-            // No dumpmacperm over SSH here — that probe reports false for every
-            // permission outside the gui domain (2026-07-28 finding). The
-            // passenger's own daemon publishes health.json from a truthful context.
-            let probe = peerRun(t, """
-            echo user=$(whoami); \
-            pgrep -f 'MIRA.app/Contents/MacOS/MIRA --daemon' >/dev/null && echo daemon=ok || echo daemon=missing; \
-            echo "HEALTH=$(cat "$HOME/Library/Application Support/MIRA/health.json" 2>/dev/null | tr -d ' \\n')"; \
-            cat "$HOME/Library/Application Support/MIRA/ride.json" 2>/dev/null || echo no-ride
-            """, timeout: 15, force: true)   // doctor must probe, not read a cached verdict
-            if probe.code != 0 { l.append("✗ \(t.id) unreachable"); lock.lock(); failures += 1; lock.unlock() }
-            else {
-                let o = probe.out
-                l.append("✓ \(t.id) reachable")
-                if o.contains("daemon=missing") {
-                    l.append("✗ \(t.id) daemon not running"); lock.lock(); failures += 1; lock.unlock()
-                } else { l.append("✓ \(t.id) daemon running") }
-                let health = o.components(separatedBy: "\n")
-                    .first(where: { $0.hasPrefix("HEALTH=") })
-                    .flatMap { try? JSONDecoder().decode(Health.self, from: Data($0.dropFirst(7).utf8)) }
-                if let h = health, Date().timeIntervalSince1970 - h.ts < 900 {
-                    if h.accessibility && h.screenRecording {
-                        l.append("✓ \(t.id) Jump Connect permissions intact")
-                    } else {
-                        l.append("✗ \(t.id) Jump Connect lost \(h.accessibility ? "" : "Accessibility ")\(h.screenRecording ? "" : "Screen Recording")— re-grant on that machine")
-                        lock.lock(); failures += 1; lock.unlock()
-                    }
-                } else {
-                    l.append("! \(t.id) no fresh permission report (daemon old or probe failing) — not counted as failure")
-                }
-                l.append(o.contains("no-ride") ? "  \(t.id): parked" : "  \(t.id): being driven")
-            }
-            lock.lock(); peerLines.append(contentsOf: l); lock.unlock()
-            group.leave()
+    let peers = cfg.machines.filter { $0.id != me.id }
+    let remote = forEachPeer(peers, deadline: 12) { p -> RuntimeSnapshot? in
+        let r = peerRun(p, "cat \"$HOME/Library/Application Support/MIRA/runtime.json\"", timeout: 8, force: true)
+        return try? JSONDecoder().decode(RuntimeSnapshot.self, from: Data(r.out.utf8))
+    }
+    var reports: [RuntimeSnapshot] = []
+    var lines = ["MIRA \(miraVersion) — fleet health"], failures = 0
+    for machine in cfg.machines {
+        let report = machine.id == me.id ? readJSON(RuntimeSnapshot.self, snapshotFile) : (remote[machine.id] ?? nil)
+        guard let report = report, Date().timeIntervalSince1970 - report.ts < 30 else {
+            lines.append("! \(machine.id): no fresh daemon report"); failures += 1; continue
+        }
+        reports.append(report)
+        let healthy = report.state == "ready" || report.state == "local" || report.state == "driving"
+        lines.append("\(healthy ? "✓" : "!") \(machine.id): \(report.state) — \(report.detail) [\(report.build)]")
+        if let w = report.width, let h = report.height {
+            lines.append("  \(w)×\(h) points; \(report.pixelWidth ?? 0)×\(report.pixelHeight ?? 0) pixels")
+        }
+        if !healthy || report.build != miraBuild || report.fdCount > 512 { failures += 1 }
+    }
+    let drivers = reports.filter { $0.role == "driver" }
+    if drivers.count > 1 { lines.append("! Conflicting drivers: \(drivers.map { $0.machine }.joined(separator: ", "))"); failures += 1 }
+    if let session = drivers.first?.session, drivers.count == 1 {
+        for r in reports where r.role == "passenger" && r.session != session {
+            lines.append("! \(r.machine): passenger belongs to a different session"); failures += 1
         }
     }
-    group.wait()
-    lines.append(contentsOf: peerLines.sorted())
-    // Viewer-side vitals: menu app alive with its Accessibility grant, and a
-    // session alias per passenger so opening never depends on UI scripting.
-    if me.roles.contains("viewer") {
-        let vh = (try? Data(contentsOf: viewerHealthFile))
-            .flatMap { try? JSONDecoder().decode(ViewerHealth.self, from: $0) }
-        if let h = vh, Date().timeIntervalSince1970 - h.ts < 900 {
-            if h.axTrusted { lines.append("✓ menu app running with Accessibility") }
-            else {
-                lines.append("✗ menu app lost Accessibility — scroll reversal and menu fallback dead (re-grant for MIRA)")
-                failures += 1
-            }
-            if !h.scrollTap { lines.append("! scroll tap not installed (grant made after launch? toggle Reverse Mouse Scrolling)") }
-        } else {
-            lines.append("✗ menu app not running (no fresh viewer health) — boot-resume will not fire; open MIRA.app")
-            failures += 1
-        }
-        for t in macPassengers(cfg: cfg, me: me)
-        where !FileManager.default.fileExists(atPath: sessionAlias(for: t.id).path) {
-            lines.append("! no session alias for \(t.id) — File > Export in Jump Desktop, put \(t.id).jump in \(aliasesDir.path)")
-        }
+    if let state = readJSON(RuntimeSnapshot.self, snapshotFile), state.role == "driver" {
+        if let m = readJSON(ViewerMeasurement.self, measurementFile), m.session == state.session {
+            lines.append("✓ Measured viewer: \(m.content.w)×\(m.content.h) points")
+        } else { lines.append("! Viewer not measured yet; using the configured screen size"); failures += 1 }
     }
-    // Geometry. Every round of "the resolution is wrong" happened while doctor
-    // said ready, because doctor had never once looked at a screen.
-    let mainD = CGMainDisplayID()
-    // Judged against the remembered baseline, never against a guessed "native"
-    // aspect: doctor used to fail the pro's correct 3440x1440 docked mode for
-    // being 1x and "the wrong aspect" for a mirror set whose reported geometry
-    // belongs to neither panel. See panelModeIsWorse.
-    if let now = currentPanelMode(mainD) {
-        let key = panelDisplayKey(mainD)
-        let base = readPanelBaseline()
-        if let b = base, b.display == key, panelModeIsWorse(baseline: b.mode, now: now) {
-            lines.append("✗ console panel \(now.w)x\(now.h) px=\(now.px)x\(now.py)"
-                + " — drifted from baseline \(b.w)x\(b.h) px=\(b.px)x\(b.py)"
-                + (screenTakers().isEmpty ? "" : " while \(screenTakers().joined(separator: ", ")) is on screen"))
-            failures += 1
-        } else if let b = base, b.display == key {
-            lines.append("✓ console panel \(now.w)x\(now.h) px=\(now.px)x\(now.py) matches its baseline")
-        } else {
-            lines.append("! console panel \(now.w)x\(now.h) px=\(now.px)x\(now.py)"
-                + " — no baseline for this panel yet (the daemon adopts one on its next tick at console)")
-        }
-    }
-    if FileManager.default.fileExists(atPath: drivingFlag.path) {
-        if let seen = observedViewerContent() {
-            lines.append("✓ viewer content area \(seen.w)x\(seen.h) — canvas follows this measurement")
-        } else {
-            lines.append("! driving but no Jump viewer window found to measure — passengers are on the config seed")
-        }
-    }
-    for taker in screenTakers() where !taker.hasPrefix("inbound Jump") {
-        lines.append("! \(taker) can renegotiate this Mac's resolution")
-    }
-    // A long-lived inbound session is not cosmetic: it renegotiates this Mac's
-    // resolution whenever it goes active. One at 14h24m is what spent an evening
-    // undoing every fix (2026-08-18).
-    for line in sh("ps -Ao etime,command | grep '[d]esktopproxy'").out.split(separator: "\n") {
-        let field = line.trimmingCharacters(in: .whitespaces).split(separator: " ").first.map(String.init)
-        guard let secs = field.flatMap(parseETime) else { continue }
-        if secs > 12 * 3600 {
-            lines.append(String(format: "✗ inbound Jump session open %.1fh — it renegotiates this Mac's display; quit the viewer holding it", secs / 3600))
-            failures += 1
-        } else if secs > 4 * 3600 {
-            lines.append(String(format: "! inbound Jump session open %.1fh", secs / 3600))
-        }
-    }
-    let vnc = sh("ps -Aro pcpu,comm | awk '$2 ~ /screensharingd/ && $1+0 > 5'").out
-    if !vnc.trimmingCharacters(in: .whitespaces).isEmpty {
-        lines.append("✗ inbound session is VNC — use the Fluid entry"); failures += 1
-    } else { lines.append("✓ no VNC session detected") }
-    // Two drivers is the failure nothing ever detected: it was only ever visible
-    // as passengers behaving oddly, and doctor only probed TARGETS, so a viewer
-    // like air13 holding a second claim was outside everything it looked at.
-    let wheelState = surveyWheel(cfg: cfg, me: me)
-    if wheelState.claimants.count > 1 {
-        lines.append("✗ TWO DRIVERS: \(wheelState.claimants.joined(separator: " and ")) both hold a claim"
-                   + " — run Drive from Here on the one you want")
-        failures += 1
-    } else if let only = wheelState.claimants.first {
-        lines.append("✓ one driver: \(only)")
-    } else {
-        lines.append("✓ nobody is driving")
-    }
-    for id in wheelState.unreachable {
-        lines.append("! \(id) unreachable — cannot confirm whether it holds the wheel")
-    }
-    lines.append(failures == 0 ? "Doctor: ready" : "Doctor: \(failures) failure(s)")
+    lines.append(failures == 0 ? "All reported machines healthy" : "\(failures) check(s) need attention")
     return (lines.joined(separator: "\n"), failures)
 }
 
@@ -2551,98 +2424,70 @@ final class StateWatcher {
 // MARK: - Daemon
 
 func runDaemon(cfg: Config) -> Never {
+    guard singleton("daemon") else { print("Mira daemon already running"); exit(0) }
+    daemonOwnsState = true
     let rec = Reconciler(cfg: cfg)
-    rec.startWatchers()
     eventMachineID = rec.me.id
-    // A claim that should never have existed must not survive a reboot either.
-    if !mayDrive(roles: rec.me.roles), FileManager.default.fileExists(atPath: drivingFlag.path) {
-        try? FileManager.default.removeItem(at: drivingFlag)
-        log("cleared a driving claim on \(rec.me.id): passenger-only machines never drive")
-        emit("drive_claim_cleared", [("id", .s(rec.me.id))])
-    }
-    log("mira daemon started on \(rec.me.id) (driver+passenger roles: \(rec.me.roles))")
-    emit("start", [("roles", .s(rec.me.roles.joined(separator: "+")))])
-    var tier: Tier = .standard
-    // Cuts a poll interval short. The daemon used to learn about a new ride
-    // only on its next tick, so a ride landing just after one waited out the
-    // whole of reconcileSeconds before any display moved — measured as the
-    // single largest cost in "grab a laptop and drive" (avg ~7.5 s of ~15 s).
+    rec.startWatchers()
+    log("MIRA \(miraVersion) build \(miraBuild) daemon started on \(rec.me.id)")
+    emit("start", [("build", .s(miraBuild))])
     let wake = DispatchSemaphore(value: 0)
-    let stateWatcher = StateWatcher(wake: wake)   // held for the process lifetime
-    stateWatcher.start()
-    // Event-driven, so the daemon learns the topology moved the moment it moves
-    // rather than up to reconcileSeconds later -- and so a change we did NOT
-    // cause is recorded as evidence. Attributing display changes was the whole
-    // difficulty on 2026-08-18/19: a stale Jump viewer renegotiates resolution
-    // at unpredictable intervals and looked exactly like MIRA misbehaving.
-    //
-    // Our own writes fire this callback too. A breaker that reset on those
-    // could never trip, so only external changes clear it.
+    let watcher = StateWatcher(wake: wake); watcher.start()
+    // Callbacks only wake the serial owner. They never mutate its breaker.
     displayReconfigured = { flags in
-        // The callback fires twice per change; the begin pass carries no state.
-        if flags.contains(.beginConfigurationFlag) { return }
-        let ours = Date().timeIntervalSince(lastSelfDisplayWrite) < 3
-        log("display reconfigured — \(ours ? "ours" : "EXTERNAL (not MIRA)")")
-        emit("display_reconfig", [("ours", .b(ours)), ("flags", .n(Double(flags.rawValue)))])
-        if !ours { rec.breaker.reset() }
-        wake.signal()
+        if !flags.contains(.beginConfigurationFlag) { wake.signal() }
     }
-    CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
-        displayReconfigured?(flags)
-    }, nil)
-    // Wall-clock deadlines rather than per-iteration decrements: the loop is
-    // woken early now, so counting iterations would fire the heartbeat far
-    // more often than heartbeatSeconds. distantPast = due immediately, which
-    // also fixes a latent stall — the old counter kept its value across a
-    // stop/resume, so resuming a drive could wait two full intervals.
-    var nextDrive = Date.distantPast
-    var nextHealth = Date.distantPast
-    // Undock/dock changes the driver's canvas. Waiting for the next heartbeat
-    // to notice left passengers on the stale canvas for up to heartbeatSeconds;
-    // driverCanvasKey is local CoreGraphics only, so it is cheap to check every
-    // tick and re-assert the moment it moves.
-    var lastCanvas: String?
+    CGDisplayRegisterReconfigurationCallback({ _, flags, _ in displayReconfigured?(flags) }, nil)
+    var nextReconcile = 0.0, nextDrive = 0.0, nextRuntime = 0.0, nextHealth = 0.0
+    var sentKey = "", session: SessionID?, geometry: ContentArea?, canvasKey = ""
     while true {
-        rec.tick()
-        if rec.me.roles.contains("viewer"),
-           FileManager.default.fileExists(atPath: drivingFlag.path) {
-            let canvas = driverCanvasKey(cfg: cfg, me: rec.me, engine: rec.engine)
-            let canvasChanged = lastCanvas != nil && lastCanvas != canvas
-            if canvasChanged { log("driver canvas \(lastCanvas!) -> \(canvas); re-asserting now") }
-            lastCanvas = canvas
-            if Date() >= nextDrive || canvasChanged {
-                // Scheduled from the START of the beat, not the end. Measuring
-                // from the end makes the real period heartbeat + however long
-                // the beat took, which quietly ate the margin against
-                // rideTTLSeconds — the thing that drops passengers to console.
-                nextDrive = Date().addingTimeInterval(cfg.heartbeatSeconds)
-                let beatT0 = Date()
-                tier = driveTick(cfg: cfg, me: rec.me, engine: rec.engine, previousTier: tier)
-                let spent = Date().timeIntervalSince(beatT0)
-                emit("beat", [("ms", .n(spent * 1000))])
-                // Loud when a beat eats enough of the TTL to threaten a drop.
-                if spent > cfg.heartbeatSeconds {
-                    log("drive beat took \(String(format: "%.1f", spent))s "
-                      + "(> heartbeat \(Int(cfg.heartbeatSeconds))s, TTL \(Int(cfg.rideTTLSeconds))s)")
+        let changed = serviceCommands(rec)
+        let now = ProcessInfo.processInfo.systemUptime
+        if changed || now >= nextReconcile {
+            rec.tick(); nextReconcile = ProcessInfo.processInfo.systemUptime + cfg.reconcileSeconds
+        }
+        if now >= nextRuntime || changed {
+            publishRuntime(rec); nextRuntime = ProcessInfo.processInfo.systemUptime + 5
+        }
+        if let own = currentSession(rec.me) {
+            let key = driverCanvasKey(cfg: cfg, me: rec.me, engine: rec.engine)
+            if session != own || canvasKey != key {
+                // The shape the whole fleet is about to be told to become, said
+                // out loud. Fourteen hours of a wrong canvas left not one line
+                // of evidence anywhere before this (2026-09-16).
+                log("driver canvas \(canvasKey.isEmpty ? "(none)" : canvasKey) -> \(key)")
+                emit("driver_canvas", [("from", .s(canvasKey)), ("to", .s(key))])
+                geometry = nil; session = own; canvasKey = key; sentKey = ""
+            }
+            geometry = adoptedGeometry(previous: geometry,
+                                       measurement: readJSON(ViewerMeasurement.self, measurementFile),
+                                       session: own, screen: mainScreenPoints(),
+                                       now: Date().timeIntervalSince1970)
+            let signature = "\(own.claim)|\(key)|\(geometry?.w ?? 0)x\(geometry?.h ?? 0)|\(loadExcluded().sorted())|\(loadSettings().hidpiRides)"
+            if now >= nextDrive || signature != sentKey || !rec.explicitTargets.isEmpty {
+                let excluded = loadExcluded()
+                for peer in cfg.machines where peer.id != rec.me.id {
+                    let isPassenger = peer.roles.contains("target") && !excluded.contains(peer.id)
+                    var request = ControlRequest(kind: isPassenger ? "ride" : "beacon")
+                    request.session = own
+                    if isPassenger {
+                        request.ride = Ride(driver: rec.me.id, canvas: key, hidpi: loadSettings().hidpiRides,
+                            ts: Date().timeIntervalSince1970, claimedAt: own.claim,
+                            canvasW: geometry?.w, canvasH: geometry?.h)
+                        request.explicit = rec.explicitTargets.contains(peer.id)
+                    }
+                    if sessionTransport.send(peer, request: request, session: own) { rec.explicitTargets.remove(peer.id) }
                 }
+                nextDrive = now + min(cfg.heartbeatSeconds, 10); sentKey = signature
             }
-        } else {
-            lastCanvas = nil   // not driving: re-baseline so resuming is not a "change"
+        } else { session = nil; sentKey = "" }
+        serviceReleases(cfg: cfg)
+        if now >= nextHealth {
+            nextHealth = now + 300
+            DispatchQueue.global(qos: .utility).async { writeHealth() }
         }
-        if Date() >= nextHealth {
-            writeHealth(); nextHealth = Date().addingTimeInterval(300)
-            // A descriptor leak is invisible until it is fatal, and then it
-            // disguises itself as somebody else's failure. Sample it.
-            let fds = openFileDescriptorCount()
-            emit("fds", [("n", .n(Double(fds)))])
-            if fds > 512 {
-                log("WARNING: \(fds) open file descriptors — leaking. "
-                  + "This ends as spawn failures and unplaceable rides.")
-            }
-        }
-        // Sleep, but return the instant ride state changes on disk.
-        _ = wake.wait(timeout: .now() + cfg.reconcileSeconds)
-        while wake.wait(timeout: .now()) == .success {}   // collapse a burst
+        _ = wake.wait(timeout: .now() + 0.25)
+        while wake.wait(timeout: .now()) == .success {}
     }
 }
 
@@ -2668,7 +2513,7 @@ func scrollTapCallback(proxy: CGEventTapProxy, type: CGEventType,
     }
     // A wheel — classic or hi-res "continuous" — never carries gesture phases;
     // trackpad and Magic Mouse scrolls always do (live phase or momentum).
-    guard scrollReversalEnabled, type == .scrollWheel,
+    guard scrollReversalEnabled, localScrollOwner, type == .scrollWheel,
           shouldReverseScroll(
               phase: event.getIntegerValueField(.scrollWheelEventScrollPhase),
               momentum: event.getIntegerValueField(.scrollWheelEventMomentumPhase)) else {
@@ -2707,6 +2552,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         // — including "claim", the most important one to be able to attribute —
         // landed in the log as machine "?".
         eventMachineID = me.id
+        localScrollOwner = readRide() == nil && !FileManager.default.fileExists(atPath: arrangementFile.path)
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         rebuild()
         installScrollTap()
@@ -2735,6 +2581,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     }
 
     func installScrollTap() {
+        guard scrollTap == nil else { return }
         let mask = CGEventMask(1 << CGEventType.scrollWheel.rawValue)
         guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                           options: .defaultTap, eventsOfInterest: mask,
@@ -2764,12 +2611,11 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         setIcon()
         let m = NSMenu()
         let excluded = loadExcluded()
-        let riding = macPassengers(cfg: cfg, me: me).filter { !excluded.contains($0.id) }.count
         // Every machine now knows who holds the wheel, not just whether it does
         // itself. Before this there was no fleet-wide driver state anywhere:
         // two menu bars could both show a steering wheel and neither could say so.
         let elsewhere = wheelHolder(wheel: readWheel(), me: me.id, ttl: cfg.rideTTLSeconds)
-        let header = driving ? "Driving \(riding) passenger\(riding == 1 ? "" : "s")"
+        let header = driving ? "Driving from \(me.jumpName)"
                              : (elsewhere.map { "Parked — \($0) is driving" } ?? "Parked")
         m.addItem(withTitle: header, action: nil, keyEquivalent: "")
         m.addItem(.separator())
@@ -2783,9 +2629,12 @@ final class MenuApp: NSObject, NSApplicationDelegate {
             // stray click on the mini was enough to strand the whole fleet.
             m.addItem(withTitle: "Passenger only — cannot drive", action: nil, keyEquivalent: "")
         }
+        if !driving, readRide() != nil {
+            m.addItem(withTitle: "Use This Mac Locally", action: #selector(useLocally), keyEquivalent: "l").target = self
+        }
         m.addItem(.separator())
         for t in macPassengers(cfg: cfg, me: me) {
-            let mi = NSMenuItem(title: t.jumpName, action: #selector(toggleMachine(_:)), keyEquivalent: "")
+            let mi = NSMenuItem(title: excluded.contains(t.id) ? "\(t.jumpName) — Not included" : fleetRow(t, session: currentSession(me)), action: #selector(toggleMachine(_:)), keyEquivalent: "")
             mi.target = self
             mi.representedObject = t.id
             mi.state = excluded.contains(t.id) ? .off : .on
@@ -2797,7 +2646,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         let sub = NSMenu()
         for (title, sel, on) in [
             ("Reverse Mouse Scrolling", #selector(toggleScroll), settings.reverseScroll),
-            ("Walk-Up Handback", #selector(toggleWalkup), settings.walkupHandback),
+            ("Return Locally on Lid/Keyboard Activity", #selector(toggleWalkup), settings.walkupHandback),
             ("Retina Passengers (HiDPI)", #selector(toggleHiDPI), settings.hidpiRides),
         ] {
             let mi = NSMenuItem(title: title, action: sel, keyEquivalent: "")
@@ -2817,29 +2666,17 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     }
 
     @objc func toggleMachine(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String,
-              let t = cfg.machines.first(where: { $0.id == id }) else { return }
-        var excluded = loadExcluded()
-        if excluded.contains(id) {
-            excluded.remove(id)
-            saveExcluded(excluded)
-            if driving {
-                let engine = DisplayEngine()
-                let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
-                DispatchQueue.global().async { [self] in
-                    clearRemoteHandback(on: t)
-                    _ = placeRide(on: t, canvas: canvas, hidpi: loadSettings().hidpiRides, driver: me.id)
-                    let names = (t.jumpAliases ?? []) + [t.jumpName]   // recents use the short alias names
-                    _ = names.contains(where: { openJumpSession($0) })
-                }
-            }
-        } else {
-            excluded.insert(id)
-            saveExcluded(excluded)
-            if driving { DispatchQueue.global().async { endRide(on: t) } }
-        }
-        rebuild()
+        guard let id = sender.representedObject as? String else { return }
+        var r = ControlRequest(kind: "include"); r.target = id; r.include = loadExcluded().contains(id)
+        sendControl(r)
     }
+    func sendControl(_ request: ControlRequest) {
+        DispatchQueue.global().async { [self] in
+            let reply = requestDaemon(request)
+            DispatchQueue.main.async { self.notify(reply.message); self.rebuild() }
+        }
+    }
+    @objc func useLocally() { sendControl(ControlRequest(kind: "local")) }
 
     @objc func toggleScroll() {
         var s = loadSettings(); s.reverseScroll.toggle(); saveSettings(s)
@@ -2916,21 +2753,103 @@ func openJumpTarget(_ t: Machine) -> Bool {
     return names.contains(where: { openJumpSession($0) })
 }
 
-// Open a Jump window for every included, not-walked-up passenger. Records the
-// boot marker when at least one opened, so boot-resume runs once per boot.
-func openSessionWindows(cfg: Config, me: Machine, targets: [Machine]? = nil) -> Int {
+// Titles Jump may give this passenger's session window. The exported alias
+// document's DisplayName is authoritative (it is the name the window shows);
+// the fleet config's aliases and full name cover a machine opened from Open
+// Recent instead. Pure and selftested.
+func sessionWindowTitles(for t: Machine, aliasTitle: String?) -> [String] {
+    var titles: [String] = []
+    if let a = aliasTitle, !a.isEmpty { titles.append(a) }
+    return titles + (t.jumpAliases ?? []) + [t.jumpName]
+}
+
+// Exact match only: "MacBook Air" must never claim a window titled
+// "MacBook Air 13". Pure and selftested.
+func hasOpenSessionWindow(_ t: Machine, aliasTitle: String?, openTitles: [String]) -> Bool {
+    let open = Set(openTitles.map { $0.trimmingCharacters(in: .whitespaces) })
+    return sessionWindowTitles(for: t, aliasTitle: aliasTitle).contains { open.contains($0) }
+}
+
+func aliasDisplayName(for id: String) -> String? {
+    guard let d = try? Data(contentsOf: sessionAlias(for: id)),
+          let p = try? PropertyListSerialization.propertyList(from: d, options: [], format: nil) as? [String: Any]
+    else { return nil }
+    return p["DisplayName"] as? String
+}
+
+// The viewer's open session windows, by title, read from Jump's Window menu:
+// AppKit lists every window of the app there, including ones parked on other
+// full-screen Spaces, which CGWindowList(.optionOnScreenOnly) and AX `windows`
+// both leave out. nil means the menu could not be read (no Accessibility, a
+// half-built menu) -- unknown, not empty -- and callers then open as before.
+// A viewer that is not running has no windows: that is a known empty list.
+func openJumpWindowTitles() -> [String]? {
+    guard sh("pgrep -f '\(jumpViewerPattern)' >/dev/null").code == 0 else { return [] }
+    let script = """
+    set AppleScript's text item delimiters to linefeed
+    tell application "System Events" to tell process "Jump Desktop"
+      set titles to name of every menu item of menu 1 of menu bar item "Window" of menu bar 1
+    end tell
+    set out to {}
+    repeat with n in titles
+      set v to contents of n
+      if v is not missing value then set end of out to v
+    end repeat
+    return out as text
+    """
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mira-windows-\(UUID().uuidString).scpt")
+    try? script.write(to: tmp, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let r = sh("osascript '\(tmp.path)'", timeout: 10)
+    guard r.code == 0 else {
+        log("Window menu unreadable, opening without duplicate check -> \(r.out.trimmingCharacters(in: .whitespacesAndNewlines))")
+        return nil
+    }
+    return r.out.components(separatedBy: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+}
+
+// Pure and selftested.
+func sessionWindowSummary(opened: Int, kept: Int) -> String {
+    func n(_ k: Int) -> String { "\(k) session window\(k == 1 ? "" : "s")" }
+    switch (opened, kept) {
+    case (0, 0): return "No session windows opened"
+    case (_, 0): return "Reopened \(n(opened))"
+    case (0, _): return kept == 1 ? "Session window already open" : "All \(kept) session windows already open"
+    default: return "Reopened \(n(opened)), \(kept) already open"
+    }
+}
+
+// Open a Jump window for every included, not-walked-up passenger whose window
+// is not already up. Records the boot marker when at least one is open (new or
+// kept), so boot-resume runs once per boot.
+func openSessionWindows(cfg: Config, me: Machine, targets: [Machine]? = nil) -> (opened: Int, kept: Int) {
     // A caller that just placed rides already knows who is rideable; re-probing
     // every passenger over SSH here doubled the round trips on the drive path.
     let list = targets ?? rideablePassengers(cfg: cfg, me: me)
-    var opened = 0
+    // A window that survived -- a sleep/wake, a reconnect in flight, a Drive
+    // re-issued over a live session -- must not be opened a second time. Jump
+    // drops a duplicate itself only once the original is Connected; a Drive
+    // that landed while the original was still reconnecting kept the extra
+    // window (air13 driving the pro, 2026-09-15 08:45:17).
+    let open = list.isEmpty ? nil : openJumpWindowTitles()
+    if let open = open, !open.isEmpty { log("viewer Window menu: \(open.joined(separator: " | "))") }
+    var opened = 0, kept = 0
     for t in list {
+        if let open = open, hasOpenSessionWindow(t, aliasTitle: aliasDisplayName(for: t.id), openTitles: open) {
+            kept += 1
+            log("session window for \(t.id) already open -- not reopening")
+            continue
+        }
         // Sequential on purpose. The alias path is a cheap `open`, but the
         // menu-scripting fallback drives the viewer's UI, and two of those at
         // once fight over the front window.
         if openJumpTarget(t) || openJumpTarget(t) { opened += 1 }   // one retry
     }
-    if opened > 0 { writeSessionMarker() }
-    return opened
+    if opened + kept > 0 { writeSessionMarker() }
+    return (opened, kept)
 }
 
 // Included passengers that are not currently walked up, probed in parallel.
@@ -2942,73 +2861,18 @@ func rideablePassengers(cfg: Config, me: Machine) -> [Machine] {
 }
 
 extension MenuApp {
-    @objc func drive() {
-        try? FileManager.default.removeItem(at: handbackFile)   // explicit drive overrides walk-up
-        claimDriver(me: me)
-        let engine = DisplayEngine()
-        let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
-        let cfg = self.cfg, me = self.me
-        DispatchQueue.global().async { [self] in
-            let handoff = stopOtherDrivers(cfg: cfg, me: me)
-            let excluded = loadExcluded()
-            let targets = macPassengers(cfg: cfg, me: me).filter { !excluded.contains($0.id) }
-            // An explicit drive overrides any walk-up, so there is nothing to
-            // probe: clear the handback and claim every passenger at once.
-            _ = forEachPeer(targets) { t -> Bool in
-                clearRemoteHandback(on: t)
-                return placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
-            }
-            let opened = openSessionWindows(cfg: cfg, me: me, targets: targets)
-            DispatchQueue.main.async {
-                // Say it when the handoff was not clean. Silence here is what
-                // let "could not reach air13 to stop its driving flag" sit in
-                // a log file while the fleet ran with two drivers.
-                var msg = "Driving: \(opened)/\(targets.count) sessions open (\(canvas))"
-                if !handoff.unreachable.isEmpty {
-                    msg += "\n\(handoff.unreachable.joined(separator: ", ")) "
-                         + "could not be stopped — will yield on waking"
-                }
-                self.notify(msg)
-                self.rebuild()
-            }
-        }
-    }
+    @objc func drive() { sendControl(ControlRequest(kind: "drive")) }
     // Re-open viewer windows without touching rides/handbacks — for a closed
     // window mid-session or a boot-resume triggered manually.
     @objc func reopenWindows() {
         DispatchQueue.global().async { [self] in
-            let opened = openSessionWindows(cfg: cfg, me: me)
-            DispatchQueue.main.async { self.notify("Reopened \(opened) session window\(opened == 1 ? "" : "s")") }
+            let r = openSessionWindows(cfg: cfg, me: me)
+            DispatchQueue.main.async { self.notify(sessionWindowSummary(opened: r.opened, kept: r.kept)) }
         }
     }
     @objc func stop() {
-        // Only tear the fleet down if we ACTUALLY hold the wheel. A machine that
-        // has already yielded gets its driving flag removed by the new driver
-        // over ssh — no code in this process runs — so the menu could still be
-        // offering "Stop Driving" long after the wheel moved. Acting on that
-        // stale item used to end the NEW driver's rides on every passenger and
-        // wipe its beacons: the exact opposite of what the click means, and a
-        // one-click way to break the session the user had just started.
-        let wasDriving = FileManager.default.fileExists(atPath: drivingFlag.path)
-        try? FileManager.default.removeItem(at: drivingFlag)
-        sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")   // close our own viewer either way
-        guard wasDriving else {
-            log("Stop Driving clicked but we do not hold the wheel — "
-              + "leaving \(readWheel()?.driver ?? "the current driver")'s rides alone")
-            notify("Not driving — \(readWheel()?.driver ?? "another machine") holds the wheel")
-            rebuild()
-            return
-        }
-        try? FileManager.default.removeItem(at: wheelFile)
-        for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
-        // Release the wheel everywhere too, so no other menu bar goes on
-        // naming a driver that has parked.
-        let cfg = self.cfg, me = self.me
-        DispatchQueue.global().async {
-            _ = forEachPeer(otherViewers(cfg: cfg, me: me)) { clearWheel(on: $0) }
-        }
-        notify("Stopped driving — passengers return to console")
-        rebuild()
+        var r = ControlRequest(kind: "stop"); r.session = currentSession(me)
+        sendControl(r)
     }
 
     // The menu bar was a snapshot of the last time THIS app acted. Losing the
@@ -3020,10 +2884,20 @@ extension MenuApp {
         let claim = (try? String(contentsOf: drivingFlag, encoding: .utf8)) ?? ""
         let driving = FileManager.default.fileExists(atPath: drivingFlag.path)
         let wheel = readWheel().map { "\($0.driver)@\($0.claimedAt)" } ?? "-"
-        return "\(driving)|\(claim)|\(wheel)|\(loadExcluded().sorted().joined(separator: ","))"
+        let fleet = macPassengers(cfg: cfg, me: me).map { fleetRow($0, session: currentSession(me)) }.joined(separator: "|")
+        return "\(driving)|\(claim)|\(wheel)|\(fleet)|\(readRide() != nil)|\(loadExcluded().sorted().joined(separator: ","))"
     }
 
     @objc func refreshMenuIfChanged() {
+        // Incoming remote wheel events must not be normalized a second time.
+        localScrollOwner = readRide() == nil && !FileManager.default.fileExists(atPath: arrangementFile.path)
+        updateViewerMeasurement(me)
+        if let request = readJSON(SessionID.self, sessionOpenFile), request == currentSession(me) {
+            removeState(sessionOpenFile)
+            DispatchQueue.global().async { [self] in
+                if currentSession(me) == request { _ = openSessionWindows(cfg: cfg, me: me) }
+            }
+        }
         let sig = menuStateSignature()
         guard sig != lastMenuState else { return }
         rebuild()   // rebuild() re-stamps lastMenuState
@@ -3036,8 +2910,9 @@ extension MenuApp {
         }
     }
     func notify(_ text: String) {
-        let esc = text.replacingOccurrences(of: "\"", with: "\\\"")
-        sh("osascript -e 'display notification \"\(esc)\" with title \"MIRA\"'")
+        let esc = text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "display notification \"\(esc)\" with title \"MIRA\""
+        _ = sh("osascript -e \(shellQuote(script))", timeout: 3)
     }
 
     // After a reboot the driving flag survives and the daemon re-places rides,
@@ -3051,11 +2926,10 @@ extension MenuApp {
         // Settle delay: Tailscale, Jump Desktop, and the menu bar all come up
         // around login; UI scripting too early hits half-built menus.
         DispatchQueue.global().asyncAfter(deadline: .now() + 12) { [self] in
-            let opened = openSessionWindows(cfg: cfg, me: me)
-            log("boot resume: opened \(opened) session window(s)")
-            DispatchQueue.main.async {
-                self.notify("Resumed driving: \(opened) session window\(opened == 1 ? "" : "s") reopened")
-            }
+            let r = openSessionWindows(cfg: cfg, me: me)
+            let summary = sessionWindowSummary(opened: r.opened, kept: r.kept)
+            log("boot resume: \(summary)")
+            DispatchQueue.main.async { self.notify("Resumed driving: \(summary)") }
         }
     }
 }
@@ -3099,6 +2973,54 @@ func selftest() -> Never {
                       laptopCanvas: "laptop-air") == "laptop-air", "builtin only -> laptop canvas")
     expect(pickCanvas(physicalWidths: [], dockedCanvas: "ultrawide",
                       laptopCanvas: "laptop-air") == "laptop-air", "headless -> laptop canvas")
+    // ---- the driver's own screen, read out of process ----
+    // A daemon that never runs a run loop never receives display-reconfiguration
+    // callbacks, so its in-process CoreGraphics display list can outlive the
+    // displays themselves: on 2026-09-16 the pro undocked in the morning and its
+    // daemon asserted the BenQ's 3440x1440 canvas onto both passengers for
+    // fourteen hours, while every fresh process on the same Mac read 1728.
+    expect(decodeScreenSurvey("{\"widths\":[1728]}") == [1728], "screen survey decodes")
+    expect(decodeScreenSurvey("{\"widths\":[]}") == [], "headless survey decodes as empty")
+    expect(decodeScreenSurvey("not json") == nil, "garbage survey -> nil, caller falls back")
+    // ---- measured geometry expires (pure, selftested) ----
+    // Stickiness is deliberate (a Space switch must not rebuild a display), but
+    // it was UNBOUNDED: geometry was only ever cleared when the session or the
+    // canvas key changed, so a measurement taken while docked kept being sent
+    // long after the panel it measured was gone.
+    let gSession = SessionID(driver: "pro", claim: 1000)
+    let laptopScreen = ContentArea(w: 1728, h: 1117)
+    let wideScreen = ContentArea(w: 3440, h: 1440)
+    func measured(_ content: ContentArea, _ screen: ContentArea, age: Double,
+                  session: SessionID = gSession) -> ViewerMeasurement {
+        ViewerMeasurement(session: session, content: content, ts: now - age, screen: screen)
+    }
+    expect(adoptedGeometry(previous: nil, measurement: measured(ContentArea(w: 1728, h: 1084), laptopScreen, age: 1),
+                           session: gSession, screen: laptopScreen, now: now) == ContentArea(w: 1728, h: 1084),
+           "fresh measurement of this screen is adopted")
+    expect(adoptedGeometry(previous: ContentArea(w: 3440, h: 1440),
+                           measurement: measured(ContentArea(w: 3440, h: 1440), wideScreen, age: 1),
+                           session: gSession, screen: laptopScreen, now: now) == nil,
+           "measurement of a different screen is dropped (the undock)")
+    expect(adoptedGeometry(previous: ContentArea(w: 3440, h: 1440),
+                           measurement: measured(ContentArea(w: 3440, h: 1440), laptopScreen, age: 400),
+                           session: gSession, screen: laptopScreen, now: now) == nil,
+           "measurement older than the TTL is dropped")
+    expect(adoptedGeometry(previous: ContentArea(w: 1728, h: 1084),
+                           measurement: measured(ContentArea(w: 1728, h: 1084), laptopScreen, age: 40),
+                           session: gSession, screen: laptopScreen, now: now) == ContentArea(w: 1728, h: 1084),
+           "a short measuring gap keeps the sticky value")
+    expect(adoptedGeometry(previous: ContentArea(w: 1728, h: 1084), measurement: nil,
+                           session: gSession, screen: laptopScreen, now: now) == ContentArea(w: 1728, h: 1084),
+           "no measurement at all keeps the sticky value")
+    expect(adoptedGeometry(previous: ContentArea(w: 1728, h: 1084),
+                           measurement: measured(ContentArea(w: 1280, h: 800), laptopScreen, age: 1,
+                                                 session: SessionID(driver: "air13", claim: 900)),
+                           session: gSession, screen: laptopScreen, now: now) == nil,
+           "another session's measurement is not ours to keep")
+    expect(adoptedGeometry(previous: ContentArea(w: 1728, h: 1084),
+                           measurement: measured(ContentArea(w: 1728, h: 1085), laptopScreen, age: 1),
+                           session: gSession, screen: laptopScreen, now: now) == ContentArea(w: 1728, h: 1084),
+           "one-point nudge stays inside the deadband")
     // console presence via idle-time
     expect(consolePresent(idleNow: 2, idlePrev: 5, threshold: 20), "sustained input -> present")
     expect(!consolePresent(idleNow: 2, idlePrev: 300, threshold: 20), "single blip -> not present")
@@ -3341,6 +3263,29 @@ func selftest() -> Never {
            "not driving -> no resume")
     expect(!shouldResumeSessions(driving: true, viewer: false, markerBoot: nil, currentBoot: 111),
            "not a viewer -> no resume")
+    // duplicate-window guard: a passenger whose session window is already in
+    // Jump's Window menu is kept, not opened again
+    let proMachine = Machine(id: "pro", jumpName: "Amir’s MacBook Pro", host: "h", tailscale: "t", user: "u",
+                             roles: ["viewer", "target"], laptopCanvas: nil, dockedCanvas: nil, type: nil,
+                             jumpAliases: ["MacBook Pro"])
+    let air15Machine = Machine(id: "air15", jumpName: "Amir’s MacBook Air 15", host: "h", tailscale: "t", user: "u",
+                               roles: ["target"], laptopCanvas: nil, dockedCanvas: nil, type: nil,
+                               jumpAliases: ["MacBook Air"])
+    let windowMenu = ["Minimize", "Zoom", "MacBook Pro", "MacBook Air 13", "Bring All to Front"]
+    expect(hasOpenSessionWindow(proMachine, aliasTitle: "MacBook Pro", openTitles: windowMenu),
+           "alias document title in Window menu -> already open")
+    expect(hasOpenSessionWindow(proMachine, aliasTitle: nil, openTitles: windowMenu),
+           "config alias in Window menu -> already open")
+    expect(hasOpenSessionWindow(proMachine, aliasTitle: "Pro Session", openTitles: ["Pro Session"]),
+           "renamed alias document title is matched")
+    expect(!hasOpenSessionWindow(air15Machine, aliasTitle: "MacBook Air", openTitles: windowMenu),
+           "'MacBook Air' must not claim the 'MacBook Air 13' window")
+    expect(!hasOpenSessionWindow(air15Machine, aliasTitle: nil, openTitles: []),
+           "no windows -> open")
+    expect(sessionWindowSummary(opened: 3, kept: 0) == "Reopened 3 session windows", "summary: all opened")
+    expect(sessionWindowSummary(opened: 1, kept: 2) == "Reopened 1 session window, 2 already open", "summary: mixed")
+    expect(sessionWindowSummary(opened: 0, kept: 3) == "All 3 session windows already open", "summary: all kept")
+    expect(sessionWindowSummary(opened: 0, kept: 0) == "No session windows opened", "summary: none")
     // dumpmacperm parse (vendor typo + warning noise tolerated)
     let permOut = """
     WARNING: QApplication was not created in the main() thread.
@@ -3526,6 +3471,7 @@ func selftest() -> Never {
     expect(presenceThreshold(configured: cfg.presenceThresholdSeconds,
                              reconcile: cfg.reconcileSeconds) >= 20,
            "configured presence threshold is not trigger-happy")
+    reliabilityTests(expect)
     print(failures == 0 ? "MIRA selftest: OK" : "MIRA selftest: \(failures) FAILURES")
     exit(failures == 0 ? 0 : 1)
 }
@@ -3537,6 +3483,36 @@ switch args.count > 1 ? args[1] : "" {
 // Select a display mode from a FRESH process, whose CoreGraphics snapshot can
 // actually see a virtual display's published modes. Called by the daemon when
 // its own snapshot is blind — see selectVirtualModeOutOfProcess.
+case "configure-passenger":
+    let a = args.dropFirst(2).compactMap { UInt32($0) }
+    guard a.count == 6 else { exit(2) }
+    let (id, w, h, px, py, retained) = (a[0], Int(a[1]), Int(a[2]), Int(a[3]), Int(a[4]), a[5])
+    let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+    let modes = (CGDisplayCopyAllDisplayModes(id, opts) as? [CGDisplayMode]) ?? []
+    guard let mode = modes.first(where: { $0.width == w && $0.height == h && $0.pixelWidth == px && $0.pixelHeight == py }) else {
+        print("requested display mode is not published"); exit(1)
+    }
+    var ids = [CGDirectDisplayID](repeating: 0, count: 32)
+    var count: UInt32 = 0
+    guard CGGetOnlineDisplayList(32, &ids, &count) == .success else { exit(1) }
+    let online = Array(ids.prefix(Int(count)))
+    guard online.contains(id) else { print("candidate display is not online"); exit(1) }
+    var transaction: CGDisplayConfigRef?
+    guard CGBeginDisplayConfiguration(&transaction) == .success, let transaction = transaction else { exit(1) }
+    func checked(_ result: CGError) {
+        if result != .success { CGCancelDisplayConfiguration(transaction); print("configuration rejected: \(result.rawValue)"); exit(1) }
+    }
+    checked(CGConfigureDisplayWithDisplayMode(transaction, id, mode, nil))
+    for physical in online where CGDisplayVendorNumber(physical) != miraVendorID {
+        checked(CGConfigureDisplayMirrorOfDisplay(transaction, physical, id))
+    }
+    if retained != 0 && retained != id && online.contains(retained) {
+        checked(CGConfigureDisplayOrigin(transaction, retained, Int32(w + 64), 0))
+    }
+    checked(CGConfigureDisplayOrigin(transaction, id, 0, 0))
+    let result = CGCompleteDisplayConfiguration(transaction, .permanently)
+    print(result == .success ? "applied \(w)x\(h) pixels \(px)x\(py)" : "transaction failed: \(result.rawValue)")
+    exit(result == .success ? 0 : 1)
 case "vmode":
     let a = CommandLine.arguments.dropFirst(2).compactMap { Int($0) }
     guard a.count == 4 else { print("usage: mira vmode <displayID> <w> <h> <px>"); exit(2) }
@@ -3559,9 +3535,49 @@ case "vmode":
           ? "set \(target.width)x\(target.height) px=\(target.pixelWidth) (of \(all.count) modes)"
           : "CGCompleteDisplayConfiguration error \(vr.rawValue)")
     exit(vr == .success ? 0 : 1)
+case "version", "--version": print("MIRA \(miraVersion) (\(miraBuild))"); exit(0)
+case "help", "--help", "-h":
+    print("mira status | drive | stop | console | handback | wheel | doctor | report | perf | version | selftest")
+    print("inspect-screens prints the displays actually attached to this Mac.")
+    print("Drive takes over the fleet. Console/handback return only this Mac to local use.")
+    exit(0)
+case "control":
+    guard args.count == 3, let data = Data(base64Encoded: args[2]),
+          let r = try? JSONDecoder().decode(ControlRequest.self, from: data) else { exit(2) }
+    let reply = requestDaemon(r)
+    if let data = try? JSONEncoder().encode(reply) { print(String(decoding: data, as: UTF8.self)) }
+    exit(reply.ok ? 0 : 1)
+case "inspect-display":
+    guard args.count == 3, let id = UInt32(args[2]), let mode = CGDisplayCopyDisplayMode(id) else { exit(1) }
+    var ids = [CGDirectDisplayID](repeating: 0, count: 32)
+    var count: UInt32 = 0
+    guard CGGetOnlineDisplayList(32, &ids, &count) == .success else { exit(1) }
+    let mirrors = ids.prefix(Int(count)).filter { CGDisplayVendorNumber($0) != miraVendorID }
+        .allSatisfy { CGDisplayMirrorsDisplay($0) == id }
+    let observed = DisplayObservation(w: mode.width, h: mode.height, px: mode.pixelWidth, py: mode.pixelHeight,
+        isMain: CGDisplayIsMain(id) != 0, mirrorsMatch: mirrors)
+    if let data = try? JSONEncoder().encode(observed) { print(String(decoding: data, as: UTF8.self)) }
+    exit(0)
+case "inspect-screens":
+    // Deliberately a separate process: see freshPhysicalWidths.
+    var screenIDs = [CGDirectDisplayID](repeating: 0, count: 32)
+    var screenCount: UInt32 = 0
+    guard CGGetOnlineDisplayList(32, &screenIDs, &screenCount) == .success else { exit(1) }
+    let widths = screenIDs.prefix(Int(screenCount))
+        .filter { CGDisplayVendorNumber($0) != miraVendorID }
+        .map { Int(CGDisplayPixelsWide($0)) }
+    if let data = try? JSONEncoder().encode(ScreenSurvey(widths: widths)) {
+        print(String(decoding: data, as: UTF8.self))
+    }
+    exit(0)
+case "ipc-selftest": controlIntegrationTests()
 case "selftest": selftest()
 case "--daemon": runDaemon(cfg: loadConfig())
 case "status":
+    if let state = readJSON(RuntimeSnapshot.self, snapshotFile) {
+        if args.contains("--json") { print(String(decoding: try! JSONEncoder().encode(state), as: UTF8.self)); exit(0) }
+        print("MIRA \(miraVersion) build \(state.build) — \(state.machine): \(state.state), \(state.detail) (\(Int(Date().timeIntervalSince1970 - state.ts))s ago)")
+    } else { print("Mira has no runtime report; daemon may be unavailable") }
     let cfg = loadConfig(); let me = selfMachine(cfg)
     let mode = computeMode(ride: readRide(), ttl: cfg.rideTTLSeconds,
                            now: Date().timeIntervalSince1970)
@@ -3580,29 +3596,11 @@ case "status":
             : "  windows: NOT opened this boot (menu: Reopen Session Windows)"
     }
     print(line)
-case "drive":
-    let cfg = loadConfig(); let me = selfMachine(cfg)
-    claimDriver(me: me)
-    let handoff = stopOtherDrivers(cfg: cfg, me: me)
-    for id in handoff.stopped { print("\(id): stopped driving") }
-    for id in handoff.unreachable {
-        print("\(id): UNREACHABLE — still holds its claim, yields on its first reachable beat")
-    }
-    let engine = DisplayEngine()
-    let canvas = driverCanvasKey(cfg: cfg, me: me, engine: engine)
-    let targets = macPassengers(cfg: cfg, me: me)
-    let placed = forEachPeer(targets) { t -> Bool in
-        clearRemoteHandback(on: t)   // explicit drive overrides target walk-up
-        return placeRide(on: t, canvas: canvas, hidpi: true, driver: me.id)
-    }
-    for t in targets {   // report in config order, not completion order
-        print("\(t.id): \(placed[t.id] == true ? "riding (\(canvas))" : "RIDE FAILED")")
-    }
-    // Alias documents open from any context; only the menu-scripting fallback
-    // would need the terminal's Accessibility grant.
-    let opened = openSessionWindows(cfg: cfg, me: me, targets: targets)
-    print(opened > 0 ? "opened \(opened) session window(s)"
-                     : "no windows opened — use the MIRA menu (Drive from Here / Reopen Session Windows)")
+case "drive", "stop", "console", "handback":
+    let verb = args[1]
+    var r = ControlRequest(kind: verb == "console" || verb == "handback" ? "local" : verb)
+    if verb == "stop" { let cfg = loadConfig(); r.session = currentSession(selfMachine(cfg)) }
+    let answer = requestDaemon(r); print(answer.message); exit(answer.ok ? 0 : 1)
 case "wheel":
     // "Who is driving?" — the question that took an evening of hand-SSH to
     // answer on 2026-08-19, and the fastest way to confirm a handoff landed.
@@ -3626,35 +3624,6 @@ case "wheel":
             + "\(Int(Date().timeIntervalSince1970 - w.ts))s old)")
     }
     exit(s.claimants.count > 1 ? 1 : 0)
-case "stop":
-    // Same guard as the menu's Stop Driving: a machine that already yielded must
-    // not tear down the CURRENT driver's rides. Stopping something you are not
-    // doing has to be a no-op, not a fleet-wide teardown.
-    let cfg = loadConfig(); let me = selfMachine(cfg)
-    let wasDriving = FileManager.default.fileExists(atPath: drivingFlag.path)
-    try? FileManager.default.removeItem(at: drivingFlag)
-    sh("pkill -f '\(jumpViewerPattern)' 2>/dev/null")   // close our own viewer either way
-    if wasDriving {
-        try? FileManager.default.removeItem(at: wheelFile)
-        for t in macPassengers(cfg: cfg, me: me) { endRide(on: t) }
-        _ = forEachPeer(otherViewers(cfg: cfg, me: me)) { clearWheel(on: $0) }
-        print("stopped — passengers return to console")
-    } else {
-        print("not driving — \(readWheel()?.driver ?? "another machine") holds the wheel; "
-            + "left its rides alone")
-    }
-case "console":
-    let cfg = loadConfig()
-    try? FileManager.default.removeItem(at: rideFile)
-    let rec = Reconciler(cfg: cfg); rec.lastMode = .passenger(canvas: "", hidpi: false)
-    rec.tick()
-    print("console mode")
-case "handback":
-    let cfg = loadConfig()
-    writeHandback()
-    let rec = Reconciler(cfg: cfg); rec.lastMode = .passenger(canvas: "", hidpi: false)
-    rec.tick()   // fresh handback -> immediate console converge
-    print("handback — returned to console")
 case "perf":
     // Reads the structured event log and answers "is this getting better or
     // worse". Deliberately percentile-based: an average hides exactly the tail
@@ -3732,7 +3701,7 @@ case "perf":
         }
     }
     let sz = (try? FileManager.default.attributesOfItem(atPath: eventsFile.path)[.size] as? Int) ?? 0
-    print("log: \(eventsFile.path) (\((sz ?? 0) / 1024) KB, caps at \(eventsCapBytes / 1024) KB + 1 rotation)")
+    print("log: \(eventsFile.path) (\(sz / 1024) KB, caps at \(eventsCapBytes / 1024) KB + 1 rotation)")
 
 case "report":
     let text = ((try? String(contentsOf: logFile, encoding: .utf8)) ?? "")
@@ -3761,6 +3730,8 @@ case "doctor":
     let (report, failures) = doctor(cfg: cfg, me: selfMachine(cfg))
     print(report); exit(failures == 0 ? 0 : 1)
 default:
+    guard args.count == 1 else { fputs("Unknown command. Run mira help.\n", stderr); exit(2) }
+    guard singleton("menu") else { exit(0) }
     let app = NSApplication.shared
     let delegate = MenuApp()
     app.delegate = delegate

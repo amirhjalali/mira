@@ -62,6 +62,41 @@ Every automatic behavior must fail toward *doing nothing*:
 
 ## Incident log
 
+- 2026-09-16: the pro left home docked and drove all day from a hotel on its
+  built-in panel, while the mini and air15 stayed at the BenQ's 3440x1440 for
+  fourteen hours. Every diagnostic disagreed with the driver at the same
+  moment: `mira doctor` printed "Measured viewer: 1728x1084", a fresh probe
+  read one 1728-wide display, and the ride captured off the wire said
+  `{"canvas":"ultrawide","canvasW":3440,"canvasH":1440}`. The mini had logged
+  1636 consecutive `lease_recv` with the same canvas — it never once changed.
+  Cause: `driverCanvasKey` reads `CGGetOnlineDisplayList` **inside the daemon**,
+  and CoreGraphics only refreshes a process's display list from the
+  reconfiguration callback, which needs a run loop. `runDaemon` has none by
+  design (see the comment above `virtualDisplayQueue`), so the callback
+  registered in it is never delivered and its display list still named a
+  monitor unplugged that morning. The second half was `geometry`: measured
+  content was sticky with no expiry at all, cleared only on a session or canvas
+  change, so the 3440x1440 hole measured at home outlived the panel it was
+  measured in. It was silent as well as wrong: the 2.1 driver logged this
+  transition ("driver canvas ultrawide -> laptop-pro; re-asserting now", last
+  seen 2026-09-12) and the 2.2 daemon rewrite dropped the line along with the
+  re-assert.
+  Fixes: the driver asks a fresh process (`mira inspect-screens`, cached 5s,
+  falling back to the local list on failure) what is actually plugged in;
+  `adoptedGeometry` drops a measurement taken on a different panel, in another
+  session, or older than two minutes, while keeping the deliberate stickiness
+  across Space switches; and a canvas change is now logged and emitted
+  (`driver_canvas`).
+  Verified live: restarting the daemon alone moved both passengers to
+  1728x1117@2x within one beat — which is the proof, since only the process
+  identity changed.
+  Lesson: a process that does not run a run loop cannot be asked what the
+  hardware is doing. MIRA already knew this about virtual-display callbacks and
+  wrote it down; the same fact applies to every CG display query the daemon
+  makes about hardware it does not own. And stickiness without an expiry is not
+  stability — it is a cache that can never be wrong, which means it can never
+  be corrected.
+
 - 2026-08-23: the pro took the wheel from air15 cleanly — flag removed, beacon
   installed, `mira wheel` reporting one driver — and the Air's menu bar went on
   showing the steering wheel and "Driving N passengers" anyway. The handoff

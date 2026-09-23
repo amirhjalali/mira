@@ -2441,53 +2441,60 @@ func runDaemon(cfg: Config) -> Never {
     var nextReconcile = 0.0, nextDrive = 0.0, nextRuntime = 0.0, nextHealth = 0.0
     var sentKey = "", session: SessionID?, geometry: ContentArea?, canvasKey = ""
     while true {
-        let changed = serviceCommands(rec)
-        let now = ProcessInfo.processInfo.systemUptime
-        if changed || now >= nextReconcile {
-            rec.tick(); nextReconcile = ProcessInfo.processInfo.systemUptime + cfg.reconcileSeconds
-        }
-        if now >= nextRuntime || changed {
-            publishRuntime(rec); nextRuntime = ProcessInfo.processInfo.systemUptime + 5
-        }
-        if let own = currentSession(rec.me) {
-            let key = driverCanvasKey(cfg: cfg, me: rec.me, engine: rec.engine)
-            if session != own || canvasKey != key {
-                // The shape the whole fleet is about to be told to become, said
-                // out loud. Fourteen hours of a wrong canvas left not one line
-                // of evidence anywhere before this (2026-09-16).
-                log("driver canvas \(canvasKey.isEmpty ? "(none)" : canvasKey) -> \(key)")
-                emit("driver_canvas", [("from", .s(canvasKey)), ("to", .s(key))])
-                geometry = nil; session = own; canvasKey = key; sentKey = ""
+        // No run loop means nothing ever drains the main thread's autorelease
+        // pool, so every Foundation object autoreleased by one beat -- file
+        // reads, JSON coding, Dates, CG lookups -- lived forever. Four beats a
+        // second for six days was a 23 GB footprint on the pro (2026-09-22).
+        // Drain per beat.
+        autoreleasepool {
+            let changed = serviceCommands(rec)
+            let now = ProcessInfo.processInfo.systemUptime
+            if changed || now >= nextReconcile {
+                rec.tick(); nextReconcile = ProcessInfo.processInfo.systemUptime + cfg.reconcileSeconds
             }
-            geometry = adoptedGeometry(previous: geometry,
-                                       measurement: readJSON(ViewerMeasurement.self, measurementFile),
-                                       session: own, screen: mainScreenPoints(),
-                                       now: Date().timeIntervalSince1970)
-            let signature = "\(own.claim)|\(key)|\(geometry?.w ?? 0)x\(geometry?.h ?? 0)|\(loadExcluded().sorted())|\(loadSettings().hidpiRides)"
-            if now >= nextDrive || signature != sentKey || !rec.explicitTargets.isEmpty {
-                let excluded = loadExcluded()
-                for peer in cfg.machines where peer.id != rec.me.id {
-                    let isPassenger = peer.roles.contains("target") && !excluded.contains(peer.id)
-                    var request = ControlRequest(kind: isPassenger ? "ride" : "beacon")
-                    request.session = own
-                    if isPassenger {
-                        request.ride = Ride(driver: rec.me.id, canvas: key, hidpi: loadSettings().hidpiRides,
-                            ts: Date().timeIntervalSince1970, claimedAt: own.claim,
-                            canvasW: geometry?.w, canvasH: geometry?.h)
-                        request.explicit = rec.explicitTargets.contains(peer.id)
-                    }
-                    if sessionTransport.send(peer, request: request, session: own) { rec.explicitTargets.remove(peer.id) }
+            if now >= nextRuntime || changed {
+                publishRuntime(rec); nextRuntime = ProcessInfo.processInfo.systemUptime + 5
+            }
+            if let own = currentSession(rec.me) {
+                let key = driverCanvasKey(cfg: cfg, me: rec.me, engine: rec.engine)
+                if session != own || canvasKey != key {
+                    // The shape the whole fleet is about to be told to become, said
+                    // out loud. Fourteen hours of a wrong canvas left not one line
+                    // of evidence anywhere before this (2026-09-16).
+                    log("driver canvas \(canvasKey.isEmpty ? "(none)" : canvasKey) -> \(key)")
+                    emit("driver_canvas", [("from", .s(canvasKey)), ("to", .s(key))])
+                    geometry = nil; session = own; canvasKey = key; sentKey = ""
                 }
-                nextDrive = now + min(cfg.heartbeatSeconds, 10); sentKey = signature
+                geometry = adoptedGeometry(previous: geometry,
+                                           measurement: readJSON(ViewerMeasurement.self, measurementFile),
+                                           session: own, screen: mainScreenPoints(),
+                                           now: Date().timeIntervalSince1970)
+                let signature = "\(own.claim)|\(key)|\(geometry?.w ?? 0)x\(geometry?.h ?? 0)|\(loadExcluded().sorted())|\(loadSettings().hidpiRides)"
+                if now >= nextDrive || signature != sentKey || !rec.explicitTargets.isEmpty {
+                    let excluded = loadExcluded()
+                    for peer in cfg.machines where peer.id != rec.me.id {
+                        let isPassenger = peer.roles.contains("target") && !excluded.contains(peer.id)
+                        var request = ControlRequest(kind: isPassenger ? "ride" : "beacon")
+                        request.session = own
+                        if isPassenger {
+                            request.ride = Ride(driver: rec.me.id, canvas: key, hidpi: loadSettings().hidpiRides,
+                                ts: Date().timeIntervalSince1970, claimedAt: own.claim,
+                                canvasW: geometry?.w, canvasH: geometry?.h)
+                            request.explicit = rec.explicitTargets.contains(peer.id)
+                        }
+                        if sessionTransport.send(peer, request: request, session: own) { rec.explicitTargets.remove(peer.id) }
+                    }
+                    nextDrive = now + min(cfg.heartbeatSeconds, 10); sentKey = signature
+                }
+            } else { session = nil; sentKey = "" }
+            serviceReleases(cfg: cfg)
+            if now >= nextHealth {
+                nextHealth = now + 300
+                DispatchQueue.global(qos: .utility).async { writeHealth() }
             }
-        } else { session = nil; sentKey = "" }
-        serviceReleases(cfg: cfg)
-        if now >= nextHealth {
-            nextHealth = now + 300
-            DispatchQueue.global(qos: .utility).async { writeHealth() }
+            _ = wake.wait(timeout: .now() + 0.25)
+            while wake.wait(timeout: .now()) == .success {}
         }
-        _ = wake.wait(timeout: .now() + 0.25)
-        while wake.wait(timeout: .now()) == .success {}
     }
 }
 

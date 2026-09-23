@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run on the affected Mac: bash rollback.sh <build> (default: this release).
 set -euo pipefail
-build=${1:-20260916.1}
+build=${1:-20260922.1}
 case "$build" in *[!0-9.]*) echo 'Invalid build' >&2; exit 2;; esac
 id=$(cat "$HOME/.config/mira/machine-id")
 backup="$HOME/Library/Application Support/MIRA/releases/$build-before"

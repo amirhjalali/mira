@@ -2,7 +2,7 @@
 """Build, stage, verify, install and retain a rollback on each named Mac."""
 import hashlib,json,os,pathlib,plistlib,shlex,shutil,subprocess,sys,time
 ROOT=pathlib.Path(__file__).resolve().parents[1]
-BUILD='20260922.1'; VERSION='2.2.0'
+BUILD='20260930.1'; VERSION='2.2.0'
 FLEET={m['id']:(m['user'],m['tailscale']) for m in json.loads((ROOT/'config/machines.json').read_text())['machines'] if m.get('type','mac')=='mac'}
 identity=pathlib.Path.home()/'.config/mira/machine-id'
 LOCAL_ID=identity.read_text().strip() if identity.exists() else 'pro'

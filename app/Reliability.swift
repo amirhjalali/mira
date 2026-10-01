@@ -286,7 +286,7 @@ func handleControl(_ r: ControlRequest, rec: Reconciler) -> ControlReply {
             }
             try atomicJSON(SessionFence(session: s, ended: false, revision: max(fence?.revision ?? 0, r.ride?.ts ?? 0)), to: fenceFile)
             try atomicJSON(Wheel(driver: s.driver, claimedAt: s.claim, ts: now), to: wheelFile)
-            if let own = own, s > own { removeState(drivingFlag); removeState(sessionOpenFile) }
+            if let own = own, s > own { relinquishWheel(to: s.driver) }
             return answer(true, "Accepted; verifying display")
         case "release":
             guard let s = r.session else { return answer(false, "Missing session") }
@@ -502,6 +502,19 @@ func controlIntegrationTests() -> Never {
     var staleStop = ControlRequest(kind: "stop"); staleStop.session = first
     let active = currentSession(rec.me)
     check(handleControl(staleStop, rec: rec).ok && currentSession(rec.me) == active, "stale menu Stop leaves current claim untouched")
+    // 2026-10-01: air13 lost the wheel to the Pro by beacon, dropped its claim,
+    // and kept its Jump session INTO the Pro for 13 hours — feeding the Pro's
+    // meeting audio to its speakers and its mic back into the meeting.
+    var olderBeacon = ControlRequest(kind: "beacon"); olderBeacon.session = first
+    let closesBefore = viewerCloseRequests
+    _ = handleControl(olderBeacon, rec: rec)
+    check(currentSession(rec.me) == active && viewerCloseRequests == closesBefore,
+          "an older driver's beacon neither unseats this Mac nor closes its viewer")
+    var newerBeacon = ControlRequest(kind: "beacon")
+    newerBeacon.session = SessionID(driver: driver, claim: active!.claim + 1)
+    check(handleControl(newerBeacon, rec: rec).ok && currentSession(rec.me) == nil
+          && viewerCloseRequests == closesBefore + 1,
+          "a newer driver's beacon unseats this Mac AND closes its viewer")
     var expired = ControlRequest(kind: "local"); expired.created -= 120
     check(!handleControl(expired, rec: rec).ok, "expired queued commands are not replayed")
     print("Control integration: \(failures == 0 ? "OK" : "FAILED")")

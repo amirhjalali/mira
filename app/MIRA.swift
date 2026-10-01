@@ -688,6 +688,23 @@ func killJumpViewer() -> Bool {
     return !stillAlive
 }
 
+// A driver that loses the wheel must close its viewer too. Dropping the claim
+// alone left air13's session INTO the new driver alive for 13 hours
+// (2026-10-01): Jump Connect on the Pro kept pulling the Pro's output to Jump
+// Desktop Audio for air13's speakers, and air13's mic came back in as Jump
+// Desktop Microphone — a meeting on the Pro echoed through a laptop on the desk.
+// Closing from the host side is useless: the viewer reconnects within a second.
+var viewerCloseRequests = 0
+func relinquishWheel(to holder: String) {
+    removeState(drivingFlag); removeState(sessionOpenFile)
+    viewerCloseRequests += 1
+    log("lost the wheel to \(holder) — closing this Mac's viewer")
+    emit("relinquish", [("to", .s(holder))])
+    // Isolated test state must never kill the real Mac's live sessions.
+    guard ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil else { return }
+    DispatchQueue.global(qos: .utility).async { killJumpViewer() }
+}
+
 // MARK: - Ride (a driver's claim on this passenger)
 
 struct Ride: Codable {
@@ -1660,10 +1677,10 @@ final class Reconciler {
         // holding a dead claim through a sleep and a wake on 2026-08-19.
         if FileManager.default.fileExists(atPath: drivingFlag.path),
            wheelYields(me: me.id, myClaim: readDriverClaim(), wheel: readWheel()) {
-            try? FileManager.default.removeItem(at: drivingFlag)
             let holder = readWheel()?.driver ?? "?"
             log("yielding the wheel to \(holder) (newer claim, via beacon)")
             emit("yield", [("to", .s(holder)), ("via", .s("beacon"))])
+            relinquishWheel(to: holder)
         }
         // Local use holds until explicitly included or a new driver takes over.
         if FileManager.default.fileExists(atPath: localHoldFile.path) {

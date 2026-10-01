@@ -2515,6 +2515,23 @@ func shouldReverseScroll(phase: Int64, momentum: Int64) -> Bool {
     phase == 0 && momentum == 0
 }
 
+// Pure, selftested: wheels here are the owner's own unless a ride is live or
+// MIRA's virtual display is up. The arrangement snapshot is NOT a signal: an
+// unverified console restore retains it, and that silently disabled reversal
+// on a Pro that was driving (2026-10-01).
+func ownsLocalScroll(rideActive: Bool, miraVirtualOnline: Bool) -> Bool {
+    !rideActive && !miraVirtualOnline
+}
+
+// Menu app only: it has a run loop, so its display list is current.
+func refreshLocalScrollOwner() {
+    var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+    var count: UInt32 = 0
+    CGGetOnlineDisplayList(16, &ids, &count)
+    let virtual = ids.prefix(Int(count)).contains { CGDisplayVendorNumber($0) == miraVendorID }
+    localScrollOwner = ownsLocalScroll(rideActive: readRide() != nil, miraVirtualOnline: virtual)
+}
+
 func scrollTapCallback(proxy: CGEventTapProxy, type: CGEventType,
                        event: CGEvent, userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -2565,7 +2582,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         // — including "claim", the most important one to be able to attribute —
         // landed in the log as machine "?".
         eventMachineID = me.id
-        localScrollOwner = readRide() == nil && !FileManager.default.fileExists(atPath: arrangementFile.path)
+        refreshLocalScrollOwner()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         rebuild()
         installScrollTap()
@@ -2903,7 +2920,7 @@ extension MenuApp {
 
     @objc func refreshMenuIfChanged() {
         // Incoming remote wheel events must not be normalized a second time.
-        localScrollOwner = readRide() == nil && !FileManager.default.fileExists(atPath: arrangementFile.path)
+        refreshLocalScrollOwner()
         updateViewerMeasurement(me)
         if let request = readJSON(SessionID.self, sessionOpenFile), request == currentSession(me) {
             removeState(sessionOpenFile)
@@ -3209,6 +3226,15 @@ func selftest() -> Never {
     expect(shouldReverseScroll(phase: 0, momentum: 0), "classic wheel reversed")
     expect(!shouldReverseScroll(phase: 2, momentum: 0), "trackpad live gesture untouched")
     expect(!shouldReverseScroll(phase: 0, momentum: 1), "trackpad momentum untouched")
+    // 2026-10-01: a console Pro kept last night's arrangement snapshot after an
+    // unverified restore, and reversal stayed off all morning. Only a live ride
+    // or MIRA's own virtual display means remote wheels are arriving.
+    expect(ownsLocalScroll(rideActive: false, miraVirtualOnline: false),
+           "scroll owner: console with a retained arrangement snapshot")
+    expect(!ownsLocalScroll(rideActive: true, miraVirtualOnline: false),
+           "scroll owner: a ride without a virtual display is still a passenger")
+    expect(!ownsLocalScroll(rideActive: false, miraVirtualOnline: true),
+           "scroll owner: MIRA's virtual display online means a passenger")
     // audio picks
     let names = ["MacBook Air Speakers", "Jump Desktop Audio", "Jump Desktop Microphone", "ZoomAudioDevice"]
     let pa = pickAudioNames(passenger: true, deviceNames: names)

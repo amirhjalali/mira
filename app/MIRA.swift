@@ -961,9 +961,14 @@ func tierWantsHiDPI(_ t: Tier) -> Bool { t == .full || t == .standard }
 
 // MARK: - Canvas pick (pure, selftested)
 
-// Docked means any physical display at least 3000px wide is attached.
-func pickCanvas(physicalWidths: [Int], dockedCanvas: String, laptopCanvas: String) -> String {
-    physicalWidths.contains { $0 >= 3000 } ? dockedCanvas : laptopCanvas
+// Docked means a physical display at least as wide as the docked canvas is
+// attached, capped at 3000 so the ultrawide rule is unchanged. The cap alone
+// could never see air13's 1920x1200 desk monitor as docked: no built-in panel
+// reaches 1920 points, so that width is unambiguous for it.
+func pickCanvas(physicalWidths: [Int], dockedCanvas: String, dockedWidth: Int? = nil,
+                laptopCanvas: String) -> String {
+    let threshold = min(3000, dockedWidth ?? 3000)
+    return physicalWidths.contains { $0 >= threshold } ? dockedCanvas : laptopCanvas
 }
 
 // MARK: - Native audio engine (CoreAudio, public API)
@@ -2004,9 +2009,10 @@ func freshPhysicalWidths(engine: DisplayEngine, ttl: Double = 5) -> [Int] {
 }
 
 func driverCanvasKey(cfg: Config, me: Machine, engine: DisplayEngine) -> String {
-    pickCanvas(physicalWidths: freshPhysicalWidths(engine: engine),
-               dockedCanvas: me.dockedCanvas ?? cfg.dockedCanvas,
-               laptopCanvas: me.laptopCanvas ?? "laptop-pro")
+    let docked = me.dockedCanvas ?? cfg.dockedCanvas
+    return pickCanvas(physicalWidths: freshPhysicalWidths(engine: engine),
+                      dockedCanvas: docked, dockedWidth: cfg.canvases[docked]?.width,
+                      laptopCanvas: me.laptopCanvas ?? "laptop-pro")
 }
 
 // MARK: - One driver at a time
@@ -2980,6 +2986,12 @@ func selftest() -> Never {
                       laptopCanvas: "laptop-air") == "laptop-air", "builtin only -> laptop canvas")
     expect(pickCanvas(physicalWidths: [], dockedCanvas: "ultrawide",
                       laptopCanvas: "laptop-air") == "laptop-air", "headless -> laptop canvas")
+    expect(pickCanvas(physicalWidths: [1280, 1920], dockedCanvas: "desk-1920", dockedWidth: 1920,
+                      laptopCanvas: "laptop-air13") == "desk-1920", "air13 + 1920 monitor -> docked")
+    expect(pickCanvas(physicalWidths: [1280], dockedCanvas: "desk-1920", dockedWidth: 1920,
+                      laptopCanvas: "laptop-air13") == "laptop-air13", "air13 alone -> laptop canvas")
+    expect(pickCanvas(physicalWidths: [1728, 1920], dockedCanvas: "ultrawide", dockedWidth: 3440,
+                      laptopCanvas: "laptop-pro") == "laptop-pro", "ultrawide rule ignores a 1920 monitor")
     // ---- the driver's own screen, read out of process ----
     // A daemon that never runs a run loop never receives display-reconfiguration
     // callbacks, so its in-process CoreGraphics display list can outlive the

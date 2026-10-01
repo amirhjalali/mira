@@ -12,6 +12,9 @@ def run(args,**kwargs):
 def build():
     inputs=[ROOT/'app/MIRA.swift',ROOT/'app/Reliability.swift',ROOT/'app/shim.h',ROOT/'config/machines.json']
     source_hashes={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}
+    # The daemon reports miraBuild; a release whose BUILD differs can never verify.
+    if f'let miraBuild = "{BUILD}"' not in (ROOT/'app/Reliability.swift').read_text():
+        raise RuntimeError(f'app/Reliability.swift miraBuild is not {BUILD}; bump both before releasing')
     run(['bash','tests/run.sh'],cwd=ROOT)
     # Never replace a working installation when its signing identity is absent.
     identities=run(['security','find-identity','-p','codesigning'],capture_output=True,text=True).stdout

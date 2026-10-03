@@ -2620,6 +2620,21 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             self?.refreshMenuIfChanged()
         }
+        // What only this GUI session can see, for `mira inspect-machine` over SSH.
+        // Jump's Window menu is AppleScript: read it every third beat (15 s).
+        var beat = 0
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+            beat += 1
+            let withWindows = beat % 3 == 1
+            DispatchQueue.global(qos: .utility).async {
+                var s = captureLocalStatus(includeJumpWindows: withWindows)
+                if !withWindows, let prev = readJSON(LocalStatus.self, localStatusFile) {
+                    s = LocalStatus(ts: s.ts, screens: s.screens, output: s.output, input: s.input,
+                                    jumpWindows: prev.jumpWindows, rdpEndpoints: s.rdpEndpoints)
+                }
+                try? atomicJSON(s, to: localStatusFile)
+            }
+        }
         maybeResumeSessions()
     }
 

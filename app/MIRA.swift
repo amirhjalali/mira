@@ -1068,7 +1068,8 @@ func pickAudioNames(passenger: Bool, deviceNames: [String]) -> (output: String?,
 // AirPods while the Pro, which the user was wearing them for, heard nothing).
 func passengerAudioDrifted(current: String?, deviceNames: [String]) -> Bool {
     guard deviceNames.contains("Jump Desktop Audio") else { return false }  // nothing to fix to
-    return current != "Jump Desktop Audio"
+    // Either Jump device is Jump's route: Jump Connect switches between them itself.
+    return current?.hasPrefix("Jump Desktop") != true
 }
 
 // Pure: where console sound goes after a ride. Give back what the owner had
@@ -2470,33 +2471,10 @@ func surveyWheel(cfg: Config, me: Machine) -> WheelSurvey {
 // MARK: - Doctor
 
 func doctor(cfg: Config, me: Machine) -> (report: String, failures: Int) {
-    let peers = cfg.machines.filter { $0.id != me.id }
-    let remote = forEachPeer(peers, deadline: 12) { p -> RuntimeSnapshot? in
-        let r = peerRun(p, "cat \"$HOME/Library/Application Support/MIRA/runtime.json\"", timeout: 8, force: true)
-        return try? JSONDecoder().decode(RuntimeSnapshot.self, from: Data(r.out.utf8))
-    }
-    var reports: [RuntimeSnapshot] = []
-    var lines = ["MIRA \(miraVersion) — fleet health"], failures = 0
-    for machine in cfg.machines {
-        let report = machine.id == me.id ? readJSON(RuntimeSnapshot.self, snapshotFile) : (remote[machine.id] ?? nil)
-        guard let report = report, Date().timeIntervalSince1970 - report.ts < 30 else {
-            lines.append("! \(machine.id): no fresh daemon report"); failures += 1; continue
-        }
-        reports.append(report)
-        let healthy = report.state == "ready" || report.state == "local" || report.state == "driving"
-        lines.append("\(healthy ? "✓" : "!") \(machine.id): \(report.state) — \(report.detail) [\(report.build)]")
-        if let w = report.width, let h = report.height {
-            lines.append("  \(w)×\(h) points; \(report.pixelWidth ?? 0)×\(report.pixelHeight ?? 0) pixels")
-        }
-        if !healthy || report.build != miraBuild || report.fdCount > 512 { failures += 1 }
-    }
-    let drivers = reports.filter { $0.role == "driver" }
-    if drivers.count > 1 { lines.append("! Conflicting drivers: \(drivers.map { $0.machine }.joined(separator: ", "))"); failures += 1 }
-    if let session = drivers.first?.session, drivers.count == 1 {
-        for r in reports where r.role == "passenger" && r.session != session {
-            lines.append("! \(r.machine): passenger belongs to a different session"); failures += 1
-        }
-    }
+    let macs = cfg.machines.filter { ($0.type ?? "mac") == "mac" }
+    let statuses = forEachPeer(macs, deadline: 15) { fetchMachineStatus($0, me: me) }
+    let verdict = doctorLines(statuses, order: macs.map { $0.id })
+    var lines = ["MIRA \(miraVersion) — fleet health"] + verdict.lines, failures = verdict.failures
     if let state = readJSON(RuntimeSnapshot.self, snapshotFile), state.role == "driver" {
         if let m = readJSON(ViewerMeasurement.self, measurementFile), m.session == state.session {
             lines.append("✓ Measured viewer: \(m.content.w)×\(m.content.h) points")
@@ -3798,7 +3776,8 @@ case "inspect-machine":
     let status = buildMachineStatus(cfg: cfg, me: me, runtime: runtime,
         local: readJSON(LocalStatus.self, localStatusFile), health: readJSON(Health.self, healthFile),
         inboundAges: inboundSessionAges(), driver: driver,
-        snapshotPending: FileManager.default.fileExists(atPath: arrangementFile.path), now: now)
+        snapshotPending: FileManager.default.fileExists(atPath: arrangementFile.path),
+        daemonRunning: sh("pgrep -f 'MacOS/MIRA --daemon' >/dev/null").code == 0, now: now)
     if let data = try? JSONEncoder().encode(status) { print(String(decoding: data, as: UTF8.self)) }
     exit(0)
 case "inspect-arrangement":

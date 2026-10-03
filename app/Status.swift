@@ -173,21 +173,28 @@ struct MachineStatus: Codable {
     let screens: [ScreenInfo]?
     let rdpEndpoints: [String]
     let warnings: [String]
+    // Optional so a window on a newer build can still read an older Mac.
+    var asleep: Bool? = nil           // daemon alive but paused: the Mac was asleep
+    var fdCount: Int? = nil
 }
 
 // Pure: everything already read, judged here.
 func buildMachineStatus(cfg: Config, me: Machine, runtime: RuntimeSnapshot?, local: LocalStatus?, health: Health?,
-                        inboundAges: [Double], driver: String?, snapshotPending: Bool, now: Double) -> MachineStatus {
+                        inboundAges: [Double], driver: String?, snapshotPending: Bool, daemonRunning: Bool,
+                        now: Double) -> MachineStatus {
     var warnings: [String] = []
     let rt = runtime.flatMap { now - $0.ts < 30 ? $0 : nil }
-    if rt == nil { warnings.append("MIRA daemon not reporting") }
+    // A stale report from a daemon that is still running is a Mac that was asleep
+    // (air13 sleeps after one minute; an SSH check wakes it before the daemon ticks).
+    let asleep = rt == nil && runtime != nil && daemonRunning
+    if rt == nil && !asleep { warnings.append(daemonRunning ? "MIRA daemon not reporting" : "MIRA daemon not running") }
     let loc = local.flatMap { now - $0.ts < 30 ? $0 : nil }
-    if loc == nil { warnings.append("MIRA menu app not reporting") }
+    if loc == nil && !asleep { warnings.append("MIRA menu app not reporting") }
     if let h = health {
         if !h.accessibility { warnings.append("Jump Connect lost Accessibility") }
         if !h.screenRecording { warnings.append("Jump Connect lost Screen Recording") }
     }
-    let role = rt?.role ?? "unknown"
+    let role = (asleep ? runtime?.role : rt?.role) ?? "unknown"
     let outbound = loc?.jumpWindows.map { titles in
         outboundMachines(titles: titles, cfg: cfg, me: me.id)
             .map { SessionLink(peer: $0, stale: sessionIsStale(holder: me.id, driver: driver)) }
@@ -201,7 +208,47 @@ func buildMachineStatus(cfg: Config, me: Machine, runtime: RuntimeSnapshot?, loc
                          output: loc?.output, input: loc?.input,
                          audioWarning: loc == nil ? nil : audioWarning(role: role, output: loc?.output, input: loc?.input),
                          display: verdict.verdict, displayDetail: verdict.detail, screens: loc?.screens,
-                         rdpEndpoints: loc?.rdpEndpoints ?? [], warnings: warnings)
+                         rdpEndpoints: loc?.rdpEndpoints ?? [], warnings: warnings,
+                         asleep: asleep ? true : nil, fdCount: runtime?.fdCount)
+}
+
+// Runs `inspect-machine` here or on a peer. Shared by the window and doctor so
+// the two can never disagree.
+func fetchMachineStatus(_ m: Machine, me: Machine, timeout: TimeInterval = 12) -> MachineStatus? {
+    let r = m.id == me.id
+        ? sh("\(shellQuote(Bundle.main.executablePath ?? CommandLine.arguments[0])) inspect-machine", timeout: timeout)
+        : peerRun(m, miraExec("inspect-machine"), timeout: timeout, force: true)
+    return try? JSONDecoder().decode(MachineStatus.self, from: Data(r.out.utf8))
+}
+
+// Pure: doctor's verdicts over the same statuses the window shows.
+// `.some(nil)` / missing = the Mac did not answer.
+func doctorLines(_ statuses: [String: MachineStatus?], order: [String]) -> (lines: [String], failures: Int) {
+    var lines: [String] = [], failures = 0
+    var answered: [MachineStatus] = []
+    for id in order {
+        guard let s = statuses[id] ?? nil else { lines.append("! \(id): unreachable"); failures += 1; continue }
+        answered.append(s)
+        if s.asleep == true { lines.append("· \(id): asleep (\(s.role))"); continue }
+        var problems: [String] = []
+        if s.build != miraBuild { problems.append("build \(s.build), expected \(miraBuild)") }
+        let stale = (s.outbound ?? []).filter { $0.stale }.map { $0.peer }
+        if !stale.isEmpty { problems.append("holding stale Jump session(s) into \(stale.joined(separator: ", "))") }
+        if s.display == "wrong" { problems.append(s.displayDetail) }
+        if let a = s.audioWarning { problems.append(a) }
+        problems += s.warnings
+        if (s.fdCount ?? 0) > 512 { problems.append("\(s.fdCount ?? 0) open files (leak?)") }
+        if problems.isEmpty { lines.append("✓ \(id): \(s.role) — \(s.displayDetail) [\(s.build)]") }
+        else { lines.append("! \(id): \(s.role) — \(problems.joined(separator: "; "))"); failures += 1 }
+    }
+    let drivers = answered.filter { $0.role == "driver" && $0.asleep != true }.map { $0.machine }
+    if drivers.count > 1 { lines.append("! Conflicting drivers: \(drivers.joined(separator: ", "))"); failures += 1 }
+    if drivers.count == 1 {
+        for s in answered where s.role == "passenger" && s.driver != drivers[0] {
+            lines.append("! \(s.machine): passenger of \(s.driver ?? "nobody"), but \(drivers[0]) is driving"); failures += 1
+        }
+    }
+    return (lines, failures)
 }
 
 // Inbound Jump sessions: one `JumpConnect --desktopproxy` per live session.
@@ -328,17 +375,17 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     let fresh = LocalStatus(ts: 1000, screens: [], output: "MacBook Air Speakers", input: "MacBook Air Microphone",
                             jumpWindows: ["Amir’s MacBook Pro"], rdpEndpoints: [])
     let st = buildMachineStatus(cfg: cfg, me: me13, runtime: rt, local: fresh, health: nil, inboundAges: [],
-                                driver: "pro", snapshotPending: false, now: 1005)
+                                driver: "pro", snapshotPending: false, daemonRunning: true, now: 1005)
     expect(st.outbound == [SessionLink(peer: "pro", stale: true)], "machineStatus: air13's session into the driving pro is stale")
     let old = LocalStatus(ts: 900, screens: [], output: nil, input: nil, jumpWindows: nil, rdpEndpoints: [])
     let st2 = buildMachineStatus(cfg: cfg, me: me13, runtime: rt, local: old, health: nil, inboundAges: [],
-                                 driver: "pro", snapshotPending: false, now: 1005)
+                                 driver: "pro", snapshotPending: false, daemonRunning: true, now: 1005)
     expect(st2.display == "unknown" && st2.warnings.contains("MIRA menu app not reporting"),
            "machineStatus: stale local status gives unknown display")
     let st3 = buildMachineStatus(cfg: cfg, me: me13, runtime: nil, local: fresh,
                                  health: Health(accessibility: false, screenRecording: true, ts: 1000),
-                                 inboundAges: [100, 50_000], driver: "pro", snapshotPending: false, now: 1005)
-    expect(st3.warnings.contains("MIRA daemon not reporting") && st3.warnings.contains("Jump Connect lost Accessibility"),
+                                 inboundAges: [100, 50_000], driver: "pro", snapshotPending: false, daemonRunning: false, now: 1005)
+    expect(st3.warnings.contains("MIRA daemon not running") && st3.warnings.contains("Jump Connect lost Accessibility"),
            "machineStatus: daemon and permission warnings")
     expect(st3.inboundCount == 2 && st3.inboundOldestSeconds == 50_000, "machineStatus: inbound sessions counted with oldest age")
     let encoded = try! JSONEncoder().encode(st)
@@ -366,6 +413,38 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     expect(offersConnect(myRole: "driver", me: proM, target: miniM), "connect: the driver can open a passenger")
     expect(!offersConnect(myRole: "local", me: proM, target: miniM), "connect: a non-driver opening a session would be stale")
     expect(!offersConnect(myRole: "driver", me: proM, target: proM), "connect: never this Mac itself")
+    // A stale report from a daemon that IS running is a Mac that was asleep, not a fault.
+    let staleRt = RuntimeSnapshot(machine: "air13", build: miraBuild, pid: 1, ts: 900, role: "local", session: nil,
+                                  state: "local", detail: "", width: nil, height: nil, pixelWidth: nil, pixelHeight: nil, fdCount: 5)
+    let slept = buildMachineStatus(cfg: cfg, me: me13, runtime: staleRt, local: old, health: nil, inboundAges: [],
+                                   driver: "pro", snapshotPending: false, daemonRunning: true, now: 1005)
+    expect(slept.asleep == true && slept.warnings.isEmpty, "machineStatus: a running daemon's stale report means asleep, no warning")
+    expect(st3.asleep != true, "machineStatus: no daemon process is a fault, not sleep")
+    // doctor speaks the same status as the window
+    func ms(_ id: String, role: String, driver: String?, build: String = miraBuild, asleep: Bool? = nil,
+            outbound: [SessionLink]? = [], warnings: [String] = [], display: String = "ok") -> MachineStatus {
+        var m = MachineStatus(machine: id, build: build, ts: 0, role: role, driver: driver, outbound: outbound, inboundCount: 0,
+                              inboundOldestSeconds: nil, output: nil, input: nil, audioWarning: nil, display: display,
+                              displayDetail: "d", screens: nil, rdpEndpoints: [], warnings: warnings)
+        m.asleep = asleep
+        return m
+    }
+    let healthy: [String: MachineStatus?] = ["pro": ms("pro", role: "driver", driver: "pro"),
+                                             "mini": ms("mini", role: "passenger", driver: "pro"),
+                                             "air13": ms("air13", role: "local", driver: "pro", asleep: true)]
+    let dh = doctorLines(healthy, order: ["pro", "mini", "air13"])
+    expect(dh.failures == 0 && dh.lines.contains { $0.contains("air13") && $0.contains("asleep") },
+           "doctor: an asleep Mac is reported, not failed")
+    var bad = healthy
+    bad["air13"] = ms("air13", role: "local", driver: "pro", outbound: [SessionLink(peer: "mini", stale: true)])
+    bad["mini"] = .some(nil)
+    bad["air15"] = ms("air15", role: "driver", driver: "air15", build: "old")
+    let db = doctorLines(bad, order: ["pro", "air15", "mini", "air13"])
+    expect(db.lines.contains { $0.hasPrefix("!") && $0.contains("mini") && $0.contains("unreachable") }, "doctor: unreachable Mac fails")
+    expect(db.lines.contains { $0.hasPrefix("!") && $0.contains("air13") && $0.contains("stale") }, "doctor: stale session fails")
+    expect(db.lines.contains { $0.contains("Conflicting drivers") }, "doctor: two drivers fail")
+    expect(db.lines.contains { $0.hasPrefix("!") && $0.contains("air15") && $0.contains("build") }, "doctor: old build fails")
+    expect(db.failures >= 4, "doctor: every problem counts")
     // Leftovers: log a failure once when it starts, not every 15 s while it lasts
     expect(shouldLogTransition(wasBad: false, isBad: true), "log: the first unreadable menu is logged")
     expect(!shouldLogTransition(wasBad: true, isBad: true), "log: a still-unreadable menu is not logged again")

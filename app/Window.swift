@@ -60,10 +60,7 @@ final class MiraModel: ObservableObject {
         guard !inFlight.contains(m.id) else { lock.unlock(); return }
         inFlight.insert(m.id); lock.unlock()
         DispatchQueue.global(qos: .utility).async { [self] in
-            let r = m.id == me.id
-                ? sh("\(shellQuote(Bundle.main.executablePath ?? CommandLine.arguments[0])) inspect-machine", timeout: 10)
-                : peerRun(m, miraExec("inspect-machine"), timeout: 12, force: true)
-            let s = try? JSONDecoder().decode(MachineStatus.self, from: Data(r.out.utf8))
+            let s = fetchMachineStatus(m, me: me)
             lock.lock(); inFlight.remove(m.id); lock.unlock()
             DispatchQueue.main.async {
                 if let s = s { self.statuses[m.id] = s; self.lastSeen[m.id] = Date(); self.unreachable.remove(m.id) }
@@ -134,13 +131,14 @@ struct MacCard: View {
         let s = model.statuses[machine.id]
         let down = model.unreachable.contains(machine.id)
         let stale = s?.outbound?.contains { $0.stale } == true
+        let asleep = s?.asleep == true
         let warn = s.map { $0.audioWarning != nil || $0.display == "wrong" || !$0.warnings.isEmpty } ?? false
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Dot(color: down || s == nil ? .gray : stale ? .red : warn ? .orange : .green)
+                Dot(color: down || s == nil || asleep ? .gray : stale ? .red : warn ? .orange : .green)
                 Text(machine.jumpName).font(.headline)
                 Spacer()
-                Text(down ? "unreachable" : (s?.role ?? "…")).font(.caption).padding(.horizontal, 6)
+                Text(down ? "unreachable" : asleep ? "asleep" : (s?.role ?? "…")).font(.caption).padding(.horizontal, 6)
                     .background(Capsule().fill(Color.secondary.opacity(0.15)))
             }
             if down, let seen = model.lastSeen[machine.id] {

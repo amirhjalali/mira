@@ -996,7 +996,7 @@ func pickCanvas(physicalWidths: [Int], dockedCanvas: String, dockedWidth: Int? =
 // MARK: - Native audio engine (CoreAudio, public API)
 
 struct AudioDev { let id: AudioDeviceID; let name: String; let builtIn: Bool
-                  let hasOutput: Bool; let hasInput: Bool }
+                  let hasOutput: Bool; let hasInput: Bool; var bluetooth = false }
 
 func listAudioDevices() -> [AudioDev] {
     var addr = AudioObjectPropertyAddress(
@@ -1037,7 +1037,9 @@ func listAudioDevices() -> [AudioDev] {
         return AudioDev(id: id, name: cfName as String,
                         builtIn: transport == kAudioDeviceTransportTypeBuiltIn,
                         hasOutput: streams(kAudioObjectPropertyScopeOutput),
-                        hasInput: streams(kAudioObjectPropertyScopeInput))
+                        hasInput: streams(kAudioObjectPropertyScopeInput),
+                        bluetooth: transport == kAudioDeviceTransportTypeBluetooth
+                                || transport == kAudioDeviceTransportTypeBluetoothLE)
     }
 }
 
@@ -1058,6 +1060,28 @@ func pickAudioNames(passenger: Bool, deviceNames: [String]) -> (output: String?,
     }
     return (nil, nil)  // console: caller falls back to built-in transport
 }
+
+// Pure: a passenger's sound must leave through Jump, or the driver never hears
+// it. AirPods on the same iCloud account join every Mac in the room, and macOS
+// makes them the default output the moment they connect — silently undoing the
+// route set at converge (2026-09-28: air15 was a ready passenger playing into
+// AirPods while the Pro, which the user was wearing them for, heard nothing).
+func passengerAudioDrifted(current: String?, deviceNames: [String]) -> Bool {
+    guard deviceNames.contains("Jump Desktop Audio") else { return false }  // nothing to fix to
+    return current != "Jump Desktop Audio"
+}
+
+// Pure: where console sound goes after a ride. Give back what the owner had
+// before the ride (headphones included) when it is still here; only then fall
+// back to the built-in speakers. Forcing built-in every time is what left the
+// Pro on its speakers with AirPods connected.
+func pickConsoleOutputName(remembered: String?, deviceNames: [String]) -> String? {
+    guard let r = remembered, !r.hasPrefix("Jump Desktop"), deviceNames.contains(r) else { return nil }
+    return r
+}
+
+// The output this Mac used before it became a passenger; restored at console.
+var preRideOutputName: String?
 
 func currentDefaultOutputName() -> String? {
     var addr = AudioObjectPropertyAddress(
@@ -1087,7 +1111,11 @@ func routeAudio(passenger: Bool) {
             setDefaultAudio(i.id, selector: kAudioHardwarePropertyDefaultInputDevice)
         }
     } else {
-        if let o = devs.first(where: { $0.builtIn && $0.hasOutput }) {
+        if let name = pickConsoleOutputName(remembered: preRideOutputName, deviceNames: devs.map { $0.name }),
+           let o = devs.first(where: { $0.name == name && $0.hasOutput }) {
+            setDefaultAudio(o.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
+            setDefaultAudio(o.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+        } else if let o = devs.first(where: { $0.builtIn && $0.hasOutput }) {
             setDefaultAudio(o.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
             setDefaultAudio(o.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
         }
@@ -1109,6 +1137,39 @@ func repairAudio(passenger: Bool) {
     if fix.input, let i = devs.first(where: { $0.builtIn && $0.hasInput }) {
         setDefaultAudio(i.id, selector: kAudioHardwarePropertyDefaultInputDevice)
     }
+}
+
+// Passenger steady state: put the Jump route back if something took it.
+func guardPassengerAudio() {
+    let devs = listAudioDevices()
+    let current = devs.first { d in d.id == defaultOutputID() }?.name
+    guard passengerAudioDrifted(current: current, deviceNames: devs.map { $0.name }) else { return }
+    log("audio drifted to \(current ?? "none") while a passenger — rerouting through Jump")
+    emit("audio_reroute", [("from", .s(current ?? "none"))])
+    routeAudio(passenger: true)
+}
+
+// A driver hears every passenger through its own default output. If headphones
+// are connected here but the speakers are selected, the user is wearing them
+// for this Mac: select them, which also pulls AirPods back from a passenger.
+func preferHeadphonesForDriver() {
+    let devs = listAudioDevices()
+    guard let current = devs.first(where: { $0.id == defaultOutputID() }), current.builtIn,
+          let bt = devs.first(where: { $0.bluetooth && $0.hasOutput }) else { return }
+    log("driver audio: \(current.name) -> \(bt.name)")
+    emit("audio_driver", [("to", .s(bt.name))])
+    setDefaultAudio(bt.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
+}
+
+func defaultOutputID() -> AudioDeviceID {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var dev: AudioDeviceID = 0
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    _ = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev)
+    return dev
 }
 
 // MARK: - Native display engine
@@ -1680,6 +1741,7 @@ final class Reconciler {
     var prevClamshell: Bool?
     var displaySleepAssertion: IOPMAssertionID = 0
     var nextStreamGuard = Date.distantPast
+    var nextAudioGuard = Date.distantPast
     var loggedStaleRideFrom: String?
     var lastLeaseTS: Double?
     var lastGeometryKey: String?
@@ -1785,6 +1847,10 @@ final class Reconciler {
             // fast now so rides converge instantly, and three process spawns a
             // second on a laptop is a battery cost with no benefit.
             guardStream(now: Date())
+            if lastMode == mode, Date() >= nextAudioGuard {
+                nextAudioGuard = Date().addingTimeInterval(4)
+                guardPassengerAudio()
+            }
             let broken = engine.passengerInvariantFailure(canvas: canvas, hidpi: wantHi)
             if broken == nil, lastMode == mode { breaker.record(nil); checkWalkupTriggers(); return }
             // Already proved we cannot satisfy this ride: keep the owner's
@@ -1806,6 +1872,10 @@ final class Reconciler {
                 _ = breaker.record("virtual create failed"); return
             }
             let applied = engine.applyPassengerTopology(canvas: canvas, hidpi: wantHi)
+            if lastMode == nil || lastMode == .console,
+               let cur = currentDefaultOutputName(), !cur.hasPrefix("Jump Desktop") {
+                preRideOutputName = cur
+            }
             routeAudio(passenger: true)
             let why = applied ? engine.settledInvariantFailure(canvas: canvas, hidpi: wantHi)
                               : "topology transaction failed"
@@ -3329,6 +3399,22 @@ func selftest() -> Never {
            "passenger audio -> jump devices")
     let ca = pickAudioNames(passenger: false, deviceNames: names)
     expect(ca.output == nil && ca.input == nil, "console audio -> builtin fallback")
+    expect(passengerAudioDrifted(current: "Amir’s AirPods Pro #2", deviceNames: names + ["Amir’s AirPods Pro #2"]),
+           "passenger audio: AirPods grabbing the output is drift")
+    expect(!passengerAudioDrifted(current: "Jump Desktop Audio", deviceNames: names),
+           "passenger audio: jump route is not drift")
+    // 2026-09-30: Jump Connect itself flips the output between its two devices
+    // every ~5 s; "correcting" that fought it 12 times a minute for over an hour.
+    expect(!passengerAudioDrifted(current: "Jump Desktop Microphone", deviceNames: names),
+           "passenger audio: Jump's own device switch is not drift")
+    expect(!passengerAudioDrifted(current: "MacBook Air Speakers", deviceNames: ["MacBook Air Speakers"]),
+           "passenger audio: no jump device, nothing to reroute to")
+    expect(pickConsoleOutputName(remembered: "AirPods", deviceNames: names + ["AirPods"]) == "AirPods",
+           "console audio: restore pre-ride headphones")
+    expect(pickConsoleOutputName(remembered: "AirPods", deviceNames: names) == nil,
+           "console audio: departed headphones fall back to builtin")
+    expect(pickConsoleOutputName(remembered: "Jump Desktop Audio", deviceNames: names) == nil,
+           "console audio: never restore a jump route")
     // handback logic
     let hnow = 2_000_000.0
     expect(handbackIsFresh(ts: hnow - 100, hold: 600, now: hnow), "handback fresh within hold")

@@ -226,6 +226,8 @@ func handleControl(_ r: ControlRequest, rec: Reconciler) -> ControlReply {
             rec.breaker.reset(); lastMeasuredContent = nil
             try atomicJSON(session, to: sessionOpenFile)
             emit("claim", [("at", .n(claim))])
+            // Isolated test state must never re-route the real Mac's audio.
+            if ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil { preferHeadphonesForDriver() }
             return ControlReply(ok: true, message: "Connecting from \(me.id)", winner: session)
         case "stop":
             guard let expected = r.session, ownsRelease(expected, current: own) else {

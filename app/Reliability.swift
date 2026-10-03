@@ -286,6 +286,29 @@ func handleControl(_ r: ControlRequest, rec: Reconciler) -> ControlReply {
             try atomicJSON(Wheel(driver: s.driver, claimedAt: s.claim, ts: now), to: wheelFile)
             if let own = own, s > own { relinquishWheel(to: s.driver) }
             return answer(true, "Accepted; verifying display")
+        case "close-viewer":
+            // A stale session is closed where its viewer lives (host-side kills reconnect).
+            viewerCloseRequests += 1
+            log("asked to close this Mac's viewer")
+            if ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil {
+                DispatchQueue.global(qos: .utility).async { killJumpViewer() }
+            }
+            return answer(true, "Closing this Mac's Jump sessions")
+        case "fix-audio":
+            fixRequests.append("audio")
+            let passenger = readRide() != nil
+            if ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil { routeAudio(passenger: passenger) }
+            return answer(true, passenger ? "Sound routed through Jump" : "Sound returned to this Mac")
+        case "fix-display":
+            fixRequests.append("display")
+            if readRide() == nil {
+                // Re-arm the last layout MIRA itself verified; the next tick restores and re-verifies it.
+                let good = stateDir.appendingPathComponent("last-console-arrangement.json")
+                guard let data = try? Data(contentsOf: good) else { return answer(false, "No verified layout to restore") }
+                try data.write(to: arrangementFile, options: .atomic)
+            }
+            rec.breaker.reset(); rec.consoleRestoreAttempts = 0; rec.lastMode = nil
+            return answer(true, "Display will be re-applied on the next beat")
         case "release":
             guard let s = r.session else { return answer(false, "Missing session") }
             // A tombstone also blocks a delayed ride arriving AFTER its release.
@@ -515,6 +538,21 @@ func controlIntegrationTests() -> Never {
           "a newer driver's beacon unseats this Mac AND closes its viewer")
     var expired = ControlRequest(kind: "local"); expired.created -= 120
     check(!handleControl(expired, rec: rec).ok, "expired queued commands are not replayed")
+    // The MIRA window's repair verbs: accepted, and inert under MIRA_STATE_DIR.
+    let closes = viewerCloseRequests
+    check(handleControl(ControlRequest(kind: "close-viewer"), rec: rec).ok && viewerCloseRequests == closes + 1,
+          "close-viewer is accepted and counted")
+    check(handleControl(ControlRequest(kind: "fix-audio"), rec: rec).ok && fixRequests.last == "audio",
+          "fix-audio is accepted")
+    try? atomicJSON([SavedDisplay](), to: stateDir.appendingPathComponent("last-console-arrangement.json"))
+    removeState(rideFile)
+    check(handleControl(ControlRequest(kind: "fix-display"), rec: rec).ok
+          && FileManager.default.fileExists(atPath: arrangementFile.path) && rec.lastMode == nil,
+          "fix-display at console re-arms the last verified layout")
+    removeState(arrangementFile)
+    removeState(stateDir.appendingPathComponent("last-console-arrangement.json"))
+    check(!handleControl(ControlRequest(kind: "fix-display"), rec: rec).ok,
+          "fix-display with no verified layout refuses rather than guessing")
     print("Control integration: \(failures == 0 ? "OK" : "FAILED")")
     exit(failures == 0 ? 0 : 1)
 }

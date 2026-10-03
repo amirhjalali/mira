@@ -698,6 +698,7 @@ func killJumpViewer() -> Bool {
 // Desktop Microphone — a meeting on the Pro echoed through a laptop on the desk.
 // Closing from the host side is useless: the viewer reconnects within a second.
 var viewerCloseRequests = 0
+var fixRequests: [String] = []   // the MIRA window's repair verbs, observable in tests
 func relinquishWheel(to holder: String) {
     removeState(drivingFlag); removeState(sessionOpenFile)
     viewerCloseRequests += 1

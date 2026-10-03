@@ -19,6 +19,13 @@ if ! "$OUT" inspect-screens | grep -qE '^\{"widths":\[[0-9,]*\]\}$'; then
   echo "FAIL: inspect-screens did not report a widths array" >&2
   exit 1
 fi
+# Display layout capture must come from a fresh process: the daemon's
+# CoreGraphics view goes stale (2026-09-16) and lost the pro's mirror link
+# in the 2026-09-30 snapshot.
+if ! "$OUT" inspect-arrangement | grep -qE '^\[.*\]$'; then
+  echo "FAIL: inspect-arrangement did not print a JSON array" >&2
+  exit 1
+fi
 if "$OUT" --not-a-mira-command >/dev/null 2>&1; then
   echo "FAIL: unknown CLI command was accepted" >&2
   exit 1

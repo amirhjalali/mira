@@ -238,6 +238,19 @@ func offersConnect(myRole: String?, me: Machine, target: Machine) -> Bool {
     myRole == "driver" && target.id != me.id && target.roles.contains("target")
 }
 
+// A recurring failure is logged when it starts, not on every retry: the Window
+// menu is read every 15 s, and a 1 MB log would roll over in two days.
+func shouldLogTransition(wasBad: Bool, isBad: Bool) -> Bool { isBad && !wasBad }
+
+// One 5 s capture at a time: a slow beat that finished late could otherwise
+// overwrite a fresher one.
+final class BeatGate {
+    private let lock = NSLock()
+    private var busy = false
+    func tryEnter() -> Bool { lock.lock(); defer { lock.unlock() }; if busy { return false }; busy = true; return true }
+    func leave() { lock.lock(); busy = false; lock.unlock() }
+}
+
 // MARK: - Tests (called from selftest)
 
 func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
@@ -353,4 +366,14 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     expect(offersConnect(myRole: "driver", me: proM, target: miniM), "connect: the driver can open a passenger")
     expect(!offersConnect(myRole: "local", me: proM, target: miniM), "connect: a non-driver opening a session would be stale")
     expect(!offersConnect(myRole: "driver", me: proM, target: proM), "connect: never this Mac itself")
+    // Leftovers: log a failure once when it starts, not every 15 s while it lasts
+    expect(shouldLogTransition(wasBad: false, isBad: true), "log: the first unreadable menu is logged")
+    expect(!shouldLogTransition(wasBad: true, isBad: true), "log: a still-unreadable menu is not logged again")
+    expect(!shouldLogTransition(wasBad: true, isBad: false), "log: recovery is not a failure line")
+    // Leftovers: a slow 5 s beat must not overlap the next one
+    let gate = BeatGate()
+    expect(gate.tryEnter(), "beat: the first beat runs")
+    expect(!gate.tryEnter(), "beat: a beat while one is running is skipped")
+    gate.leave()
+    expect(gate.tryEnter(), "beat: the next beat runs once the previous left")
 }

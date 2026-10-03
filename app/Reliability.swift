@@ -4,7 +4,7 @@ import Foundation
 import Darwin
 
 let miraVersion = "2.2.0"
-let miraBuild = "20261003.1"
+let miraBuild = "20261003.2"
 var daemonOwnsState = false
 var singletonFD: Int32 = -1
 var snapshotFile: URL { stateDir.appendingPathComponent("runtime.json") }
@@ -573,6 +573,14 @@ func controlIntegrationTests() -> Never {
           && readJSON([SavedDisplay].self, arrangementFile)?.first?.stableID == "pending",
           "fix-display never overwrites a pending restore snapshot")
     removeState(arrangementFile); removeState(stateDir.appendingPathComponent("last-console-arrangement.json"))
+    // Leftovers: the passenger anti-stream guard runs on its 15 s cadence (lost in 553bdb6).
+    let guardRuns = streamGuardRuns
+    rec.nextStreamGuard = .distantPast
+    rec.guardStream(now: Date())
+    rec.guardStream(now: Date())
+    check(streamGuardRuns == guardRuns + 1, "stream guard fires once, then waits")
+    rec.guardStream(now: Date().addingTimeInterval(16))
+    check(streamGuardRuns == guardRuns + 2, "stream guard fires again after 15 s")
     print("Control integration: \(failures == 0 ? "OK" : "FAILED")")
     exit(failures == 0 ? 0 : 1)
 }

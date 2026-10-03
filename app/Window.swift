@@ -9,11 +9,14 @@ func rdpFileText(_ pc: WindowsPC) -> String {
 }
 
 // Windows App owns the session; MIRA only brings it forward or starts it.
+// Off the main thread: `open` can stall while Windows App launches.
 func openWindowsPC(_ pc: WindowsPC, sessionOpen: Bool) {
-    if sessionOpen { sh("open -a 'Windows App'"); return }
-    let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(pc.id).rdp")
-    try? rdpFileText(pc).write(to: url, atomically: true, encoding: .utf8)
-    sh("open -a 'Windows App' \(shellQuote(url.path))")
+    DispatchQueue.global(qos: .userInitiated).async {
+        if sessionOpen { sh("open -a 'Windows App'"); return }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(pc.id).rdp")
+        try? rdpFileText(pc).write(to: url, atomically: true, encoding: .utf8)
+        sh("open -a 'Windows App' \(shellQuote(url.path))")
+    }
 }
 
 final class MiraModel: ObservableObject {
@@ -171,7 +174,7 @@ struct MacCard: View {
                 HStack {
                     Text("Viewing: " + out.map { model.name($0.peer) + ($0.stale ? " (stale)" : "") }.joined(separator: ", "))
                         .foregroundStyle(stale ? .red : .primary)
-                    if stale { Button("Kill") { confirmKill = true } }
+                    if stale { Button("Kill") { confirmKill = true }.disabled(down) }
                 }
             }
             if s.inboundCount > 0 {
@@ -179,12 +182,12 @@ struct MacCard: View {
             }
             HStack {
                 Text("Audio: \(s.output ?? "?") / \(s.input ?? "?")")
-                if s.audioWarning != nil { Button("Fix") { model.act("fix-audio", on: machine) } }
+                if s.audioWarning != nil { Button("Fix") { model.act("fix-audio", on: machine) }.disabled(down) }
             }
             if let w = s.audioWarning { Text(w).foregroundStyle(.orange) }
             HStack {
                 Text("Display: \(s.displayDetail)").foregroundStyle(s.display == "wrong" ? .orange : .primary)
-                if s.display == "wrong" { Button("Fix") { confirmDisplay = true } }
+                if s.display == "wrong" { Button("Fix") { confirmDisplay = true }.disabled(down) }
             }
             ForEach(s.warnings, id: \.self) { Text($0).foregroundStyle(.orange) }
             Text("Build \(s.build)").foregroundStyle(.secondary)

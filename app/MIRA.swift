@@ -698,6 +698,7 @@ func killJumpViewer() -> Bool {
 // Desktop Microphone — a meeting on the Pro echoed through a laptop on the desk.
 // Closing from the host side is useless: the viewer reconnects within a second.
 var viewerCloseRequests = 0
+var streamGuardRuns = 0          // observable in tests
 var fixRequests: [String] = []   // the MIRA window's repair verbs, observable in tests
 func relinquishWheel(to holder: String) {
     removeState(drivingFlag); removeState(sessionOpenFile)
@@ -1441,9 +1442,8 @@ func matchMode(display: CGDirectDisplayID, w: Int, h: Int, hz: Double?, px: Int?
     return pool.min { abs($0.refreshRate - hz) < abs($1.refreshRate - hz) }
 }
 
-func captureArrangement(engine: DisplayEngine) {
-    guard !FileManager.default.fileExists(atPath: arrangementFile.path) else { return }
-    let saved = engine.physicalDisplays().map { d -> SavedDisplay in
+func savedDisplays(_ ids: [CGDirectDisplayID]) -> [SavedDisplay] {
+    ids.map { d -> SavedDisplay in
         let b = CGDisplayBounds(d)
         let master = CGDisplayMirrorsDisplay(d)
         let m = CGDisplayCopyDisplayMode(d)
@@ -1452,6 +1452,21 @@ func captureArrangement(engine: DisplayEngine) {
                             mirrorOf: master == kCGNullDirectDisplay ? nil : master,
                             w: m.map { $0.width }, h: m.map { $0.height },
                             hz: m.map { $0.refreshRate }, px: m.map { $0.pixelWidth }, stableID: physicalDisplayKey(d))
+    }
+}
+
+// The layout to give back after a ride, read by a FRESH process. The daemon has
+// no run loop, so its CoreGraphics view goes stale (2026-09-16); on 2026-09-30 a
+// two-day-old daemon captured the docked pro without its mirror link, and every
+// restore after that re-applied an extended layout.
+func captureArrangement(engine: DisplayEngine) {
+    guard !FileManager.default.fileExists(atPath: arrangementFile.path) else { return }
+    let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
+    let r = sh("\(shellQuote(exe)) inspect-arrangement", timeout: 5)
+    var saved = (try? JSONDecoder().decode([SavedDisplay].self, from: Data(r.out.utf8))) ?? []
+    if saved.isEmpty {
+        log("fresh arrangement capture failed (\(r.code)) — falling back to the daemon's own view")
+        saved = savedDisplays(engine.physicalDisplays())
     }
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
     try? atomicJSON(saved, to: arrangementFile)
@@ -1769,9 +1784,7 @@ final class Reconciler {
             // its original ~15 s cadence rather than the tick rate: the tick is
             // fast now so rides converge instantly, and three process spawns a
             // second on a laptop is a battery cost with no benefit.
-            if Date() >= nextStreamGuard {
-                nextStreamGuard = Date().addingTimeInterval(15)
-            }
+            guardStream(now: Date())
             let broken = engine.passengerInvariantFailure(canvas: canvas, hidpi: wantHi)
             if broken == nil, lastMode == mode { breaker.record(nil); checkWalkupTriggers(); return }
             // Already proved we cannot satisfy this ride: keep the owner's
@@ -1846,6 +1859,16 @@ final class Reconciler {
         // Use This Mac Locally, and a newer session still release immediately.
         return true
     }
+    }
+
+    // A passenger never streams outward. The kill itself went missing in
+    // 553bdb6, leaving an empty timer here for two weeks.
+    func guardStream(now: Date) {
+        guard now >= nextStreamGuard else { return }
+        nextStreamGuard = now.addingTimeInterval(15)
+        streamGuardRuns += 1
+        guard ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil else { return }
+        DispatchQueue.global(qos: .utility).async { killJumpViewer() }
     }
 
     func convergeConsole() {
@@ -2639,10 +2662,13 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         // What only this GUI session can see, for `mira inspect-machine` over SSH.
         // Jump's Window menu is AppleScript: read it every third beat (15 s).
         var beat = 0
+        let gate = BeatGate()
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+            guard gate.tryEnter() else { return }
             beat += 1
             let withWindows = beat % 3 == 1
             DispatchQueue.global(qos: .utility).async {
+                defer { gate.leave() }
                 var s = captureLocalStatus(includeJumpWindows: withWindows)
                 if !withWindows, let prev = readJSON(LocalStatus.self, localStatusFile) {
                     s = LocalStatus(ts: s.ts, screens: s.screens, output: s.output, input: s.input,
@@ -2865,6 +2891,7 @@ func aliasDisplayName(for id: String) -> String? {
 // both leave out. nil means the menu could not be read (no Accessibility, a
 // half-built menu) -- unknown, not empty -- and callers then open as before.
 // A viewer that is not running has no windows: that is a known empty list.
+var windowMenuUnreadable = false
 func openJumpWindowTitles() -> [String]? {
     guard sh("pgrep -f '\(jumpViewerPattern)' >/dev/null").code == 0 else { return [] }
     let script = """
@@ -2885,9 +2912,13 @@ func openJumpWindowTitles() -> [String]? {
     defer { try? FileManager.default.removeItem(at: tmp) }
     let r = sh("osascript '\(tmp.path)'", timeout: 10)
     guard r.code == 0 else {
-        log("Window menu unreadable, opening without duplicate check -> \(r.out.trimmingCharacters(in: .whitespacesAndNewlines))")
+        if shouldLogTransition(wasBad: windowMenuUnreadable, isBad: true) {
+            log("Window menu unreadable, opening without duplicate check -> \(r.out.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        windowMenuUnreadable = true
         return nil
     }
+    windowMenuUnreadable = false
     return r.out.components(separatedBy: "\n")
         .map { $0.trimmingCharacters(in: .whitespaces) }
         .filter { !$0.isEmpty }
@@ -3683,6 +3714,14 @@ case "inspect-machine":
         inboundAges: inboundSessionAges(), driver: driver,
         snapshotPending: FileManager.default.fileExists(atPath: arrangementFile.path), now: now)
     if let data = try? JSONEncoder().encode(status) { print(String(decoding: data, as: UTF8.self)) }
+    exit(0)
+case "inspect-arrangement":
+    // Deliberately a separate process: see captureArrangement.
+    var arrIDs = [CGDirectDisplayID](repeating: 0, count: 32)
+    var arrCount: UInt32 = 0
+    guard CGGetOnlineDisplayList(32, &arrIDs, &arrCount) == .success else { exit(1) }
+    let physicalIDs = arrIDs.prefix(Int(arrCount)).filter { CGDisplayVendorNumber($0) != miraVendorID }
+    if let data = try? JSONEncoder().encode(savedDisplays(Array(physicalIDs))) { print(String(decoding: data, as: UTF8.self)) }
     exit(0)
 case "ipc-selftest": controlIntegrationTests()
 case "selftest": selftest()

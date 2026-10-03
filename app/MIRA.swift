@@ -88,6 +88,7 @@ struct Machine: Codable {
                                   // falls back to cfg.dockedCanvas when absent
     let type: String?             // "mac" (default) | "windows"
     let jumpAliases: [String]?    // other names this machine has in a viewer's Jump list
+    var mirrorDocked: Bool? = nil // docked: external main, built-in mirrors it (pro)
 }
 struct Config: Codable {
     let rideTTLSeconds: Double, heartbeatSeconds: Double, reconcileSeconds: Double
@@ -106,6 +107,8 @@ struct Config: Codable {
     // Starlink's router also defaults to 192.168.1.0/24, so the home subnet alone
     // is not proof of being home. When set, the default gateway's MAC must match.
     let homeGatewayMAC: String?
+    // Watched and launched only: never in `machines`, so no SSH loop reaches them.
+    let windowsPCs: [WindowsPC]?
 }
 
 func repoRoot() -> URL {
@@ -3534,6 +3537,7 @@ func selftest() -> Never {
                              reconcile: cfg.reconcileSeconds) >= 20,
            "configured presence threshold is not trigger-happy")
     reliabilityTests(expect)
+    windowTests(expect, cfg)
     print(failures == 0 ? "MIRA selftest: OK" : "MIRA selftest: \(failures) FAILURES")
     exit(failures == 0 ? 0 : 1)
 }

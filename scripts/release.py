@@ -10,7 +10,7 @@ APP=ROOT/'build.noindex/MIRA.app'
 def run(args,**kwargs):
     return subprocess.run(args,check=True,**kwargs)
 def build():
-    inputs=[ROOT/'app/MIRA.swift',ROOT/'app/Reliability.swift',ROOT/'app/shim.h',ROOT/'config/machines.json']
+    inputs=[ROOT/'app/MIRA.swift',ROOT/'app/Reliability.swift',ROOT/'app/Status.swift',ROOT/'app/Window.swift',ROOT/'app/shim.h',ROOT/'config/machines.json']
     source_hashes={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}
     # The daemon reports miraBuild; a release whose BUILD differs can never verify.
     if f'let miraBuild = "{BUILD}"' not in (ROOT/'app/Reliability.swift').read_text():
@@ -30,7 +30,7 @@ def build():
     run(['codesign','--verify','--strict',str(app)])
     if source_hashes != {str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}: raise RuntimeError('Sources changed during build; refusing mismatched release')
     digest=hashlib.sha256((app/'Contents/MacOS/MIRA').read_bytes()).hexdigest()
-    manifest={'build':BUILD,'version':VERSION,'binarySHA256':digest,'sources':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in [ROOT/'app/MIRA.swift',ROOT/'app/Reliability.swift',ROOT/'app/shim.h',ROOT/'config/machines.json']}}
+    manifest={'build':BUILD,'version':VERSION,'binarySHA256':digest,'sources':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in [ROOT/'app/MIRA.swift',ROOT/'app/Reliability.swift',ROOT/'app/Status.swift',ROOT/'app/Window.swift',ROOT/'app/shim.h',ROOT/'config/machines.json']}}
     (ROOT/'build.noindex/release.json').write_text(json.dumps(manifest,indent=2)+'\n')
     print('Built',BUILD,digest,flush=True)
 

@@ -4,7 +4,7 @@ set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$REPO_ROOT/build.noindex/mira}"
 mkdir -p "$(dirname "$OUT")"
-cat "$REPO_ROOT/app/Reliability.swift" "$REPO_ROOT/app/MIRA.swift" > "$OUT.sources.swift"
+cat "$REPO_ROOT/app/Reliability.swift" "$REPO_ROOT/app/Status.swift" "$REPO_ROOT/app/Window.swift" "$REPO_ROOT/app/MIRA.swift" > "$OUT.sources.swift"
 swiftc -O -import-objc-header "$REPO_ROOT/app/shim.h" "$OUT.sources.swift" -o "$OUT"
 MACRIG_DIR="$REPO_ROOT" "$OUT" selftest
 

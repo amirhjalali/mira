@@ -54,7 +54,8 @@
       "type": "mac",
       "jumpAliases": [
         "MacBook Pro"
-      ]
+      ],
+      "mirrorDocked": true
     },
     {
       "id": "air15",
@@ -103,6 +104,28 @@
       "jumpAliases": [
         "MacBook Air 13"
       ]
+    }
+  ],
+  "windowsPCs": [
+    {
+      "id": "rig3090",
+      "name": "3090 Desktop",
+      "tailscale": "100.78.167.19",
+      "tailscaleName": "desktop-iki1670",
+      "rdpPort": 1337
+    },
+    {
+      "id": "amelie",
+      "name": "Amelie's Desktop",
+      "tailscale": "100.64.135.60",
+      "tailscaleName": "desktop-aeefjre",
+      "rdpPort": 1338
+    },
+    {
+      "id": "ace",
+      "name": "Ace Mini PC",
+      "tailscale": "100.101.253.21",
+      "tailscaleName": "win-slk2vhu7sbe"
     }
   ]
 }

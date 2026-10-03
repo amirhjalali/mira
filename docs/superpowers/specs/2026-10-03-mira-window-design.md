@@ -162,3 +162,25 @@ There is no separate "fleet" product. This is MIRA's own window over the machine
 - Macs are *managed*: they run MIRA, so it can inspect and change them.
 - Windows PCs are *watched and launched*: Windows App does the remote session well, so MIRA only shows
   status and opens Windows App onto the right PC.
+
+## Departures found while building (2026-10-03)
+
+- **Windows PCs live in `windowsPCs`, not `machines`.**
+  - Several loops SSH to every `machines` entry (beacons, releases).
+  - Older binaries `fatalError` on an entry missing a Mac-only field, while an unknown top-level key is
+    ignored.
+  - The pro's mirrored-when-docked preference is `mirrorDocked: true` on its entry.
+- **Screen data comes from the menu app, not a daemon `status` request.**
+  - An SSH process sees no screens at all (`inspect-screens` over SSH printed `{"widths":[]}`), and the
+    daemon has no run loop.
+  - So the menu app writes `local-status.json` every 5 s (screens, audio, Jump window titles every 15 s,
+    Windows App TCP endpoints).
+  - `mira inspect-machine`, run locally or over SSH, merges that file with the other state into one
+    `MachineStatus`.
+- **Connect for Windows PCs:**
+  - If a session is open, it brings Windows App forward.
+  - Otherwise it opens a generated `.rdp` for the PC's endpoint.
+  - There is no documented way to open a saved bookmark directly, and reading Windows App's database at
+    runtime would trigger macOS's "access data from other apps" prompt.
+  - The first connect may ask for the password. Amelie's bookmark has no saved credential today.
+- **The menu item is "Open MIRA…"** (⌘M inside the menu). Clicking the M still opens the menu.

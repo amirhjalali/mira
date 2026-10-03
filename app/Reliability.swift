@@ -4,7 +4,7 @@ import Foundation
 import Darwin
 
 let miraVersion = "2.2.0"
-let miraBuild = "20261003.2"
+let miraBuild = "20261003.3"
 var daemonOwnsState = false
 var singletonFD: Int32 = -1
 var snapshotFile: URL { stateDir.appendingPathComponent("runtime.json") }

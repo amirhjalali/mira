@@ -1,10 +1,10 @@
-# Fleet Tracker — design
+# MIRA window — design
 
 Date: 2026-10-03 · Status: draft for review
 
 ## Intent
 
-MIRA becomes a fleet tracker. A native MIRA window, opened from the menu bar, shows every machine the
+MIRA gets a window. Opened from the menu bar, it shows every machine the
 owner uses (the four Macs and three Windows PCs) at a glance. From the same window the owner can connect
 to any machine and fix the faults it shows. Success looks like this:
 
@@ -31,7 +31,7 @@ to any machine and fix the faults it shows. Success looks like this:
 - Windows PCs are reached only over Tailscale
 - the window is the same on every viewer Mac
 
-## Fleet additions
+## New machines
 
 `config/machines.json` gains three `type: "windows"` machines (the schema field already exists, app/MIRA.swift:89):
 
@@ -47,10 +47,10 @@ New optional fields: `rdpHost`, `rdpPort`, `tailscaleName`.
 - `release.py` already filters the fleet to `type == mac`.
 - Out of scope: the `amir-lab` Linux bookmark and the public `20.26.121.2` bookmark.
 
-## Architecture (approach A: each Mac reports itself, any window polls all)
+## Architecture (each Mac reports itself, any window polls all)
 
 ```
-FleetWindow (menu app, any Mac)
+MIRA window (menu app, any Mac)
   ├─ every 5 s while visible, in parallel:
   │    Mac peers ──SSH── `MIRA control {kind:"status"}` → MachineStatus
   │    this Mac  ──────── buildMachineStatus() locally
@@ -59,8 +59,8 @@ FleetWindow (menu app, any Mac)
 ```
 
 **Units:**
-- `app/Fleet.swift`: the data model, status builders, pure classifiers and the Windows probes. No UI.
-- `app/FleetWindow.swift`: an AppKit `NSWindow` hosting a SwiftUI view, plus a "Fleet…" menu item.
+- `app/Status.swift`: the data model, status builders, pure classifiers and the Windows probes. No UI.
+- `app/Window.swift`: an AppKit `NSWindow` hosting a SwiftUI view, plus an "Open MIRA" menu item (and clicking the M).
 - `app/MIRA.swift` stays as it is apart from the menu item and the new control kinds.
 - `tests/run.sh` and `scripts/release.py` gain the two new source files (their concatenation list and source hashes).
 
@@ -122,7 +122,7 @@ Every destructive action asks for confirmation in the window. The new control ki
 ## Window layout
 
 - Header: who is driving, the time of the last refresh, and a manual refresh button.
-- Two rows of cards: **Macs** (pro, air15, mini, air13), then **Windows** (3090, Amelie, Ace).
+- Window title "MIRA". Two rows of cards: **Macs** (pro, air15, mini, air13), then **Windows** (3090, Amelie, Ace).
 - Mac card: status dot, name, role badge, the connections list with stale ones in red and a Kill button,
   an audio line (warning plus a Fix button), a display line (plus a Fix button), a build/health line, and
   Drive/Stop/Local where they apply.
@@ -155,3 +155,10 @@ Every destructive action asks for confirmation in the window. The new control ki
 - A web dashboard
 - Doctor reusing MachineStatus (a natural follow-up)
 - Fixing why the 2026-09-30 arrangement capture lost `mirrorOf` (tracked separately)
+
+## Naming
+
+There is no separate "fleet" product. This is MIRA's own window over the machines it already knows about.
+- Macs are *managed*: they run MIRA, so it can inspect and change them.
+- Windows PCs are *watched and launched*: Windows App does the remote session well, so MIRA only shows
+  status and opens Windows App onto the right PC.

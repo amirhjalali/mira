@@ -244,6 +244,24 @@ struct Settings: Codable {
     // and kicked a live session. OFF until proven under the live-fire
     // protocol (docs/STABILITY.md).
     var walkupPresence: Bool = false
+    // Black out this Mac's own screens while it is driven remotely (2026-10-03).
+    var darkenWhileDriven: Bool = true
+}
+
+// A file written before a key existed keeps every value it has. The synthesized
+// decoder throws on a missing key, and loadSettings() then fell back to ALL
+// defaults -- adding any setting silently reset the others (reverse scrolling
+// back on, for one).
+extension Settings {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = Settings()
+        reverseScroll = try c.decodeIfPresent(Bool.self, forKey: .reverseScroll) ?? d.reverseScroll
+        walkupHandback = try c.decodeIfPresent(Bool.self, forKey: .walkupHandback) ?? d.walkupHandback
+        hidpiRides = try c.decodeIfPresent(Bool.self, forKey: .hidpiRides) ?? d.hidpiRides
+        walkupPresence = try c.decodeIfPresent(Bool.self, forKey: .walkupPresence) ?? d.walkupPresence
+        darkenWhileDriven = try c.decodeIfPresent(Bool.self, forKey: .darkenWhileDriven) ?? d.darkenWhileDriven
+    }
 }
 
 func loadSettings() -> Settings {
@@ -1672,6 +1690,7 @@ final class WalkupWatcher {
     private var manager: IOHIDManager?
     private var timestamps: [Double] = []
     private var burstLatched = false   // sticky: survives until the next poll
+    private var lastEvent: Double?     // any real local input: relights darkened screens
     private let lock = NSLock()
     private let threshold: Int
     private static var loggedUnavailable = false
@@ -1713,12 +1732,15 @@ final class WalkupWatcher {
         let now = Date().timeIntervalSince1970
         lock.lock(); defer { lock.unlock() }
         timestamps.append(now)
+        lastEvent = now
         timestamps.removeAll { now - $0 > 5 }   // keep a rolling 5 s window
         // Latch the moment the window crosses threshold; the poll interval
         // (reconcileSeconds) is longer than the 5 s window, so a brief burst
         // would otherwise be pruned before the next consumeBurst.
         if timestamps.count >= threshold { burstLatched = true }
     }
+
+    func lastInputAt() -> Double? { lock.lock(); defer { lock.unlock() }; return lastEvent }
 
     // True if a >= threshold burst has landed since the last poll; read-and-clears
     // the latch (and the window).
@@ -1739,6 +1761,9 @@ final class Reconciler {
     let engine = DisplayEngine()
     var lastMode: Mode?
     lazy var walkup = WalkupWatcher(threshold: Int(cfg.walkupInputEvents ?? 20))
+    let darkener = ScreenDarkener()
+    var lidWasClosed: Bool?
+    var lidOpenedAt: Double?
     var prevClamshell: Bool?
     var displaySleepAssertion: IOPMAssertionID = 0
     var nextStreamGuard = Date.distantPast
@@ -1762,7 +1787,9 @@ final class Reconciler {
     var passengerConverged: Bool { if case .passenger = lastMode { return true }; return false }
 
     // Started by the daemon only (not one-shot CLI ticks).
-    func startWatchers() { if isLaptop { walkup.start() } }
+    // Every Mac, not just laptops: real local input relights darkened screens on a
+    // desktop too. Walk-up HANDBACK still only ever fires on laptops.
+    func startWatchers() { walkup.start() }
 
     func tick() {
         // The wheel comes first: a machine that has lost it must stop behaving
@@ -1778,6 +1805,7 @@ final class Reconciler {
             emit("yield", [("to", .s(holder)), ("via", .s("beacon"))])
             relinquishWheel(to: holder)
         }
+        updateDarkness()
         // Local use holds until explicitly included or a new driver takes over.
         if FileManager.default.fileExists(atPath: localHoldFile.path) {
             removeState(rideFile); convergeConsole(); return
@@ -2000,6 +2028,18 @@ final class Reconciler {
             log("walk-up detected -> handback")
         }
         if let nc = nowClam { prevClamshell = nc }
+    }
+
+    // A driven Mac's own screens stay black until someone actually touches it.
+    func updateDarkness() {
+        let now = Date().timeIntervalSince1970
+        if let closed = readClamshellState() {
+            if lidWasClosed == true && !closed { lidOpenedAt = now }
+            lidWasClosed = closed
+        }
+        darkener.update(wantDark: screensShouldBeDark(
+            passengerConverged: passengerConverged, enabled: loadSettings().darkenWhileDriven,
+            lastLocalInput: walkup.lastInputAt(), lidOpenedAt: lidOpenedAt, now: now))
     }
 
     func holdDisplayAwake() {
@@ -2804,6 +2844,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
             ("Reverse Mouse Scrolling", #selector(toggleScroll), settings.reverseScroll),
             ("Return Locally on Lid/Keyboard Activity", #selector(toggleWalkup), settings.walkupHandback),
             ("Retina Passengers (HiDPI)", #selector(toggleHiDPI), settings.hidpiRides),
+            ("Darken Screens While Driven", #selector(toggleDarken), settings.darkenWhileDriven),
         ] {
             let mi = NSMenuItem(title: title, action: sel, keyEquivalent: "")
             mi.target = self
@@ -2840,6 +2881,9 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         // A grant made after launch: retry the tap on demand.
         if s.reverseScroll && scrollTap == nil { installScrollTap() }
         rebuild()
+    }
+    @objc func toggleDarken() {
+        var s = loadSettings(); s.darkenWhileDriven.toggle(); saveSettings(s); rebuild()
     }
     @objc func toggleWalkup() {
         var s = loadSettings(); s.walkupHandback.toggle(); saveSettings(s); rebuild()

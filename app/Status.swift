@@ -298,6 +298,58 @@ final class BeatGate {
     func leave() { lock.lock(); busy = false; lock.unlock() }
 }
 
+// A driven Mac's own screens go dark; any REAL local input (the HID watcher never
+// sees Jump's injected events) or opening the lid relights them for `relight` s.
+func screensShouldBeDark(passengerConverged: Bool, enabled: Bool, lastLocalInput: Double?,
+                         lidOpenedAt: Double?, now: Double, relight: Double = 120) -> Bool {
+    guard passengerConverged, enabled else { return false }
+    let touched = [lastLocalInput, lidOpenedAt].compactMap { $0 }.max()
+    return touched.map { now - $0 >= relight } ?? true
+}
+
+// Gamma to black on each PHYSICAL screen; MIRA's virtual display (what Jump
+// streams) is never touched. Fail-safe: macOS restores gamma by itself when this
+// process exits, so a crashed daemon can never leave the screens black.
+// Verified 2026-10-03 on the pro: a mirrored (inactive) built-in goes black.
+final class ScreenDarkener {
+    private(set) var dark = false
+    private var nextAssert = Date.distantPast
+
+    func update(wantDark: Bool, now: Date = Date()) {
+        guard wantDark else {
+            if dark {
+                CGDisplayRestoreColorSyncSettings()
+                dark = false
+                log("screens relit")
+                emit("darken", [("dark", .b(false))])
+            }
+            return
+        }
+        // Re-assert every 15 s: ColorSync and Night Shift rewrite gamma.
+        guard !dark || now >= nextAssert else { return }
+        nextAssert = now.addingTimeInterval(15)
+        let ids = freshPhysicalDisplayIDs()
+        for id in ids {
+            let cap = CGDisplayGammaTableCapacity(id)
+            guard cap > 0 else { continue }
+            var zeros = [CGGammaValue](repeating: 0, count: Int(cap))
+            CGSetDisplayTransferByTable(id, cap, &zeros, &zeros, &zeros)
+        }
+        if !dark {
+            log("darkened \(ids.count) screen(s) while driven")
+            emit("darken", [("dark", .b(true)), ("n", .n(Double(ids.count)))])
+        }
+        dark = true
+    }
+}
+
+// The daemon's own display list goes stale (no run loop), so ask a fresh process.
+func freshPhysicalDisplayIDs() -> [CGDirectDisplayID] {
+    let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
+    let r = sh("\(shellQuote(exe)) inspect-arrangement", timeout: 5)
+    return ((try? JSONDecoder().decode([SavedDisplay].self, from: Data(r.out.utf8))) ?? []).map { $0.id }
+}
+
 // MARK: - Tests (called from selftest)
 
 func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
@@ -445,6 +497,24 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     expect(db.lines.contains { $0.contains("Conflicting drivers") }, "doctor: two drivers fail")
     expect(db.lines.contains { $0.hasPrefix("!") && $0.contains("air15") && $0.contains("build") }, "doctor: old build fails")
     expect(db.failures >= 4, "doctor: every problem counts")
+    // Darken a driven Mac's own screens; any real local input or opening the lid relights them.
+    expect(screensShouldBeDark(passengerConverged: true, enabled: true, lastLocalInput: nil, lidOpenedAt: nil, now: 1000),
+           "darken: a converged passenger nobody is touching goes dark")
+    expect(!screensShouldBeDark(passengerConverged: false, enabled: true, lastLocalInput: nil, lidOpenedAt: nil, now: 1000),
+           "darken: never at console")
+    expect(!screensShouldBeDark(passengerConverged: true, enabled: false, lastLocalInput: nil, lidOpenedAt: nil, now: 1000),
+           "darken: the setting turns it off")
+    expect(!screensShouldBeDark(passengerConverged: true, enabled: true, lastLocalInput: 950, lidOpenedAt: nil, now: 1000),
+           "darken: a real keypress relights for two minutes")
+    expect(screensShouldBeDark(passengerConverged: true, enabled: true, lastLocalInput: 850, lidOpenedAt: nil, now: 1000),
+           "darken: and goes dark again after them")
+    expect(!screensShouldBeDark(passengerConverged: true, enabled: true, lastLocalInput: nil, lidOpenedAt: 990, now: 1000),
+           "darken: opening the lid relights")
+    // A settings file written before a key existed must keep every value it has.
+    let oldSettings = #"{"hidpiRides":true,"walkupHandback":false,"walkupPresence":false,"reverseScroll":false}"#
+    let decoded = try? JSONDecoder().decode(Settings.self, from: Data(oldSettings.utf8))
+    expect(decoded?.reverseScroll == false && decoded?.darkenWhileDriven == true,
+           "settings: an older file keeps its values and gains the new default")
     // Leftovers: log a failure once when it starts, not every 15 s while it lasts
     expect(shouldLogTransition(wasBad: false, isBad: true), "log: the first unreadable menu is logged")
     expect(!shouldLogTransition(wasBad: true, isBad: true), "log: a still-unreadable menu is not logged again")

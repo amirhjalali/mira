@@ -288,6 +288,8 @@ func handleControl(_ r: ControlRequest, rec: Reconciler) -> ControlReply {
             return answer(true, "Accepted; verifying display")
         case "close-viewer":
             // A stale session is closed where its viewer lives (host-side kills reconnect).
+            // Re-checked here: the window's verdict can be seconds old.
+            guard own == nil else { return answer(false, "This Mac is driving — its sessions are not stale") }
             viewerCloseRequests += 1
             log("asked to close this Mac's viewer")
             if ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil {
@@ -297,11 +299,15 @@ func handleControl(_ r: ControlRequest, rec: Reconciler) -> ControlReply {
         case "fix-audio":
             fixRequests.append("audio")
             let passenger = readRide() != nil
-            if ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil { routeAudio(passenger: passenger) }
-            return answer(true, passenger ? "Sound routed through Jump" : "Sound returned to this Mac")
+            if ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil { repairAudio(passenger: passenger) }
+            return answer(true, passenger ? "Sound routed through Jump" : "Jump devices returned to this Mac's own")
         case "fix-display":
+            // Never on the driver: a console restore unmirrors, re-routes audio and
+            // resizes the viewer windows every passenger is measured from.
+            guard own == nil else { return answer(false, "This Mac is driving — change its screens in System Settings") }
             fixRequests.append("display")
-            if readRide() == nil {
+            // A pending snapshot is newer than any verified one: retry it, never replace it.
+            if readRide() == nil, !FileManager.default.fileExists(atPath: arrangementFile.path) {
                 // Re-arm the last layout MIRA itself verified; the next tick restores and re-verifies it.
                 let good = stateDir.appendingPathComponent("last-console-arrangement.json")
                 guard let data = try? Data(contentsOf: good) else { return answer(false, "No verified layout to restore") }
@@ -553,6 +559,20 @@ func controlIntegrationTests() -> Never {
     removeState(stateDir.appendingPathComponent("last-console-arrangement.json"))
     check(!handleControl(ControlRequest(kind: "fix-display"), rec: rec).ok,
           "fix-display with no verified layout refuses rather than guessing")
+    // Final review: a Mac that is driving must refuse Kill and Fix display.
+    _ = handleControl(ControlRequest(kind: "drive"), rec: rec)
+    let closesWhileDriving = viewerCloseRequests
+    check(!handleControl(ControlRequest(kind: "close-viewer"), rec: rec).ok && viewerCloseRequests == closesWhileDriving,
+          "close-viewer refuses on the Mac that is driving")
+    try? atomicJSON([SavedDisplay](), to: stateDir.appendingPathComponent("last-console-arrangement.json"))
+    check(!handleControl(ControlRequest(kind: "fix-display"), rec: rec).ok && !FileManager.default.fileExists(atPath: arrangementFile.path),
+          "fix-display refuses on the Mac that is driving")
+    var stopNow = ControlRequest(kind: "stop"); stopNow.session = currentSession(rec.me); _ = handleControl(stopNow, rec: rec)
+    try? atomicJSON([SavedDisplay(id: 9, x: 0, y: 0, main: true, mirrorOf: nil, w: 1, h: 1, hz: nil, px: nil, stableID: "pending")], to: arrangementFile)
+    check(handleControl(ControlRequest(kind: "fix-display"), rec: rec).ok
+          && readJSON([SavedDisplay].self, arrangementFile)?.first?.stableID == "pending",
+          "fix-display never overwrites a pending restore snapshot")
+    removeState(arrangementFile); removeState(stateDir.appendingPathComponent("last-console-arrangement.json"))
     print("Control integration: \(failures == 0 ? "OK" : "FAILED")")
     exit(failures == 0 ? 0 : 1)
 }

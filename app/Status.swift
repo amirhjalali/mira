@@ -65,7 +65,7 @@ func captureLocalStatus(includeJumpWindows: Bool) -> LocalStatus {
                           main: d == main, builtIn: CGDisplayIsBuiltin(d) != 0,
                           mirrorsMain: CGDisplayMirrorsDisplay(d) == main)
     }
-    let lsof = sh("lsof -nP -iTCP -sTCP:ESTABLISHED -c Windows 2>/dev/null", timeout: 5).out
+    let lsof = sh("lsof -a -nP -iTCP -sTCP:ESTABLISHED -c Windows 2>/dev/null", timeout: 5).out
     return LocalStatus(ts: Date().timeIntervalSince1970, screens: screens,
                        output: currentDefaultOutputName(), input: currentDefaultInputName(),
                        jumpWindows: includeJumpWindows ? openJumpWindowTitles() : nil,
@@ -123,12 +123,14 @@ private func screenSummary(_ screens: [ScreenInfo]) -> String {
     return mirrored > 0 ? "\(main), \(mirrored) mirrored" : "\(main), \(screens.count) screen(s)"
 }
 
-func parseTailscale(_ json: String) -> [String: (online: Bool, lastSeen: String?)] {
+// A field that is missing reads as unknown, never as offline: a Tailscale format
+// change must not grey out every PC and disable Connect.
+func parseTailscale(_ json: String) -> [String: (online: Bool?, lastSeen: String?)] {
     guard let root = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
           let peers = root["Peer"] as? [String: Any] else { return [:] }
-    var out: [String: (online: Bool, lastSeen: String?)] = [:]
+    var out: [String: (online: Bool?, lastSeen: String?)] = [:]
     for case let p as [String: Any] in peers.values {
-        let online = p["Online"] as? Bool ?? false
+        let online = p["Online"] as? Bool
         for case let ip as String in (p["TailscaleIPs"] as? [Any] ?? []) {
             out[ip] = (online, p["LastSeen"] as? String)
         }
@@ -214,6 +216,26 @@ func miraExec(_ args: String) -> String {
     "if [ -x \"$HOME/Applications/MIRA.app/Contents/MacOS/MIRA\" ]; then "
       + "exec \"$HOME/Applications/MIRA.app/Contents/MacOS/MIRA\" \(args); "
       + "else exec /Applications/MIRA.app/Contents/MacOS/MIRA \(args); fi"
+}
+
+// Reset only what is wrong: a driver on AirPods with a stray Jump mic keeps its AirPods.
+func audioRepair(passenger: Bool, output: String?, input: String?) -> (output: Bool, input: Bool) {
+    if passenger { return (true, true) }
+    return (output?.hasPrefix("Jump Desktop") == true, input?.hasPrefix("Jump Desktop") == true)
+}
+
+// The header names the Mac that says it drives; hearsay from passengers (which
+// keep a crashed driver's ride) only when no reachable Mac claims the wheel.
+func currentDriver(_ statuses: [String: MachineStatus], unreachable: Set<String>) -> String? {
+    let live = statuses.filter { !unreachable.contains($0.key) }
+    if let d = live.keys.sorted().first(where: { live[$0]?.role == "driver" }) { return d }
+    return live.keys.sorted().compactMap { live[$0]?.driver }.first
+}
+
+// A session opened by a Mac that is not driving is exactly the leftover this
+// window flags as stale (2026-10-01), so only the driver offers Connect.
+func offersConnect(myRole: String?, me: Machine, target: Machine) -> Bool {
+    myRole == "driver" && target.id != me.id && target.roles.contains("target")
 }
 
 // MARK: - Tests (called from selftest)
@@ -311,4 +333,24 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     // Windows App connect: the generated .rdp targets the PC's endpoint
     let rdp = rdpFileText(WindowsPC(id: "rig3090", name: "3090", tailscale: "100.78.167.19", tailscaleName: "d", rdpPort: 1337))
     expect(rdp.contains("full address:s:100.78.167.19:1337"), "rdp: file targets the PC's endpoint")
+    // Final review fixes
+    let noOnline = #"{"Peer":{"k":{"TailscaleIPs":["100.78.167.19"],"LastSeen":"2026-10-03T10:00:00Z"}}}"#
+    expect(parseTailscale(noOnline)["100.78.167.19"]?.online == nil, "tailscale: a missing Online field is unknown, not offline")
+    let fixBoth = audioRepair(passenger: false, output: "AirPods", input: "Jump Desktop Microphone")
+    expect(!fixBoth.output && fixBoth.input, "audio fix: only the device on Jump is reset (AirPods stay)")
+    let fixPass = audioRepair(passenger: true, output: "AirPods", input: "Jump Desktop Microphone")
+    expect(fixPass.output && fixPass.input, "audio fix: a passenger is fully re-routed through Jump")
+    func mk(_ id: String, _ role: String, _ driver: String?) -> MachineStatus {
+        MachineStatus(machine: id, build: "b", ts: 0, role: role, driver: driver, outbound: nil, inboundCount: 0,
+                      inboundOldestSeconds: nil, output: nil, input: nil, audioWarning: nil, display: "ok",
+                      displayDetail: "", screens: nil, rdpEndpoints: [], warnings: [])
+    }
+    let fleet = ["air13": mk("air13", "local", "pro"), "mini": mk("mini", "passenger", "pro"),
+                 "air15": mk("air15", "driver", "air15")]
+    expect(currentDriver(fleet, unreachable: []) == "air15", "header: a reachable Mac saying it drives wins over hearsay")
+    expect(currentDriver(fleet, unreachable: ["air15"]) == "pro", "header: falls back to what reachable Macs report")
+    let proM = cfg.machines.first { $0.id == "pro" }!, miniM = cfg.machines.first { $0.id == "mini" }!
+    expect(offersConnect(myRole: "driver", me: proM, target: miniM), "connect: the driver can open a passenger")
+    expect(!offersConnect(myRole: "local", me: proM, target: miniM), "connect: a non-driver opening a session would be stale")
+    expect(!offersConnect(myRole: "driver", me: proM, target: proM), "connect: never this Mac itself")
 }

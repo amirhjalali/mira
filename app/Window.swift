@@ -30,7 +30,7 @@ final class MiraModel: ObservableObject {
 
     init(cfg: Config, me: Machine) { self.cfg = cfg; self.me = me }
     var macs: [Machine] { cfg.machines.filter { ($0.type ?? "mac") == "mac" } }
-    var driver: String? { statuses.values.compactMap { $0.driver }.first }
+    var driver: String? { currentDriver(statuses, unreachable: unreachable) }
 
     func start() {
         guard timer == nil else { refresh(); return }
@@ -45,7 +45,7 @@ final class MiraModel: ObservableObject {
             let ts = parseTailscale(sh("tailscale status --json 2>/dev/null || /Applications/Tailscale.app/Contents/MacOS/Tailscale status --json 2>/dev/null", timeout: 8).out)
             let open = Set(readJSON(LocalStatus.self, localStatusFile)?.rdpEndpoints ?? [])
             let list = (cfg.windowsPCs ?? []).map { pc in
-                WindowsStatus(pc: pc, online: ts.isEmpty ? nil : (ts[pc.tailscale]?.online ?? false),
+                WindowsStatus(pc: pc, online: ts[pc.tailscale]?.online ?? nil,
                               lastSeen: ts[pc.tailscale]?.lastSeen, sessionOpen: open.contains(rdpEndpoint(pc)))
             }
             DispatchQueue.main.async { self.pcs = list; self.refreshed = Date() }
@@ -126,6 +126,7 @@ struct MacCard: View {
     @ObservedObject var model: MiraModel
     let machine: Machine
     @State private var confirmKill = false
+    @State private var confirmDisplay = false
     var body: some View {
         let s = model.statuses[machine.id]
         let down = model.unreachable.contains(machine.id)
@@ -148,7 +149,7 @@ struct MacCard: View {
                     if s?.role == "driver" { Button("Stop Driving") { model.act("stop", on: machine) } }
                     else if mayDrive(roles: machine.roles) { Button("Drive from Here") { model.act("drive", on: machine) } }
                     if s?.role == "passenger" { Button("Use Locally") { model.act("local", on: machine) } }
-                } else if machine.roles.contains("target") {
+                } else if offersConnect(myRole: model.statuses[model.me.id]?.role, me: model.me, target: machine) {
                     Button("Connect") { model.connect(machine) }
                 }
                 if let note = model.notes[machine.id] { Text(note).font(.caption).foregroundStyle(.secondary) }
@@ -158,6 +159,9 @@ struct MacCard: View {
         .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
         .confirmationDialog("Close every Jump session \(machine.jumpName) is holding?", isPresented: $confirmKill) {
             Button("Close Sessions", role: .destructive) { model.act("close-viewer", on: machine) }
+        }
+        .confirmationDialog("Re-apply \(machine.jumpName)'s display layout? Screens may flicker.", isPresented: $confirmDisplay) {
+            Button("Re-apply Layout") { model.act("fix-display", on: machine) }
         }
     }
 
@@ -180,7 +184,7 @@ struct MacCard: View {
             if let w = s.audioWarning { Text(w).foregroundStyle(.orange) }
             HStack {
                 Text("Display: \(s.displayDetail)").foregroundStyle(s.display == "wrong" ? .orange : .primary)
-                if s.display == "wrong" { Button("Fix") { model.act("fix-display", on: machine) } }
+                if s.display == "wrong" { Button("Fix") { confirmDisplay = true } }
             }
             ForEach(s.warnings, id: \.self) { Text($0).foregroundStyle(.orange) }
             Text("Build \(s.build)").foregroundStyle(.secondary)

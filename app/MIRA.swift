@@ -1096,6 +1096,20 @@ func routeAudio(passenger: Bool) {
     }
 }
 
+// The MIRA window's Fix: reset only the devices audioRepair says are wrong.
+func repairAudio(passenger: Bool) {
+    if passenger { routeAudio(passenger: true); return }
+    let fix = audioRepair(passenger: false, output: currentDefaultOutputName(), input: currentDefaultInputName())
+    let devs = listAudioDevices()
+    if fix.output, let o = devs.first(where: { $0.builtIn && $0.hasOutput }) {
+        setDefaultAudio(o.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
+        setDefaultAudio(o.id, selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
+    }
+    if fix.input, let i = devs.first(where: { $0.builtIn && $0.hasInput }) {
+        setDefaultAudio(i.id, selector: kAudioHardwarePropertyDefaultInputDevice)
+    }
+}
+
 // MARK: - Native display engine
 
 let miraVendorID: UInt32 = 0x4D49_5241 & 0xFFFF  // "RA" tail of 'MIRA'
@@ -3662,7 +3676,7 @@ case "inspect-machine":
     // Runs over SSH: reads what the menu app and daemon published, plus `ps`.
     let cfg = loadConfig(), me = selfMachine(cfg), now = Date().timeIntervalSince1970
     let runtime = readJSON(RuntimeSnapshot.self, snapshotFile)
-    let driver = runtime?.role == "driver" ? me.id
+    let driver = currentSession(me) != nil || runtime?.role == "driver" ? me.id
         : (readRide()?.driver ?? readWheel().flatMap { now - $0.ts < cfg.rideTTLSeconds ? $0.driver : nil })
     let status = buildMachineStatus(cfg: cfg, me: me, runtime: runtime,
         local: readJSON(LocalStatus.self, localStatusFile), health: readJSON(Health.self, healthFile),

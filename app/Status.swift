@@ -151,6 +151,71 @@ func parseEtime(_ s: String) -> Double? {
     return days * 86400 + secs
 }
 
+// MARK: - MachineStatus (what `mira inspect-machine` prints)
+
+struct SessionLink: Codable, Equatable { let peer: String; let stale: Bool }
+struct MachineStatus: Codable {
+    let machine: String
+    let build: String
+    let ts: Double
+    let role: String                  // driver | passenger | local | unknown
+    let driver: String?
+    let outbound: [SessionLink]?      // nil = this Mac's viewer windows unknown
+    let inboundCount: Int
+    let inboundOldestSeconds: Double?
+    let output: String?
+    let input: String?
+    let audioWarning: String?
+    let display: String               // ok | wrong | unknown
+    let displayDetail: String
+    let screens: [ScreenInfo]?
+    let rdpEndpoints: [String]
+    let warnings: [String]
+}
+
+// Pure: everything already read, judged here.
+func buildMachineStatus(cfg: Config, me: Machine, runtime: RuntimeSnapshot?, local: LocalStatus?, health: Health?,
+                        inboundAges: [Double], driver: String?, snapshotPending: Bool, now: Double) -> MachineStatus {
+    var warnings: [String] = []
+    let rt = runtime.flatMap { now - $0.ts < 30 ? $0 : nil }
+    if rt == nil { warnings.append("MIRA daemon not reporting") }
+    let loc = local.flatMap { now - $0.ts < 30 ? $0 : nil }
+    if loc == nil { warnings.append("MIRA menu app not reporting") }
+    if let h = health {
+        if !h.accessibility { warnings.append("Jump Connect lost Accessibility") }
+        if !h.screenRecording { warnings.append("Jump Connect lost Screen Recording") }
+    }
+    let role = rt?.role ?? "unknown"
+    let outbound = loc?.jumpWindows.map { titles in
+        outboundMachines(titles: titles, cfg: cfg, me: me.id)
+            .map { SessionLink(peer: $0, stale: sessionIsStale(holder: me.id, driver: driver)) }
+    }
+    let verdict = loc == nil
+        ? (verdict: "unknown", detail: "No fresh screen report")
+        : displayVerdict(role: role, runtimeState: rt?.state ?? "unknown", runtimeDetail: rt?.detail ?? "",
+                         screens: loc?.screens, mirrorDocked: me.mirrorDocked == true, snapshotPending: snapshotPending)
+    return MachineStatus(machine: me.id, build: runtime?.build ?? "?", ts: now, role: role, driver: driver,
+                         outbound: outbound, inboundCount: inboundAges.count, inboundOldestSeconds: inboundAges.max(),
+                         output: loc?.output, input: loc?.input,
+                         audioWarning: loc == nil ? nil : audioWarning(role: role, output: loc?.output, input: loc?.input),
+                         display: verdict.verdict, displayDetail: verdict.detail, screens: loc?.screens,
+                         rdpEndpoints: loc?.rdpEndpoints ?? [], warnings: warnings)
+}
+
+// Inbound Jump sessions: one `JumpConnect --desktopproxy` per live session.
+func inboundSessionAges() -> [Double] {
+    sh("ps -Ao etime=,command= | grep 'JumpConnect --desktopproxy' | grep -v grep", timeout: 5).out
+        .components(separatedBy: "\n")
+        .compactMap { $0.trimmingCharacters(in: .whitespaces).split(separator: " ").first.flatMap { parseEtime(String($0)) } }
+}
+
+// The shell command that runs this binary's CLI on any Mac, wherever it is installed.
+func miraExec(_ args: String) -> String {
+    "if [ -x \"$HOME/Applications/MIRA.app/Contents/MacOS/MIRA\" ]; then "
+      + "exec \"$HOME/Applications/MIRA.app/Contents/MacOS/MIRA\" \(args); "
+      + "else exec /Applications/MIRA.app/Contents/MacOS/MIRA \(args); fi"
+}
+
 // MARK: - Tests (called from selftest)
 
 func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
@@ -221,4 +286,26 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     expect(parseEtime("13:17:36") == 47_856.0, "etime: hours")
     expect(parseEtime("05:09") == 309, "etime: minutes")
     expect(parseEtime("x") == nil, "etime: garbage")
+    // MachineStatus: the 2026-10-01 incident, seen from air13
+    let me13 = cfg.machines.first { $0.id == "air13" }!
+    let rt = RuntimeSnapshot(machine: "air13", build: miraBuild, pid: 1, ts: 1000, role: "local", session: nil,
+                             state: "local", detail: "", width: nil, height: nil, pixelWidth: nil, pixelHeight: nil, fdCount: 5)
+    let fresh = LocalStatus(ts: 1000, screens: [], output: "MacBook Air Speakers", input: "MacBook Air Microphone",
+                            jumpWindows: ["Amir’s MacBook Pro"], rdpEndpoints: [])
+    let st = buildMachineStatus(cfg: cfg, me: me13, runtime: rt, local: fresh, health: nil, inboundAges: [],
+                                driver: "pro", snapshotPending: false, now: 1005)
+    expect(st.outbound == [SessionLink(peer: "pro", stale: true)], "machineStatus: air13's session into the driving pro is stale")
+    let old = LocalStatus(ts: 900, screens: [], output: nil, input: nil, jumpWindows: nil, rdpEndpoints: [])
+    let st2 = buildMachineStatus(cfg: cfg, me: me13, runtime: rt, local: old, health: nil, inboundAges: [],
+                                 driver: "pro", snapshotPending: false, now: 1005)
+    expect(st2.display == "unknown" && st2.warnings.contains("MIRA menu app not reporting"),
+           "machineStatus: stale local status gives unknown display")
+    let st3 = buildMachineStatus(cfg: cfg, me: me13, runtime: nil, local: fresh,
+                                 health: Health(accessibility: false, screenRecording: true, ts: 1000),
+                                 inboundAges: [100, 50_000], driver: "pro", snapshotPending: false, now: 1005)
+    expect(st3.warnings.contains("MIRA daemon not reporting") && st3.warnings.contains("Jump Connect lost Accessibility"),
+           "machineStatus: daemon and permission warnings")
+    expect(st3.inboundCount == 2 && st3.inboundOldestSeconds == 50_000, "machineStatus: inbound sessions counted with oldest age")
+    let encoded = try! JSONEncoder().encode(st)
+    expect((try? JSONDecoder().decode(MachineStatus.self, from: encoded)) != nil, "machineStatus: JSON round-trip")
 }

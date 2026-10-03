@@ -3651,6 +3651,18 @@ case "inspect-screens":
         print(String(decoding: data, as: UTF8.self))
     }
     exit(0)
+case "inspect-machine":
+    // Runs over SSH: reads what the menu app and daemon published, plus `ps`.
+    let cfg = loadConfig(), me = selfMachine(cfg), now = Date().timeIntervalSince1970
+    let runtime = readJSON(RuntimeSnapshot.self, snapshotFile)
+    let driver = runtime?.role == "driver" ? me.id
+        : (readRide()?.driver ?? readWheel().flatMap { now - $0.ts < cfg.rideTTLSeconds ? $0.driver : nil })
+    let status = buildMachineStatus(cfg: cfg, me: me, runtime: runtime,
+        local: readJSON(LocalStatus.self, localStatusFile), health: readJSON(Health.self, healthFile),
+        inboundAges: inboundSessionAges(), driver: driver,
+        snapshotPending: FileManager.default.fileExists(atPath: arrangementFile.path), now: now)
+    if let data = try? JSONEncoder().encode(status) { print(String(decoding: data, as: UTF8.self)) }
+    exit(0)
 case "ipc-selftest": controlIntegrationTests()
 case "selftest": selftest()
 case "--daemon": runDaemon(cfg: loadConfig())

@@ -116,9 +116,7 @@ func remoteControl(_ machine: Machine, _ request: ControlRequest) -> ControlRepl
     guard let data = try? JSONEncoder().encode(request) else { return ControlReply(ok: false, message: "Invalid request") }
     // Fixed paths, no GUI scripting. Each installed CLI sends to its GUI daemon.
     let payload = data.base64EncodedString()
-    let command = "if [ -x \"$HOME/Applications/MIRA.app/Contents/MacOS/MIRA\" ]; then "
-        + "exec \"$HOME/Applications/MIRA.app/Contents/MacOS/MIRA\" control \(payload); "
-        + "else exec /Applications/MIRA.app/Contents/MacOS/MIRA control \(payload); fi"
+    let command = miraExec("control \(payload)")
     let r = peerRun(machine, command, timeout: 16, force: true)
     if let answer = try? JSONDecoder().decode(ControlReply.self, from: Data(r.out.utf8)) { return answer }
     return ControlReply(ok: false, message: r.code == 124 || r.code == 255 ? "Reconnecting" : "No compatible acknowledgement (\(r.code))")

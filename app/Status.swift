@@ -72,6 +72,85 @@ func captureLocalStatus(includeJumpWindows: Bool) -> LocalStatus {
                        rdpEndpoints: parseLsofEndpoints(lsof))
 }
 
+// MARK: - Pure rules (selftested)
+
+// Jump's Window menu lists every viewer window by title; only titles that name
+// a Mac in the config are sessions (the rest is menu furniture).
+func outboundMachines(titles: [String], cfg: Config, me: String) -> [String] {
+    var out: [String] = []
+    for m in cfg.machines where m.id != me {
+        let names = [m.jumpName] + (m.jumpAliases ?? [])
+        if titles.contains(where: { names.contains($0) }), !out.contains(m.id) { out.append(m.id) }
+    }
+    return out
+}
+
+// 2026-10-01: a session held by any Mac other than the current driver is a leftover.
+func sessionIsStale(holder: String, driver: String?) -> Bool { holder != driver }
+
+func audioWarning(role: String, output: String?, input: String?) -> String? {
+    let jumpOut = output?.hasPrefix("Jump Desktop") == true
+    let jumpIn = input?.hasPrefix("Jump Desktop") == true
+    if role == "passenger" { return jumpOut ? nil : "Sound is not going through Jump" }
+    if jumpIn { return "Jump microphone selected — remote audio can loop back" }
+    if jumpOut { return "Sound is going to Jump, not this Mac" }
+    return nil
+}
+
+func displayVerdict(role: String, runtimeState: String, runtimeDetail: String, screens: [ScreenInfo]?,
+                    mirrorDocked: Bool, snapshotPending: Bool) -> (verdict: String, detail: String) {
+    if role == "passenger" {
+        switch runtimeState {
+        case "ready": return ("ok", "Matches the driver")
+        case "needs-attention": return ("wrong", runtimeDetail)
+        default: return ("unknown", runtimeDetail)
+        }
+    }
+    if snapshotPending { return ("wrong", "A display layout restore is pending") }
+    guard let screens = screens, !screens.isEmpty else { return ("unknown", "No fresh screen report") }
+    let external = screens.filter { !$0.builtIn }
+    guard mirrorDocked, let widest = external.max(by: { $0.w * $0.h < $1.w * $1.h }) else {
+        return ("ok", screenSummary(screens))
+    }
+    if !widest.main { return ("wrong", "The external screen is not main") }
+    if screens.contains(where: { !$0.main && !$0.mirrorsMain }) { return ("wrong", "Screens are extended, not mirrored") }
+    return ("ok", screenSummary(screens))
+}
+
+private func screenSummary(_ screens: [ScreenInfo]) -> String {
+    let main = screens.first { $0.main }.map { "\($0.w)×\($0.h) main" } ?? "no main screen"
+    let mirrored = screens.filter { $0.mirrorsMain }.count
+    return mirrored > 0 ? "\(main), \(mirrored) mirrored" : "\(main), \(screens.count) screen(s)"
+}
+
+func parseTailscale(_ json: String) -> [String: (online: Bool, lastSeen: String?)] {
+    guard let root = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
+          let peers = root["Peer"] as? [String: Any] else { return [:] }
+    var out: [String: (online: Bool, lastSeen: String?)] = [:]
+    for case let p as [String: Any] in peers.values {
+        let online = p["Online"] as? Bool ?? false
+        for case let ip as String in (p["TailscaleIPs"] as? [Any] ?? []) {
+            out[ip] = (online, p["LastSeen"] as? String)
+        }
+    }
+    return out
+}
+
+// `ps -o etime`: [[dd-]hh:]mm:ss
+func parseEtime(_ s: String) -> Double? {
+    let t = s.trimmingCharacters(in: .whitespaces)
+    var days = 0.0, clock = Substring(t)
+    if let dash = t.firstIndex(of: "-") {
+        guard let d = Double(t[..<dash]) else { return nil }
+        days = d; clock = t[t.index(after: dash)...]
+    }
+    let parts = clock.split(separator: ":").map { Double($0) }
+    guard (2...3).contains(parts.count), !parts.contains(where: { $0 == nil }) else { return nil }
+    let v = parts.map { $0! }
+    let secs = v.count == 3 ? v[0] * 3600 + v[1] * 60 + v[2] : v[0] * 60 + v[1]
+    return days * 86400 + secs
+}
+
 // MARK: - Tests (called from selftest)
 
 func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
@@ -93,4 +172,53 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     expect(parseLsofEndpoints(lsof) == ["100.78.167.19:1337", "20.26.121.2:3389"],
            "lsof: remote endpoints of established Windows App connections")
     expect(parseLsofEndpoints("") == [], "lsof: nothing open is an empty list")
+    // outbound sessions come from Jump's Window menu titles
+    let titles = ["Computers", "Minimize", "Zoom", "Mac Mini", "MacBook Air", "Bring All to Front"]
+    let out = outboundMachines(titles: titles, cfg: cfg, me: "pro")
+    expect(out.contains("mini"), "outbound: alias title maps to the machine")
+    expect(!out.contains { ["Computers", "Minimize", "Zoom"].contains($0) }, "outbound: menu noise is ignored")
+    expect(!outboundMachines(titles: ["MacBook Pro"], cfg: cfg, me: "pro").contains("pro"), "outbound: never this Mac itself")
+    // staleness: 2026-10-01, air13 kept a session into the pro the pro was driving from
+    expect(sessionIsStale(holder: "air13", driver: "pro"), "stale: a non-driver's viewer is stale")
+    expect(!sessionIsStale(holder: "pro", driver: "pro"), "stale: the driver's own viewer is not stale")
+    expect(sessionIsStale(holder: "air13", driver: nil), "stale: nobody driving means any viewer is stale")
+    // audio
+    expect(audioWarning(role: "local", output: "Jump Desktop Audio", input: "MacBook Pro Microphone") != nil,
+           "audio: Jump output on a Mac nobody drives is flagged")
+    expect(audioWarning(role: "driver", output: "AirPods", input: "Jump Desktop Microphone") != nil,
+           "audio: Jump mic on the driver is flagged")
+    expect(audioWarning(role: "passenger", output: "Jump Desktop Audio", input: "Jump Desktop Microphone") == nil,
+           "audio: passenger routed through Jump is fine")
+    expect(audioWarning(role: "passenger", output: "AirPods", input: nil) != nil,
+           "audio: passenger not routed through Jump is flagged")
+    expect(audioWarning(role: "local", output: "AirPods", input: "AirPods") == nil, "audio: normal local use is fine")
+    // display
+    let benq = ScreenInfo(w: 3440, h: 1440, main: true, builtIn: false, mirrorsMain: false)
+    let panelMirror = ScreenInfo(w: 3440, h: 1440, main: false, builtIn: true, mirrorsMain: true)
+    let panelExtend = ScreenInfo(w: 1728, h: 1117, main: false, builtIn: true, mirrorsMain: false)
+    expect(displayVerdict(role: "driver", runtimeState: "driving", runtimeDetail: "", screens: [benq, panelMirror],
+                          mirrorDocked: true, snapshotPending: false).verdict == "ok", "display: docked pro mirrored is ok")
+    expect(displayVerdict(role: "driver", runtimeState: "driving", runtimeDetail: "", screens: [benq, panelExtend],
+                          mirrorDocked: true, snapshotPending: false).verdict == "wrong", "display: docked pro extended is wrong")
+    expect(displayVerdict(role: "local", runtimeState: "local", runtimeDetail: "", screens: [benq, panelExtend],
+                          mirrorDocked: false, snapshotPending: false).verdict == "ok", "display: extended is fine where not preferred")
+    expect(displayVerdict(role: "local", runtimeState: "local", runtimeDetail: "", screens: [benq, panelMirror],
+                          mirrorDocked: true, snapshotPending: true).verdict == "wrong", "display: retained snapshot is wrong")
+    expect(displayVerdict(role: "local", runtimeState: "local", runtimeDetail: "", screens: nil,
+                          mirrorDocked: true, snapshotPending: false).verdict == "unknown", "display: no fresh screens is unknown")
+    let pv = displayVerdict(role: "passenger", runtimeState: "needs-attention", runtimeDetail: "Virtual display is not main",
+                            screens: [], mirrorDocked: false, snapshotPending: false)
+    expect(pv.verdict == "wrong" && pv.detail == "Virtual display is not main", "display: passenger takes the daemon's verdict")
+    // tailscale
+    let ts = #"{"Peer":{"k1":{"TailscaleIPs":["100.78.167.19","fd7a::1"],"Online":true,"LastSeen":"2026-10-03T10:00:00Z"},"k2":{"TailscaleIPs":["100.101.253.21"],"Online":false,"LastSeen":"2026-08-09T10:00:00Z"}}}"#
+    let parsed = parseTailscale(ts)
+    expect(parsed["100.78.167.19"]?.online == true, "tailscale: online peer")
+    expect(parsed["100.101.253.21"]?.online == false && parsed["100.101.253.21"]?.lastSeen == "2026-08-09T10:00:00Z",
+           "tailscale: offline peer keeps last seen")
+    expect(parseTailscale("not json").isEmpty, "tailscale: garbage gives no verdicts")
+    // ps etime
+    expect(parseEtime("02-05:03:35") == 191_015.0, "etime: days")
+    expect(parseEtime("13:17:36") == 47_856.0, "etime: hours")
+    expect(parseEtime("05:09") == 309, "etime: minutes")
+    expect(parseEtime("x") == nil, "etime: garbage")
 }

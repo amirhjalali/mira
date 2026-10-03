@@ -2596,6 +2596,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
     let cfg = loadConfig()
     lazy var me = selfMachine(cfg)
     var scrollTap: CFMachPort?
+    var miraWindow: MiraWindowController?
     var lastMenuState = ""
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -2684,6 +2685,7 @@ final class MenuApp: NSObject, NSApplicationDelegate {
         let header = driving ? "Driving from \(me.jumpName)"
                              : (elsewhere.map { "Parked — \($0) is driving" } ?? "Parked")
         m.addItem(withTitle: header, action: nil, keyEquivalent: "")
+        m.addItem(withTitle: "Open MIRA…", action: #selector(openMiraWindow), keyEquivalent: "m").target = self
         m.addItem(.separator())
         if driving {
             m.addItem(withTitle: "Stop Driving", action: #selector(stop), keyEquivalent: "d").target = self
@@ -2928,6 +2930,10 @@ func rideablePassengers(cfg: Config, me: Machine) -> [Machine] {
 
 extension MenuApp {
     @objc func drive() { sendControl(ControlRequest(kind: "drive")) }
+    @objc func openMiraWindow() {
+        if miraWindow == nil { miraWindow = MiraWindowController(cfg: cfg, me: me) }
+        miraWindow?.show()
+    }
     // Re-open viewer windows without touching rides/handbacks — for a closed
     // window mid-session or a boot-resume triggered manually.
     @objc func reopenWindows() {

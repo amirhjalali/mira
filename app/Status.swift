@@ -308,4 +308,7 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     expect(st3.inboundCount == 2 && st3.inboundOldestSeconds == 50_000, "machineStatus: inbound sessions counted with oldest age")
     let encoded = try! JSONEncoder().encode(st)
     expect((try? JSONDecoder().decode(MachineStatus.self, from: encoded)) != nil, "machineStatus: JSON round-trip")
+    // Windows App connect: the generated .rdp targets the PC's endpoint
+    let rdp = rdpFileText(WindowsPC(id: "rig3090", name: "3090", tailscale: "100.78.167.19", tailscaleName: "d", rdpPort: 1337))
+    expect(rdp.contains("full address:s:100.78.167.19:1337"), "rdp: file targets the PC's endpoint")
 }

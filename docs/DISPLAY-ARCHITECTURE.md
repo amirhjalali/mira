@@ -134,3 +134,47 @@ drive" instead of the wheel. All selftested.
 wrong answers this in one line: a passenger that says `driving: false` and names
 a canvas is being driven; anything else is an arbitration problem, not a
 geometry one.
+
+## macOS 26 decides some virtual displays are TVs
+
+2026-10-05: air13 drove from a 1920x1200 desk monitor. air15 was fine. The pro
+and the mini each showed a "how do you want to use this display?" picker, and
+their passenger topology failed with `candidate display is not online`. The pro
+then fell back to streaming its own physical screens at 1680x1050. The mini
+rolled back to its old 3440x1440 virtual, so it was squeezed into the
+1920x1200 window.
+
+**The cause:** the virtual display claimed a fixed 800x335 mm physical size,
+which is a 38" ultrawide. At some resolutions on 26.6.2, Control Center's
+`offlineDisplays` controller treats a display that size as a TV. Logged as
+`tvConnected … needsAlert: true`. The display is held offline behind a shield
+window until a human answers the picker. air15 never saw it because its lid
+is closed.
+
+Measured with a probe on the mini:
+
+| Resolution | Claimed size | Treated as a TV? |
+|---|---|---|
+| 1920x1200 | 800 mm | yes |
+| 1920x1080 | 800 mm | yes |
+| 2048x1280 | 800 mm | yes |
+| 3840x2160 | 800 mm or more | yes |
+| 1280x800 | 800 mm | no |
+| 1728x1117 | 800 mm | no |
+| 2560x1600 | 800 mm | no |
+| 3440x1440 | 800 mm | no |
+
+Every resolution came online immediately with no picker once it claimed a
+monitor's size.
+
+**Now:** `virtualPhysicalSize` claims 110 ppi with a 30" diagonal cap
+(selftested). The `configure-passenger` helper waits up to 2 s for the display
+to come online. When it gives up, it names the picker as the likely culprit.
+
+**If it recurs:**
+
+```
+log show --last 10m --predicate 'process == "ControlCenter" AND category == "offlineDisplays"'
+```
+
+Look for `needsAlert: true`.

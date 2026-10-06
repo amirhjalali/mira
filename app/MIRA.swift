@@ -1285,7 +1285,7 @@ final class DisplayEngine {
         desc.name = "MIRA"
         desc.maxPixelsWide = 6880
         desc.maxPixelsHigh = 3824
-        desc.sizeInMillimeters = CGSize(width: 800, height: 335)
+        desc.sizeInMillimeters = virtualPhysicalSize(width: canvas.width, height: canvas.height)
         desc.serialNum = nextVirtualSerial()  // retained rollback display must have a different identity
         desc.productID = 0x4D32
         desc.vendorID = miraVendorID
@@ -3733,11 +3733,24 @@ case "configure-passenger":
     guard let mode = modes.first(where: { $0.width == w && $0.height == h && $0.pixelWidth == px && $0.pixelHeight == py }) else {
         print("requested display mode is not published"); exit(1)
     }
-    var ids = [CGDirectDisplayID](repeating: 0, count: 32)
-    var count: UInt32 = 0
-    guard CGGetOnlineDisplayList(32, &ids, &count) == .success else { exit(1) }
-    let online = Array(ids.prefix(Int(count)))
-    guard online.contains(id) else { print("candidate display is not online"); exit(1) }
+    // A display created a moment ago can take a beat to come online. One that
+    // never does is almost always macOS holding it behind Control Center's
+    // mirror/extend picker -- see virtualPhysicalSize.
+    func onlineNow() -> [CGDirectDisplayID] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 32)
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(32, &ids, &count) == .success else { return [] }
+        return Array(ids.prefix(Int(count)))
+    }
+    var online = onlineNow()
+    let onlineDeadline = Date().addingTimeInterval(2)
+    while !online.contains(id), Date() < onlineDeadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        online = onlineNow()
+    }
+    guard online.contains(id) else {
+        print("candidate display is not online after 2 s (held behind the macOS display picker?)"); exit(1)
+    }
     var transaction: CGDisplayConfigRef?
     guard CGBeginDisplayConfiguration(&transaction) == .success, let transaction = transaction else { exit(1) }
     func checked(_ result: CGError) {

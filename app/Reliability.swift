@@ -4,7 +4,7 @@ import Foundation
 import Darwin
 
 let miraVersion = "2.2.0"
-let miraBuild = "20261003.4"
+let miraBuild = "20261005.1"
 var daemonOwnsState = false
 var singletonFD: Int32 = -1
 var snapshotFile: URL { stateDir.appendingPathComponent("runtime.json") }
@@ -440,6 +440,17 @@ func shouldNormalizeScroll(enabled: Bool, passenger: Bool, phase: Int64, momentu
 func reliabilityTests(_ expect: (Bool, String) -> Void) {
     let firstSerial = nextVirtualSerial(), secondSerial = nextVirtualSerial()
     expect(firstSerial != secondSerial && firstSerial != 1, "candidate display identity differs from retained rollback display")
+    // Sizes measured as TVs on 26.6.2: 1920x1200 at 800mm, 2048x1280 at 800mm,
+    // 3840x2160 at 886mm and at 800mm. Sizes measured as monitors: 1920x1200 at
+    // 443mm, 3840x2160 at 708mm, 3440x1440 at 794mm.
+    for (w, h) in [(1920, 1200), (1920, 1080), (2048, 1280), (3840, 2160), (3440, 1440), (1280, 800)] {
+        let s = virtualPhysicalSize(width: w, height: h)
+        let inches = (s.width * s.width + s.height * s.height).squareRoot() / 25.4
+        expect(inches <= 30.01 && abs(s.width / s.height - Double(w) / Double(h)) < 0.01,
+               "virtual \(w)x\(h) claims a monitor (\(Int(s.width))x\(Int(s.height))mm), not a TV")
+    }
+    expect(virtualPhysicalSize(width: 1920, height: 1200).width < 500,
+           "1920x1200 is no longer a 38-inch panel")
     let old = SessionID(driver: "pro", claim: 100)
     let new = SessionID(driver: "air13", claim: 101)
     expect(!sessionAccepts(old, fence: SessionFence(session: new, ended: false)), "late old driver cannot overwrite new owner")
@@ -594,6 +605,23 @@ func physicalDisplayKey(_ id: CGDirectDisplayID) -> String {
 // A candidate and the rollback display coexist. Reusing the vendor/product/
 // serial triple makes CGVirtualDisplay initialization fail while the old one
 // is still alive. The daemon is the sole caller; consecutive candidates differ.
+// The physical size a virtual display claims decides whether macOS 26 treats
+// it as a TV. A "TV" is held OFFLINE behind Control Center's mirror/extend
+// picker until someone clicks it, so the topology transaction finds no display
+// and the passenger falls back to its console screen. The old hardcoded 800x335
+// mm (a 38" ultrawide) was fine for 3440x1440 but turned 1920x1200, 1920x1080
+// and 2048x1280 into TVs -- the 2026-10-05 failure on the pro and the mini when
+// air13 drove from a 1920x1200 desk monitor. Measured on 26.6.2: claim a desktop
+// monitor's density (110 ppi) and cap the diagonal at 30"; every canvas from
+// 1024x768 to 5120x2880 then comes online with no picker.
+func virtualPhysicalSize(width: Int, height: Int) -> CGSize {
+    let mm = { (px: Int) in Double(px) * 25.4 / 110 }
+    var w = mm(width), h = mm(height)
+    let diagonal = (w * w + h * h).squareRoot(), cap = 30 * 25.4
+    if diagonal > cap { w *= cap / diagonal; h *= cap / diagonal }
+    return CGSize(width: w.rounded(), height: h.rounded())
+}
+
 var virtualSerial: UInt32 = UInt32.random(in: 2...UInt32.max - 1)
 func nextVirtualSerial() -> UInt32 {
     virtualSerial = virtualSerial == UInt32.max ? 2 : virtualSerial + 1

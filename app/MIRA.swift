@@ -1240,21 +1240,27 @@ func jumpAgentLogTail(bytes: UInt64 = 262_144) -> String {
     return String(decoding: h.readDataToEndOfFile(), as: UTF8.self)
 }
 
+// Only a live session's own proxy: the one just ended keeps "failing" in the
+// log for a few seconds, and an old line's pid may since have been reused.
+func liveStuckJumpCaptures(now: Double) -> [CaptureStuck] {
+    stuckJumpCaptures(logTail: jumpAgentLogTail(), now: now).filter {
+        sh("ps -o command= -p \($0.pid)", timeout: 5).out.contains("JumpConnect --desktopproxy")
+    }
+}
+
 var captureRecycles: [Double] = []
 var captureBudgetLogged = false
 
 // Passenger steady state: end any session whose sound capture is stuck.
 // `force` is the MIRA window's Fix: a human asked, so the loop budget does not apply.
 func guardJumpCapture(now: Double = Date().timeIntervalSince1970, force: Bool = false) {
-    let stuck = stuckJumpCaptures(logTail: jumpAgentLogTail(), now: now)
+    let stuck = liveStuckJumpCaptures(now: now)
     guard !stuck.isEmpty else { captureBudgetLogged = false; return }
     guard force || mayRecycleCapture(history: captureRecycles, now: now) else {
         if !captureBudgetLogged { log("Jump capture still stuck after \(captureRecycles.count) restarts — leaving it") }
         captureBudgetLogged = true; return
     }
     for s in stuck {
-        // Only ever a session's own proxy; the pid in an old log line may be reused.
-        guard sh("ps -o command= -p \(s.pid)", timeout: 5).out.contains("JumpConnect --desktopproxy") else { continue }
         captureRecycles.append(now)
         log("Jump session \(s.pid) has captured no sound for \(Int(now - s.since))s — ending it so the viewer reconnects")
         emit("capture_recycle", [("pid", .n(Double(s.pid))), ("stuck", .n(now - s.since))])
@@ -3946,7 +3952,7 @@ case "inspect-machine":
     let status = buildMachineStatus(cfg: cfg, me: me, runtime: runtime,
         local: readJSON(LocalStatus.self, localStatusFile), health: readJSON(Health.self, healthFile),
         inboundAges: inboundSessionAges(), driver: driver,
-        captureStuckSince: stuckJumpCaptures(logTail: jumpAgentLogTail(), now: now).map { $0.since }.min(),
+        captureStuckSince: liveStuckJumpCaptures(now: now).map { $0.since }.min(),
         snapshotPending: FileManager.default.fileExists(atPath: arrangementFile.path),
         daemonRunning: sh("pgrep -f 'MacOS/MIRA --daemon' >/dev/null").code == 0, now: now)
     if let data = try? JSONEncoder().encode(status) { print(String(decoding: data, as: UTF8.self)) }

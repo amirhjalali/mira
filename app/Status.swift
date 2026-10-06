@@ -97,6 +97,13 @@ func audioWarning(role: String, output: String?, input: String?) -> String? {
     return nil
 }
 
+// A session whose Jump Connect lost its capture device (see stuckJumpCaptures).
+func captureWarning(stuckFor secs: Double) -> String {
+    let s = Int(secs)
+    // A lower bound: only the log's tail is read.
+    return "Jump has captured no sound for \(s >= 120 ? "\(s / 60)+ min" : "\(s)+ s") — the driver hears nothing"
+}
+
 func displayVerdict(role: String, runtimeState: String, runtimeDetail: String, screens: [ScreenInfo]?,
                     mirrorDocked: Bool, snapshotPending: Bool) -> (verdict: String, detail: String) {
     if role == "passenger" {
@@ -180,8 +187,8 @@ struct MachineStatus: Codable {
 
 // Pure: everything already read, judged here.
 func buildMachineStatus(cfg: Config, me: Machine, runtime: RuntimeSnapshot?, local: LocalStatus?, health: Health?,
-                        inboundAges: [Double], driver: String?, snapshotPending: Bool, daemonRunning: Bool,
-                        now: Double) -> MachineStatus {
+                        inboundAges: [Double], driver: String?, captureStuckSince: Double? = nil,
+                        snapshotPending: Bool, daemonRunning: Bool, now: Double) -> MachineStatus {
     var warnings: [String] = []
     let rt = runtime.flatMap { now - $0.ts < 30 ? $0 : nil }
     // A stale report from a daemon that is still running is a Mac that was asleep
@@ -206,7 +213,8 @@ func buildMachineStatus(cfg: Config, me: Machine, runtime: RuntimeSnapshot?, loc
     return MachineStatus(machine: me.id, build: runtime?.build ?? "?", ts: now, role: role, driver: driver,
                          outbound: outbound, inboundCount: inboundAges.count, inboundOldestSeconds: inboundAges.max(),
                          output: loc?.output, input: loc?.input,
-                         audioWarning: loc == nil ? nil : audioWarning(role: role, output: loc?.output, input: loc?.input),
+                         audioWarning: captureStuckSince.map { captureWarning(stuckFor: now - $0) }
+                             ?? (loc == nil ? nil : audioWarning(role: role, output: loc?.output, input: loc?.input)),
                          display: verdict.verdict, displayDetail: verdict.detail, screens: loc?.screens,
                          rdpEndpoints: loc?.rdpEndpoints ?? [], warnings: warnings,
                          asleep: asleep ? true : nil, fdCount: runtime?.fdCount)

@@ -1180,6 +1180,89 @@ func preferHeadphonesForDriver() {
     setDefaultAudio(bt.id, selector: kAudioHardwarePropertyDefaultOutputDevice)
 }
 
+// MARK: - Jump capture guard
+
+// 2026-10-06: a session's Jump Connect picks its capture device by number when
+// it starts. The iPhone's Continuity microphone coming and going renumbers the
+// list, and the session keeps asking for a device that no longer exists — once
+// a second, "Capture channels is 0, exiting", for hours. The passenger's route
+// is right, the driver simply hears nothing. Re-routing does not reach it; only
+// a new session re-picks. Ending that session's desktopproxy is enough: the
+// viewer reconnects within seconds.
+struct CaptureStuck: Equatable { let pid: Int32; let since: Double }
+
+let jumpLogTimeFormat: DateFormatter = {
+    let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd HH:mm:ss:SSS"
+    df.locale = Locale(identifier: "en_US_POSIX"); return df
+}()
+
+// Pure: a session is stuck when its latest capture attempt failed, it has failed
+// for `after` seconds without a successful start, and it is still trying.
+func stuckJumpCaptures(logTail: String, now: Double, after: Double = 15) -> [CaptureStuck] {
+    var firstFail: [Int32: Double] = [:], lastFail: [Int32: Double] = [:]
+    // Jump writes CRLF, which Swift reads as ONE Character: never split on "\n".
+    for line in logTail.split(whereSeparator: \.isNewline) where line.contains("[audio_cap_") {
+        let failed = line.contains(" ERROR [audio_cap_")
+        guard failed || line.contains("Started capture"), line.count > 24,
+              let t = jumpLogTimeFormat.date(from: String(line.prefix(23)))?.timeIntervalSince1970,
+              let pid = line.dropFirst(24).split(separator: ":").first.flatMap({ Int32($0) }) else { continue }
+        if failed { if firstFail[pid] == nil { firstFail[pid] = t }; lastFail[pid] = t }
+        else { firstFail[pid] = nil; lastFail[pid] = nil }
+    }
+    return firstFail.compactMap { pid, since in
+        guard let last = lastFail[pid], now - last < 10, now - since >= after else { return nil }
+        return CaptureStuck(pid: pid, since: since)
+    }.sorted { $0.pid < $1.pid }
+}
+
+// Pure: never cycle a session in a loop. One restart per two minutes, three per
+// half hour; past that the status warning stays up for a human.
+func mayRecycleCapture(history: [Double], now: Double) -> Bool {
+    let recent = history.filter { now - $0 < 1800 }
+    return recent.count < 3 && !recent.contains { now - $0 < 120 }
+}
+
+// The tail of today's Jump Connect log. It grows about 2 KB a second while
+// capture is failing, so the tail always covers the last minute or more.
+func jumpAgentLogTail(bytes: UInt64 = 262_144) -> String {
+    let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Jump Desktop")
+    let logs = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]))?
+        .filter { $0.lastPathComponent.hasPrefix("Agent_") && $0.pathExtension == "log" } ?? []
+    let newest = logs.max { a, b in
+        let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        return da < db
+    }
+    guard let url = newest, let h = try? FileHandle(forReadingFrom: url) else { return "" }
+    defer { try? h.close() }
+    let end = h.seekToEndOfFile()
+    h.seek(toFileOffset: end > bytes ? end - bytes : 0)
+    return String(decoding: h.readDataToEndOfFile(), as: UTF8.self)
+}
+
+var captureRecycles: [Double] = []
+var captureBudgetLogged = false
+
+// Passenger steady state: end any session whose sound capture is stuck.
+// `force` is the MIRA window's Fix: a human asked, so the loop budget does not apply.
+func guardJumpCapture(now: Double = Date().timeIntervalSince1970, force: Bool = false) {
+    let stuck = stuckJumpCaptures(logTail: jumpAgentLogTail(), now: now)
+    guard !stuck.isEmpty else { captureBudgetLogged = false; return }
+    guard force || mayRecycleCapture(history: captureRecycles, now: now) else {
+        if !captureBudgetLogged { log("Jump capture still stuck after \(captureRecycles.count) restarts — leaving it") }
+        captureBudgetLogged = true; return
+    }
+    for s in stuck {
+        // Only ever a session's own proxy; the pid in an old log line may be reused.
+        guard sh("ps -o command= -p \(s.pid)", timeout: 5).out.contains("JumpConnect --desktopproxy") else { continue }
+        captureRecycles.append(now)
+        log("Jump session \(s.pid) has captured no sound for \(Int(now - s.since))s — ending it so the viewer reconnects")
+        emit("capture_recycle", [("pid", .n(Double(s.pid))), ("stuck", .n(now - s.since))])
+        guard ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil else { continue }
+        kill(s.pid, SIGTERM)
+    }
+}
+
 func defaultOutputID() -> AudioDeviceID {
     var addr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDefaultOutputDevice,
@@ -1879,6 +1962,7 @@ final class Reconciler {
             if lastMode == mode, Date() >= nextAudioGuard {
                 nextAudioGuard = Date().addingTimeInterval(4)
                 guardPassengerAudio()
+                guardJumpCapture()
             }
             let broken = engine.passengerInvariantFailure(canvas: canvas, hidpi: wantHi)
             if broken == nil, lastMode == mode { breaker.record(nil); checkWalkupTriggers(); return }
@@ -3437,6 +3521,35 @@ func selftest() -> Never {
            "console audio: departed headphones fall back to builtin")
     expect(pickConsoleOutputName(remembered: "Jump Desktop Audio", deviceNames: names) == nil,
            "console audio: never restore a jump route")
+    // Jump capture guard: lines as the Pro logged them 2026-10-06
+    func jl(_ hms: String, _ pid: Int, _ msg: String) -> String {
+        "2026-10-06 \(hms) \(pid):28442967 \(msg)"
+    }
+    let ok = "INFO [audio_cap_rtaudio yjjbc17l] Started capture: Phase Five Systems LLC: Jump Desktop Audio id:135 48000hz, 8 channels, frames:240"
+    let bad = "ERROR [audio_cap_rtaudio yjjbc17l] Capture channels is 0, exiting"
+    let enumerate = "INFO [audio_cap_rtaudio yjjbc17l] Device 134: Name:Phase Five Systems LLC: Jump Desktop Audio, ID:134"
+    let t = { (hms: String) in jumpLogTimeFormat.date(from: "2026-10-06 \(hms)")!.timeIntervalSince1970 }
+    let stuckLog = [jl("14:10:05:827", 40379, ok), jl("14:24:37:483", 40379, bad), jl("14:24:38:432", 40379, enumerate)]
+        + (39...59).map { jl("14:24:\($0):432", 40379, bad) }
+    expect(stuckJumpCaptures(logTail: stuckLog.joined(separator: "\r\n"), now: t("14:25:00:000"))
+            == [CaptureStuck(pid: 40379, since: t("14:24:37:483"))],
+           "capture: failing for 22s after the device renumbered is stuck (Jump's CRLF lines)")
+    expect(stuckJumpCaptures(logTail: stuckLog.prefix(6).joined(separator: "\n"), now: t("14:24:42:000")).isEmpty,
+           "capture: a few seconds of failures is not stuck yet")
+    expect(stuckJumpCaptures(logTail: (stuckLog + [jl("14:24:59:900", 40379, ok)]).joined(separator: "\n"),
+                             now: t("14:25:00:000")).isEmpty,
+           "capture: a successful start clears it")
+    expect(stuckJumpCaptures(logTail: stuckLog.joined(separator: "\n"), now: t("14:26:00:000")).isEmpty,
+           "capture: a session that stopped trying (ended) is not stuck")
+    expect(stuckJumpCaptures(logTail: (stuckLog + [jl("14:24:59:000", 46504, ok)]).joined(separator: "\n"),
+                             now: t("14:25:00:000")).map { $0.pid } == [40379],
+           "capture: sessions are judged per process")
+    expect(mayRecycleCapture(history: [], now: now), "capture recycle: first restart allowed")
+    expect(!mayRecycleCapture(history: [now - 60], now: now), "capture recycle: not twice in two minutes")
+    expect(!mayRecycleCapture(history: [now - 1500, now - 900, now - 300], now: now),
+           "capture recycle: at most three per half hour")
+    expect(mayRecycleCapture(history: [now - 4000, now - 3000, now - 300], now: now),
+           "capture recycle: old restarts age out")
     // handback logic
     let hnow = 2_000_000.0
     expect(handbackIsFresh(ts: hnow - 100, hold: 600, now: hnow), "handback fresh within hold")
@@ -3833,6 +3946,7 @@ case "inspect-machine":
     let status = buildMachineStatus(cfg: cfg, me: me, runtime: runtime,
         local: readJSON(LocalStatus.self, localStatusFile), health: readJSON(Health.self, healthFile),
         inboundAges: inboundSessionAges(), driver: driver,
+        captureStuckSince: stuckJumpCaptures(logTail: jumpAgentLogTail(), now: now).map { $0.since }.min(),
         snapshotPending: FileManager.default.fileExists(atPath: arrangementFile.path),
         daemonRunning: sh("pgrep -f 'MacOS/MIRA --daemon' >/dev/null").code == 0, now: now)
     if let data = try? JSONEncoder().encode(status) { print(String(decoding: data, as: UTF8.self)) }

@@ -301,7 +301,10 @@ func handleControl(_ r: ControlRequest, rec: Reconciler) -> ControlReply {
         case "fix-audio":
             fixRequests.append("audio")
             let passenger = readRide() != nil
-            if ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil { repairAudio(passenger: passenger) }
+            if ProcessInfo.processInfo.environment["MIRA_STATE_DIR"] == nil {
+                repairAudio(passenger: passenger)
+                guardJumpCapture(force: true)
+            }
             return answer(true, passenger ? "Sound routed through Jump" : "Jump devices returned to this Mac's own")
         case "fix-display":
             // Never on the driver: a console restore unmirrors, re-routes audio and

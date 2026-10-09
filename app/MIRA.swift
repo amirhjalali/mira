@@ -1599,6 +1599,24 @@ func restoreStep(_ s: SavedDisplay, online: Set<UInt32>) -> RestoreStep {
                 mirrorOf: s.mirrorOf.flatMap { online.contains($0) ? $0 : nil })
 }
 
+// Two physical displays at the same origin with the same UI size can only be a
+// mirror set — extend never overlaps. Captures on the docked pro have recorded
+// exactly that with no mirrorOf (2026-10-01, 2026-10-09): restore then gave each
+// display its own origin, macOS pushed them apart, the built-in fell back to its
+// native mode, verification failed and the pro was left extended. Recover the
+// lost link, pointing at the main display of the overlap. Pure, selftested.
+func inferMirrors(_ saved: [SavedDisplay]) -> [SavedDisplay] {
+    saved.map { s in
+        guard s.mirrorOf == nil, !s.main, let w = s.w, let h = s.h else { return s }
+        guard let master = saved.first(where: {
+            $0.id != s.id && $0.main && $0.mirrorOf == nil
+                && $0.x == s.x && $0.y == s.y && $0.w == w && $0.h == h
+        }) else { return s }
+        return SavedDisplay(id: s.id, x: s.x, y: s.y, main: false, mirrorOf: master.id,
+                            w: s.w, h: s.h, hz: s.hz, px: s.px, stableID: s.stableID)
+    }
+}
+
 // Best available mode for UI w×h: prefer the saved backing-pixel width
 // (hidpi vs 1x), then the closest refresh rate.
 func matchMode(display: CGDirectDisplayID, w: Int, h: Int, hz: Double?, px: Int?) -> CGDisplayMode? {
@@ -1637,8 +1655,12 @@ func captureArrangement(engine: DisplayEngine) {
         log("fresh arrangement capture failed (\(r.code)) — falling back to the daemon's own view")
         saved = savedDisplays(engine.physicalDisplays())
     }
+    let inferred = inferMirrors(saved)
+    if inferred.contains(where: { $0.mirrorOf != nil }) != saved.contains(where: { $0.mirrorOf != nil }) {
+        log("arrangement capture had overlapping displays with no mirror link — recorded them as mirrored")
+    }
     try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
-    try? atomicJSON(saved, to: arrangementFile)
+    try? atomicJSON(inferred, to: arrangementFile)
 }
 
 // Returns true when the arrangement is restored (or there is nothing to
@@ -1648,7 +1670,7 @@ func captureArrangement(engine: DisplayEngine) {
 @discardableResult
 func restoreArrangement(engine: DisplayEngine) -> Bool {
     guard let data = try? Data(contentsOf: arrangementFile),
-          let saved = try? JSONDecoder().decode([SavedDisplay].self, from: data) else {
+          let decoded = try? JSONDecoder().decode([SavedDisplay].self, from: data) else {
         // No saved arrangement means we never took the displays away, so there
         // is nothing to give back — and "nothing to give back" must mean TOUCH
         // NOTHING. unmirrorAll() and setMain() used to run BEFORE this check,
@@ -1663,6 +1685,7 @@ func restoreArrangement(engine: DisplayEngine) -> Bool {
         // the worst possible moment.
         return true   // nothing captured -> nothing to do, and nothing to retry
     }
+    let saved = inferMirrors(decoded)   // heals snapshots captured without the link
     engine.unmirrorAll()   // break the virtual's mirror before rebuilding the real one
     let online = Set(engine.onlineDisplays())
     let remapped = saved.compactMap { original -> SavedDisplay? in
@@ -3611,6 +3634,17 @@ func selftest() -> Never {
     let old = SavedDisplay(id: 3, x: 0, y: 0, main: false, mirrorOf: 1)
     expect(restoreStep(old, online: [1, 3]) == RestoreStep(id: 3, setMode: false, mirrorOf: 1),
            "restoreStep legacy capture sets no mode")
+    // Snapshot that lost its mirror link (pro, 2026-10-09): overlap => mirror of main.
+    let lostLink = [SavedDisplay(id: 4, x: 0, y: 0, main: true, mirrorOf: nil, w: 3440, h: 1440, hz: 60, px: 3440),
+                    SavedDisplay(id: 1, x: 0, y: 0, main: false, mirrorOf: nil, w: 3440, h: 1440, hz: 120, px: 3440)]
+    let healed = inferMirrors(lostLink)
+    expect(healed[0].mirrorOf == nil && healed[1].mirrorOf == 4, "inferMirrors restores overlap as mirror of main")
+    let extended = [SavedDisplay(id: 1, x: 0, y: 0, main: true, mirrorOf: nil, w: 1728, h: 1117, hz: 120, px: 3456),
+                    SavedDisplay(id: 4, x: 1728, y: 0, main: false, mirrorOf: nil, w: 3440, h: 1440, hz: 60, px: 3440)]
+    expect(inferMirrors(extended).allSatisfy { $0.mirrorOf == nil }, "inferMirrors leaves extend alone")
+    let sameOriginDiffSize = [extended[0], SavedDisplay(id: 4, x: 0, y: 0, main: false, mirrorOf: nil,
+                                                        w: 3440, h: 1440, hz: 60, px: 3440)]
+    expect(inferMirrors(sameOriginDiffSize).allSatisfy { $0.mirrorOf == nil }, "inferMirrors needs matching size")
     // boot-resume gate
     expect(shouldResumeSessions(driving: true, viewer: true, markerBoot: nil, currentBoot: 111),
            "no marker -> resume")

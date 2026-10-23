@@ -8,10 +8,19 @@ func rdpFileText(_ boot: PCBoot) -> String {
     "full address:s:\(rdpEndpoint(boot))\nprompt for credentials on client:i:0\nscreen mode id:i:2\n"
 }
 
-// Windows App owns the session; MIRA only brings it forward or starts it.
-// Off the main thread: `open` can stall while Windows App launches.
+// Jump or Windows App owns the session; MIRA only brings it forward or starts it.
+// Off the main thread: `open` can stall while the app launches.
 func openWindowsPC(_ pc: WindowsPC, boot: PCBoot, sessionOpen: Bool) {
     DispatchQueue.global(qos: .userInitiated).async {
+        if let name = boot.jumpName {
+            // An exported alias first, then Open Recent; a first connect is picked from Jump's list.
+            let alias = sessionAlias(for: "\(pc.id)-\(boot.os.lowercased())")
+            if sessionOpen || !((FileManager.default.fileExists(atPath: alias.path) && sh("open \(shellQuote(alias.path))").code == 0)
+                                || openJumpSession(name)) {
+                sh("open -a 'Jump Desktop'")
+            }
+            return
+        }
         if sessionOpen { sh("open -a 'Windows App'"); return }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(pc.id)-\(boot.os).rdp")
         try? rdpFileText(boot).write(to: url, atomically: true, encoding: .utf8)
@@ -46,11 +55,11 @@ final class MiraModel: ObservableObject {
         macs.forEach(poll)
         DispatchQueue.global(qos: .utility).async { [self] in
             let ts = parseTailscale(sh("tailscale status --json 2>/dev/null || /Applications/Tailscale.app/Contents/MacOS/Tailscale status --json 2>/dev/null", timeout: 8).out)
-            let open = Set(readJSON(LocalStatus.self, localStatusFile)?.rdpEndpoints ?? [])
+            let local = readJSON(LocalStatus.self, localStatusFile)
             let list = (cfg.windowsPCs ?? []).map { pc -> WindowsStatus in
                 let boot = activeBoot(pc, ts)
                 return WindowsStatus(pc: pc, boot: boot, online: ts[boot.tailscale]?.online ?? nil,
-                                     lastSeen: ts[boot.tailscale]?.lastSeen, sessionOpen: open.contains(rdpEndpoint(boot)))
+                                     lastSeen: ts[boot.tailscale]?.lastSeen, sessionOpen: pcSessionOpen(boot, rdpEndpoints: local?.rdpEndpoints ?? [], jumpWindows: local?.jumpWindows))
             }
             DispatchQueue.main.async { self.pcs = list; self.refreshed = Date() }
         }
@@ -212,7 +221,7 @@ struct PCCard: View {
                 Spacer()
                 Text(status.online == true ? "online" : status.online == false ? "offline" : "unknown").font(.caption)
             }
-            Text(status.boot.os + " · " + status.boot.tailscaleName + " · " + rdpEndpoint(status.boot)).font(.caption).foregroundStyle(.secondary)
+            Text(status.boot.os + " · " + status.boot.tailscaleName + " · " + pcAddress(status.boot)).font(.caption).foregroundStyle(.secondary)
             if status.pc.boots.count > 1 {
                 Text("Dual boot: " + status.pc.boots.map { $0.os }.joined(separator: " / ")).font(.caption).foregroundStyle(.secondary)
             }

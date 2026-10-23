@@ -11,6 +11,7 @@ struct PCBoot: Codable, Equatable {
     let tailscale: String
     let tailscaleName: String
     let rdpPort: Int?
+    var jumpName: String? = nil       // set = reached through Jump Connect, not RDP (Connect for Linux, alpha 2026-10)
 }
 
 struct WindowsPC: Codable {
@@ -27,6 +28,13 @@ struct WindowsPC: Codable {
 
 func rdpEndpoint(_ boot: PCBoot) -> String { "\(boot.tailscale):\(boot.rdpPort ?? 3389)" }
 func rdpEndpoint(_ pc: WindowsPC) -> String { rdpEndpoint(pc.boots[0]) }
+
+// Pure, selftested. Jump sessions show up as viewer window titles, RDP as Windows App sockets.
+func pcSessionOpen(_ boot: PCBoot, rdpEndpoints: [String], jumpWindows: [String]?) -> Bool {
+    if let name = boot.jumpName { return jumpWindows?.contains(name) == true }
+    return rdpEndpoints.contains(rdpEndpoint(boot))
+}
+func pcAddress(_ boot: PCBoot) -> String { boot.jumpName == nil ? rdpEndpoint(boot) : "Jump" }
 
 // Pure, selftested. The OS that is up; with none up, the one seen last; Windows when unknown.
 func activeBoot(_ pc: WindowsPC, _ ts: [String: (online: Bool?, lastSeen: String?)]) -> PCBoot {
@@ -518,6 +526,15 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
            "dual boot: both down shows the OS seen last")
     expect(activeBoot(dual, [:]).os == "Windows", "dual boot: Tailscale unknown falls back to Windows")
     expect(pc.boots.count == 1 && activeBoot(pc, [:]) == pc.boots[0], "dual boot: a single-OS PC is unchanged")
+    // Jump Connect for Linux (alpha): a boot with a Jump name is reached through Jump, not RDP.
+    let jumpBoot = PCBoot(os: "Ubuntu", tailscale: "100.1.0.2", tailscaleName: "lab", rdpPort: 3390, jumpName: "amir-lab")
+    expect(pcSessionOpen(jumpBoot, rdpEndpoints: ["100.1.0.2:3390"], jumpWindows: ["amir-lab"])
+           && !pcSessionOpen(jumpBoot, rdpEndpoints: ["100.1.0.2:3390"], jumpWindows: ["Mac Mini"])
+           && !pcSessionOpen(jumpBoot, rdpEndpoints: [], jumpWindows: nil), "pc session: a Jump boot is open only when its viewer window is")
+    expect(pcSessionOpen(dual.boots[1], rdpEndpoints: ["100.1.0.2:3390"], jumpWindows: ["lab"]), "pc session: an RDP boot is judged by its socket")
+    expect(pcAddress(jumpBoot) == "Jump" && pcAddress(dual.boots[1]) == "100.1.0.2:3390", "pc card: Jump boots show Jump, RDP boots their endpoint")
+    let jumpJSON = #"{"os":"Ubuntu","tailscale":"100.1.0.2","tailscaleName":"lab","rdpPort":3390,"jumpName":"amir-lab"}"#
+    expect((try? JSONDecoder().decode(PCBoot.self, from: Data(jumpJSON.utf8)))?.jumpName == "amir-lab", "config: a boot's jumpName decodes")
     // Final review fixes
     let noOnline = #"{"Peer":{"k":{"TailscaleIPs":["100.78.167.19"],"LastSeen":"2026-10-03T10:00:00Z"}}}"#
     expect(parseTailscale(noOnline)["100.78.167.19"]?.online == nil, "tailscale: a missing Online field is unknown, not offline")

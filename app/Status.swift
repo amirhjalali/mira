@@ -515,7 +515,8 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     let rig = (cfg.windowsPCs ?? []).first { $0.id == "rig3090" }
     expect(rig?.boots.map { $0.os } == ["Windows", "Ubuntu"], "dual boot: the 3090 boots Windows and Ubuntu")
     expect(rig.map { rdpEndpoint($0.boots[1]) } == "100.92.154.104:3390",
-           "dual boot: Ubuntu connects to GNOME desktop sharing (3389 is Remote Login)")
+           "dual boot: Ubuntu's RDP fallback is GNOME desktop sharing (3389 is Remote Login)")
+    expect(rig?.boots[1].jumpName == "amir-lab", "dual boot: Ubuntu is reached through Jump Connect for Linux")
     let ubuntuJSON = #"{"id":"x","name":"X","tailscale":"100.1.0.1","tailscaleName":"win","rdpPort":1337,"dualBoot":{"os":"Ubuntu","tailscale":"100.1.0.2","tailscaleName":"lab","rdpPort":3390}}"#
     let dual = try! JSONDecoder().decode(WindowsPC.self, from: Data(ubuntuJSON.utf8))
     expect(activeBoot(dual, ["100.1.0.1": (false, "2026-10-22T18:40:17Z"), "100.1.0.2": (true, "2026-10-01T00:00:00Z")]).os == "Ubuntu",

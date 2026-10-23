@@ -117,7 +117,8 @@
         "os": "Ubuntu",
         "tailscale": "100.92.154.104",
         "tailscaleName": "amir-lab",
-        "rdpPort": 3390
+        "rdpPort": 3390,
+        "jumpName": "amir-lab"
       }
     },
     {

@@ -1,20 +1,20 @@
 // MIRA window UI. Compiled with the other sources by tests/run.sh.
 import SwiftUI
 
-struct WindowsStatus { let pc: WindowsPC; let online: Bool?; let lastSeen: String?; let sessionOpen: Bool }
+struct WindowsStatus { let pc: WindowsPC; let boot: PCBoot; let online: Bool?; let lastSeen: String?; let sessionOpen: Bool }
 
 // Pure, selftested.
-func rdpFileText(_ pc: WindowsPC) -> String {
-    "full address:s:\(rdpEndpoint(pc))\nprompt for credentials on client:i:0\nscreen mode id:i:2\n"
+func rdpFileText(_ boot: PCBoot) -> String {
+    "full address:s:\(rdpEndpoint(boot))\nprompt for credentials on client:i:0\nscreen mode id:i:2\n"
 }
 
 // Windows App owns the session; MIRA only brings it forward or starts it.
 // Off the main thread: `open` can stall while Windows App launches.
-func openWindowsPC(_ pc: WindowsPC, sessionOpen: Bool) {
+func openWindowsPC(_ pc: WindowsPC, boot: PCBoot, sessionOpen: Bool) {
     DispatchQueue.global(qos: .userInitiated).async {
         if sessionOpen { sh("open -a 'Windows App'"); return }
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(pc.id).rdp")
-        try? rdpFileText(pc).write(to: url, atomically: true, encoding: .utf8)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(pc.id)-\(boot.os).rdp")
+        try? rdpFileText(boot).write(to: url, atomically: true, encoding: .utf8)
         sh("open -a 'Windows App' \(shellQuote(url.path))")
     }
 }
@@ -47,9 +47,10 @@ final class MiraModel: ObservableObject {
         DispatchQueue.global(qos: .utility).async { [self] in
             let ts = parseTailscale(sh("tailscale status --json 2>/dev/null || /Applications/Tailscale.app/Contents/MacOS/Tailscale status --json 2>/dev/null", timeout: 8).out)
             let open = Set(readJSON(LocalStatus.self, localStatusFile)?.rdpEndpoints ?? [])
-            let list = (cfg.windowsPCs ?? []).map { pc in
-                WindowsStatus(pc: pc, online: ts[pc.tailscale]?.online ?? nil,
-                              lastSeen: ts[pc.tailscale]?.lastSeen, sessionOpen: open.contains(rdpEndpoint(pc)))
+            let list = (cfg.windowsPCs ?? []).map { pc -> WindowsStatus in
+                let boot = activeBoot(pc, ts)
+                return WindowsStatus(pc: pc, boot: boot, online: ts[boot.tailscale]?.online ?? nil,
+                                     lastSeen: ts[boot.tailscale]?.lastSeen, sessionOpen: open.contains(rdpEndpoint(boot)))
             }
             DispatchQueue.main.async { self.pcs = list; self.refreshed = Date() }
         }
@@ -107,7 +108,7 @@ struct MiraView: View {
                     ForEach(model.macs, id: \.id) { m in MacCard(model: model, machine: m) }
                 }
                 if !model.pcs.isEmpty {
-                    Text("Windows").font(.title3.bold())
+                    Text("PCs").font(.title3.bold())
                     LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
                         ForEach(model.pcs, id: \.pc.id) { s in PCCard(status: s) }
                     }
@@ -132,7 +133,8 @@ struct MacCard: View {
         let down = model.unreachable.contains(machine.id)
         let stale = s?.outbound?.contains { $0.stale } == true
         let asleep = s?.asleep == true
-        let warn = s.map { $0.audioWarning != nil || $0.display == "wrong" || !$0.warnings.isEmpty } ?? false
+        let warn = s.map { $0.audioWarning != nil || $0.display == "wrong" || !$0.warnings.isEmpty
+            || !jumpBehind($0, fleet: Array(model.statuses.values)).isEmpty } ?? false
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Dot(color: down || s == nil || asleep ? .gray : stale ? .red : warn ? .orange : .green)
@@ -188,7 +190,9 @@ struct MacCard: View {
                 if s.display == "wrong" { Button("Fix") { confirmDisplay = true }.disabled(down) }
             }
             ForEach(s.warnings, id: \.self) { Text($0).foregroundStyle(.orange) }
-            Text("Build \(s.build)").foregroundStyle(.secondary)
+            ForEach(jumpBehind(s, fleet: Array(model.statuses.values)), id: \.self) { Text($0).foregroundStyle(.orange) }
+            Text("Build \(s.build)" + (s.jumpViewer.map { " · Jump \($0)" } ?? "") + (s.jumpConnect.map { " · Connect \($0)" } ?? ""))
+                .foregroundStyle(.secondary)
         }.font(.caption).opacity(down ? 0.5 : 1)
     }
 
@@ -208,10 +212,13 @@ struct PCCard: View {
                 Spacer()
                 Text(status.online == true ? "online" : status.online == false ? "offline" : "unknown").font(.caption)
             }
-            Text(status.pc.tailscaleName + " · " + rdpEndpoint(status.pc)).font(.caption).foregroundStyle(.secondary)
+            Text(status.boot.os + " · " + status.boot.tailscaleName + " · " + rdpEndpoint(status.boot)).font(.caption).foregroundStyle(.secondary)
+            if status.pc.boots.count > 1 {
+                Text("Dual boot: " + status.pc.boots.map { $0.os }.joined(separator: " / ")).font(.caption).foregroundStyle(.secondary)
+            }
             if status.online == false, let seen = status.lastSeen { Text("Last seen \(seen.prefix(10))").font(.caption) }
             if status.sessionOpen { Text("Session open from this Mac").font(.caption).foregroundStyle(.green) }
-            Button(status.sessionOpen ? "Show" : "Connect") { openWindowsPC(status.pc, sessionOpen: status.sessionOpen) }
+            Button(status.sessionOpen ? "Show" : "Connect") { openWindowsPC(status.pc, boot: status.boot, sessionOpen: status.sessionOpen) }
                 .disabled(status.online == false)
         }
         .padding(12)

@@ -3983,12 +3983,14 @@ case "inspect-machine":
     let runtime = readJSON(RuntimeSnapshot.self, snapshotFile)
     let driver = currentSession(me) != nil || runtime?.role == "driver" ? me.id
         : (readRide()?.driver ?? readWheel().flatMap { now - $0.ts < cfg.rideTTLSeconds ? $0.driver : nil })
-    let status = buildMachineStatus(cfg: cfg, me: me, runtime: runtime,
+    var status = buildMachineStatus(cfg: cfg, me: me, runtime: runtime,
         local: readJSON(LocalStatus.self, localStatusFile), health: readJSON(Health.self, healthFile),
         inboundAges: inboundSessionAges(), driver: driver,
         captureStuckSince: liveStuckJumpCaptures(now: now).map { $0.since }.min(),
         snapshotPending: FileManager.default.fileExists(atPath: arrangementFile.path),
         daemonRunning: sh("pgrep -f 'MacOS/MIRA --daemon' >/dev/null").code == 0, now: now)
+    status.jumpViewer = installedVersion("/Applications/Jump Desktop.app")
+    status.jumpConnect = installedVersion("/Applications/Jump Desktop Connect.app")
     if let data = try? JSONEncoder().encode(status) { print(String(decoding: data, as: UTF8.self)) }
     exit(0)
 case "inspect-arrangement":

@@ -112,7 +112,13 @@
       "name": "3090 Desktop",
       "tailscale": "100.78.167.19",
       "tailscaleName": "desktop-iki1670",
-      "rdpPort": 1337
+      "rdpPort": 1337,
+      "dualBoot": {
+        "os": "Ubuntu",
+        "tailscale": "100.92.154.104",
+        "tailscaleName": "amir-lab",
+        "rdpPort": 3390
+      }
     },
     {
       "id": "amelie",

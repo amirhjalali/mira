@@ -4,15 +4,36 @@ import AppKit
 import CoreAudio
 import Foundation
 
+// One OS a PC can boot into. A dual-boot PC is two Tailscale nodes, one per OS,
+// and at most one of them is online.
+struct PCBoot: Codable, Equatable {
+    let os: String
+    let tailscale: String
+    let tailscaleName: String
+    let rdpPort: Int?
+}
+
 struct WindowsPC: Codable {
     let id: String
     let name: String
     let tailscale: String
     let tailscaleName: String
     let rdpPort: Int?
+    var dualBoot: PCBoot? = nil       // the PC's other OS (rig3090 also boots Ubuntu)
+    var boots: [PCBoot] {
+        [PCBoot(os: "Windows", tailscale: tailscale, tailscaleName: tailscaleName, rdpPort: rdpPort)] + (dualBoot.map { [$0] } ?? [])
+    }
 }
 
-func rdpEndpoint(_ pc: WindowsPC) -> String { "\(pc.tailscale):\(pc.rdpPort ?? 3389)" }
+func rdpEndpoint(_ boot: PCBoot) -> String { "\(boot.tailscale):\(boot.rdpPort ?? 3389)" }
+func rdpEndpoint(_ pc: WindowsPC) -> String { rdpEndpoint(pc.boots[0]) }
+
+// Pure, selftested. The OS that is up; with none up, the one seen last; Windows when unknown.
+func activeBoot(_ pc: WindowsPC, _ ts: [String: (online: Bool?, lastSeen: String?)]) -> PCBoot {
+    let boots = pc.boots
+    if let up = boots.first(where: { ts[$0.tailscale]?.online == true }) { return up }
+    return boots.max { (ts[$0.tailscale]?.lastSeen ?? "") < (ts[$1.tailscale]?.lastSeen ?? "") } ?? boots[0]
+}
 
 // MARK: - Local status (menu app)
 
@@ -183,6 +204,33 @@ struct MachineStatus: Codable {
     // Optional so a window on a newer build can still read an older Mac.
     var asleep: Bool? = nil           // daemon alive but paused: the Mac was asleep
     var fdCount: Int? = nil
+    var jumpViewer: String? = nil     // nil = not installed (the mini) or an older build
+    var jumpConnect: String? = nil
+}
+
+func installedVersion(_ app: String) -> String? {
+    NSDictionary(contentsOfFile: app + "/Contents/Info.plist")?["CFBundleShortVersionString"] as? String
+}
+
+// Pure, selftested. Numeric, so "10.15.46.0" equals "10.15.46" and 9.x sorts below 10.x.
+func versionLess(_ a: String, _ b: String) -> Bool {
+    let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(x.count, y.count) {
+        let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+        if p != q { return p < q }
+    }
+    return false
+}
+
+// Pure, selftested. 2026-10-23: air13's viewer sat at 9.1.9 while the rest ran 10.15;
+// Sparkle only updates an app someone opens. The newest copy in the fleet is the bar.
+func jumpBehind(_ s: MachineStatus, fleet: [MachineStatus]) -> [String] {
+    func check(_ name: String, _ v: KeyPath<MachineStatus, String?>) -> String? {
+        guard let mine = s[keyPath: v],
+              let newest = fleet.compactMap({ $0[keyPath: v] }).max(by: versionLess), versionLess(mine, newest) else { return nil }
+        return "\(name) \(mine), fleet has \(newest)"
+    }
+    return [check("Jump Desktop", \.jumpViewer), check("Jump Desktop Connect", \.jumpConnect)].compactMap { $0 }
 }
 
 // Pure: everything already read, judged here.
@@ -234,6 +282,7 @@ func fetchMachineStatus(_ m: Machine, me: Machine, timeout: TimeInterval = 12) -
 func doctorLines(_ statuses: [String: MachineStatus?], order: [String]) -> (lines: [String], failures: Int) {
     var lines: [String] = [], failures = 0
     var answered: [MachineStatus] = []
+    let fleet = statuses.values.compactMap { $0 }
     for id in order {
         guard let s = statuses[id] ?? nil else { lines.append("! \(id): unreachable"); failures += 1; continue }
         answered.append(s)
@@ -245,6 +294,7 @@ func doctorLines(_ statuses: [String: MachineStatus?], order: [String]) -> (line
         if s.display == "wrong" { problems.append(s.displayDetail) }
         if let a = s.audioWarning { problems.append(a) }
         problems += s.warnings
+        problems += jumpBehind(s, fleet: fleet)
         if (s.fdCount ?? 0) > 512 { problems.append("\(s.fdCount ?? 0) open files (leak?)") }
         if problems.isEmpty { lines.append("✓ \(id): \(s.role) — \(s.displayDetail) [\(s.build)]") }
         else { lines.append("! \(id): \(s.role) — \(problems.joined(separator: "; "))"); failures += 1 }
@@ -451,8 +501,23 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     let encoded = try! JSONEncoder().encode(st)
     expect((try? JSONDecoder().decode(MachineStatus.self, from: encoded)) != nil, "machineStatus: JSON round-trip")
     // Windows App connect: the generated .rdp targets the PC's endpoint
-    let rdp = rdpFileText(WindowsPC(id: "rig3090", name: "3090", tailscale: "100.78.167.19", tailscaleName: "d", rdpPort: 1337))
+    let rdp = rdpFileText(WindowsPC(id: "rig3090", name: "3090", tailscale: "100.78.167.19", tailscaleName: "d", rdpPort: 1337).boots[0])
     expect(rdp.contains("full address:s:100.78.167.19:1337"), "rdp: file targets the PC's endpoint")
+    // Dual boot (2026-10-23): the 3090 is desktop-iki1670 in Windows and amir-lab in Ubuntu.
+    let rig = (cfg.windowsPCs ?? []).first { $0.id == "rig3090" }
+    expect(rig?.boots.map { $0.os } == ["Windows", "Ubuntu"], "dual boot: the 3090 boots Windows and Ubuntu")
+    expect(rig.map { rdpEndpoint($0.boots[1]) } == "100.92.154.104:3390",
+           "dual boot: Ubuntu connects to GNOME desktop sharing (3389 is Remote Login)")
+    let ubuntuJSON = #"{"id":"x","name":"X","tailscale":"100.1.0.1","tailscaleName":"win","rdpPort":1337,"dualBoot":{"os":"Ubuntu","tailscale":"100.1.0.2","tailscaleName":"lab","rdpPort":3390}}"#
+    let dual = try! JSONDecoder().decode(WindowsPC.self, from: Data(ubuntuJSON.utf8))
+    expect(activeBoot(dual, ["100.1.0.1": (false, "2026-10-22T18:40:17Z"), "100.1.0.2": (true, "2026-10-01T00:00:00Z")]).os == "Ubuntu",
+           "dual boot: the OS that is online is the one shown")
+    expect(activeBoot(dual, ["100.1.0.1": (true, nil), "100.1.0.2": (false, "2026-10-22T18:40:17Z")]).os == "Windows",
+           "dual boot: Windows when Windows is up")
+    expect(activeBoot(dual, ["100.1.0.1": (false, "2026-10-20T00:00:00Z"), "100.1.0.2": (false, "2026-10-22T00:00:00Z")]).os == "Ubuntu",
+           "dual boot: both down shows the OS seen last")
+    expect(activeBoot(dual, [:]).os == "Windows", "dual boot: Tailscale unknown falls back to Windows")
+    expect(pc.boots.count == 1 && activeBoot(pc, [:]) == pc.boots[0], "dual boot: a single-OS PC is unchanged")
     // Final review fixes
     let noOnline = #"{"Peer":{"k":{"TailscaleIPs":["100.78.167.19"],"LastSeen":"2026-10-03T10:00:00Z"}}}"#
     expect(parseTailscale(noOnline)["100.78.167.19"]?.online == nil, "tailscale: a missing Online field is unknown, not offline")
@@ -505,6 +570,20 @@ func windowTests(_ expect: (Bool, String) -> Void, _ cfg: Config) {
     expect(db.lines.contains { $0.contains("Conflicting drivers") }, "doctor: two drivers fail")
     expect(db.lines.contains { $0.hasPrefix("!") && $0.contains("air15") && $0.contains("build") }, "doctor: old build fails")
     expect(db.failures >= 4, "doctor: every problem counts")
+    // Jump version drift
+    expect(versionLess("9.1.9", "10.15.46") && !versionLess("10.15.46.0", "10.15.46") && !versionLess("10.15.46", "10.15.46.0")
+           && versionLess("10.15.16.0", "10.15.46"), "versions: numeric, trailing zeros equal")
+    var j13 = mk("air13", "driver", "air13"); j13.jumpViewer = "9.1.9"; j13.jumpConnect = "10.15.46.0"
+    var jPro = mk("pro", "passenger", "air13"); jPro.jumpViewer = "10.15.46.0"; jPro.jumpConnect = "10.15.46.0"
+    let jMini = mk("mini", "passenger", "air13")
+    expect(jumpBehind(j13, fleet: [j13, jPro, jMini]) == ["Jump Desktop 9.1.9, fleet has 10.15.46.0"],
+           "jump: a viewer behind the fleet is named; a current Connect is not")
+    expect(jumpBehind(jPro, fleet: [j13, jPro, jMini]).isEmpty && jumpBehind(jMini, fleet: [j13, jPro, jMini]).isEmpty,
+           "jump: current and not-installed are both fine")
+    var d13 = ms("air13", role: "driver", driver: "air13"); d13.jumpViewer = "9.1.9"
+    var dPro = ms("pro", role: "passenger", driver: "air13"); dPro.jumpViewer = "10.15.46.0"
+    let jd = doctorLines(["air13": d13, "pro": dPro], order: ["air13", "pro"])
+    expect(jd.failures == 1 && jd.lines[0].contains("Jump Desktop 9.1.9"), "doctor: a lagging Jump install needs attention")
     // Darken a driven Mac's own screens; any real local input or opening the lid relights them.
     expect(screensShouldBeDark(passengerConverged: true, enabled: true, lastLocalInput: nil, lidOpenedAt: nil, now: 1000),
            "darken: a converged passenger nobody is touching goes dark")

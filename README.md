@@ -51,7 +51,9 @@ Deployment restarts each passenger's display owner, so its virtual display is br
 
 ## CLI and diagnostics
 
-`mira status [--json] | drive | stop | console | handback | wheel | doctor | report | perf | version | selftest | inspect-screens`
+`mira status [--json] | drive | stop | console | handback | wheel | doctor | report | perf | reboot <machine> | version | selftest | inspect-screens`
+
+`reboot <machine>` restarts a Mac with `fdesetup authrestart`, so a FileVault Mac comes back on its own instead of waiting at the unlock screen. It asks for the password; MIRA never stores it.
 
 `inspect-screens` prints the displays physically attached to this Mac. The daemon runs it as a subprocess to decide the driver's canvas: its own display list is not refreshed while it has no run loop, so it cannot be trusted about hardware it does not own.
 

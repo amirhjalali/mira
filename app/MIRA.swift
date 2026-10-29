@@ -3944,7 +3944,7 @@ case "vmode":
     exit(vr == .success ? 0 : 1)
 case "version", "--version": print("MIRA \(miraVersion) (\(miraBuild))"); exit(0)
 case "help", "--help", "-h":
-    print("mira status | drive | stop | console | handback | wheel | doctor | report | perf | version | selftest")
+    print("mira status | drive | stop | console | handback | wheel | doctor | report | perf | reboot <machine> | version | selftest")
     print("inspect-screens prints the displays actually attached to this Mac.")
     print("Drive takes over the fleet. Console/handback return only this Mac to local use.")
     exit(0)
@@ -4160,6 +4160,27 @@ case "doctor":
     let cfg = loadConfig()
     let (report, failures) = doctor(cfg: cfg, me: selfMachine(cfg))
     print(report); exit(failures == 0 ? 0 : 1)
+case "reboot":
+    // A FileVault Mac that restarts plainly waits at the unlock screen with no
+    // network at all — no SSH, Tailscale or Jump — until someone types the
+    // password (air15, 2026-10-28: two hours dark). authrestart unlocks the
+    // next boot once, so a restart started here comes back on its own.
+    // Interactive on purpose: sudo and fdesetup ask for the password, which
+    // MIRA never stores. A plain restart only when FileVault is off — never as
+    // a fallback for a failed authrestart, which would strand the machine.
+    let cfg = loadConfig()
+    let macs = cfg.machines.filter { ($0.type ?? "mac") == "mac" }
+    guard args.count == 3, let m = macs.first(where: { $0.id == args[2] }) else {
+        print("usage: mira reboot <\(macs.map(\.id).joined(separator: "|"))>"); exit(2)
+    }
+    let remote = "if fdesetup isactive >/dev/null; then sudo fdesetup authrestart; else sudo shutdown -r now; fi"
+    let argv = m.id == selfMachine(cfg).id
+        ? ["/bin/sh", "-c", remote]
+        : ["/usr/bin/ssh", "-t", "-o", "ConnectTimeout=5", "\(m.user)@\(m.tailscale)", remote]
+    print("Restarting \(m.id) unlocked — enter its password when asked.")
+    fflush(stdout)
+    execv(argv[0], argv.map { strdup($0) } + [nil])
+    perror("mira reboot"); exit(1)
 default:
     guard args.count == 1 else { fputs("Unknown command. Run mira help.\n", stderr); exit(2) }
     guard singleton("menu") else { exit(0) }

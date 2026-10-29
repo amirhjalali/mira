@@ -51,6 +51,12 @@ Every automatic behavior must fail toward *doing nothing*:
   someone physically unlocks it. Never reboot the mini remotely. Decide
   deliberately: keep FileVault (secure, fragile fleet) or disable it / enable
   auto-login on the headless canary (available fleet, weaker at-rest story).
+  2026-10-28: air15 too (FileVault on, no auto-login) — a plain restart left
+  it dark for two hours; lid/clamshell was ruled out (disablesleep=1). Decided:
+  keep FileVault. Restart any Mac with `mira reboot <id>` (fdesetup
+  authrestart: the next boot unlocks itself). After an unplanned reboot,
+  unlock from the LAN: macOS 26 answers SSH at the unlock screen with a
+  different host key and accepts only the password.
 - `caffeinate -u` does NOT reset HIDIdleTime (measured 2026-07-28) — it is not
   a synthetic-presence vector and not a usable exercise for the presence guard.
 - ~~macOS updates strip Jump Connect TCC grants~~ DISPROVEN 2026-07-28: the
